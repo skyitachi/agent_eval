@@ -1,0 +1,23 @@
+name: audit-fixture
+version: 1.0.0
+description: |
+  Fixture for the `aeval audit` end-to-end tests.
+
+  Three tasks, each shaped to trip exactly one health check:
+
+    sound            solvable, necessary, stable  -> healthy
+    unsolvable       its own oracle does not pass -> solvability failed
+    already-solved   the untouched tree passes    -> necessity failed
+
+  The grader is a grep rather than pytest, so the fixture needs no interpreter
+  beyond a shell and every verdict is deterministic. Determinism is the point:
+  a fixture for a health check that is itself flaky proves nothing.
+license: Apache-2.0
+
+tasks_file: tasks.jsonl
+
+defaults:
+  output:
+    type: patch
+    ignore_paths:
+      - "__pycache__/**"

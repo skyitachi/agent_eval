@@ -1,0 +1,10 @@
+--- a/calc.py
++++ b/calc.py
+@@ -9,4 +9,6 @@
+     total = 0
+     for n in nums:
+         total += n
+-    return total / (len(nums) - 1)
++    if not nums:
++        return 0.0
++    return total / len(nums)

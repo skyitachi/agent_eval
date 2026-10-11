@@ -1,0 +1,22 @@
+name: rlenv-fixture
+version: 1.0.0
+description: |
+  Fixture for the RL environment service (`internal/rlenv`) tests.
+
+  Three tasks, chosen so each one pins down a different part of the reward
+  contract a training loop depends on:
+
+    subtract   dense reward, nothing guarded   -> the happy path
+    tamper     forbid_changed_paths            -> a rejected attempt pays zero
+    sparse     reward: {type: pass}            -> a partial fix pays zero too
+
+  The graders are greps rather than pytest, so the fixture needs no interpreter
+  beyond a shell and every reward is deterministic. A fixture whose rewards
+  wobble cannot be used to assert what a reward is.
+license: Apache-2.0
+
+tasks_file: tasks.jsonl
+
+defaults:
+  output:
+    type: patch

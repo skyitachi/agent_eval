@@ -1,0 +1,12 @@
+--- a/slugify.py
++++ b/slugify.py
+@@ -6,4 +6,8 @@
+ 
+     See the task description in the prompt for the exact specification.
+     """
+-    raise NotImplementedError("slugify is not implemented yet")
++    import re
++
++    text = text.lower()
++    text = re.sub(r"[^a-z0-9]+", "-", text)
++    return text.strip("-")

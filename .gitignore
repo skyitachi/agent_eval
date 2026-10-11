@@ -1,0 +1,19 @@
+# Build output
+/aeval
+/bin/
+
+# Results. The database is the artefact worth keeping, but it is per-machine
+# state rather than source.
+*.db
+*.db-wal
+*.db-shm
+/reports/
+
+# Reports written into the working tree by `aeval run --report` / `report` / `compare`.
+/report-*.html
+/compare.html
+
+# Editors
+.DS_Store
+.idea/
+.vscode/

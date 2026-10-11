@@ -1,0 +1,25 @@
+name: demo-basic
+version: 1.0.0
+description: |
+  Small self-contained demo dataset used by the README quickstart and CI smoke tests.
+  Covers the three most common grading shapes: visible pytest suite, hidden pytest
+  suite injected at grade time, and a stdout answer scored by exact_match.
+license: Apache-2.0
+
+tasks_file: tasks.jsonl
+
+defaults:
+  limits:
+    max_turns: 30
+    timeout_s: 600
+  output:
+    type: patch
+    ignore_paths:
+      - "*.pyc"
+      - "__pycache__/**"
+      - ".pytest_cache/**"
+      - "node_modules/**"
+  graders:
+    - type: patch
+      name: patch-applied
+      weight: 1

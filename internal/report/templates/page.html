@@ -1,0 +1,64 @@
+{{- /* The page shell.
+   *
+   * All three outputs -- a single run, the run index, a comparison -- share
+   * this shell and differ only in (a) the payload they embed and (b) the mode
+   * attribute the client reads. Putting the routing in the client rather than
+   * in three near-identical templates is what keeps the file report and the
+   * served report from drifting apart.
+   *
+   * CSS and JS are inlined by default so the output is one file that works from
+   * a file:// URL, an email attachment or a USB stick. The non-standalone branch
+   * exists for the web server, which serves them once and caches them.
+   */ -}}
+{{- define "page" -}}
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{.Title}}</title>
+{{- if .MetaRefresh}}
+<meta http-equiv="refresh" content="{{.MetaRefresh}}">
+{{- end}}
+{{- if .Standalone}}
+<style>{{.CSS}}</style>
+{{- else}}
+<link rel="stylesheet" href="{{.AssetBase}}app.css">
+{{- end}}
+</head>
+<body data-mode="{{.Mode}}">
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" id="brand" href="{{.Home}}"></a>
+    <nav class="nav" id="nav">
+      {{- range .Nav}}
+      <a href="{{.Href}}"{{if .Active}} class="active"{{end}}>{{.Label}}</a>
+      {{- end}}
+    </nav>
+    <div class="topbar-actions">
+      <input type="search" id="global-search" class="search" placeholder="Filter" autocomplete="off" aria-label="Filter rows">
+      <button type="button" class="btn ghost" id="theme-toggle" title="Switch between light and dark">Theme</button>
+      <button type="button" class="btn ghost" id="export-btn" title="Download the embedded payload as JSON">JSON</button>
+      <button type="button" class="btn ghost" id="print-btn" title="Print, or save as PDF">Print</button>
+    </div>
+  </div>
+</header>
+<main id="main"></main>
+<aside id="drawer" class="drawer" hidden aria-live="polite"></aside>
+
+{{/* The payload is a JS object literal rather than a data script element.
+     A <script> body is a raw-text element: the parser performs no entity
+     decoding inside it, so the payload survives byte for byte, and the value is
+     already a valid expression because JSON is a subset of JS. The encoder
+     guarantees it contains no "<", so it can neither close the element early
+     nor open an HTML comment. */}}
+<script>window.__AEVAL_PAYLOAD__ = {{.Payload}};</script>
+{{- if .Standalone}}
+<script>{{.JS}}</script>
+{{- else}}
+<script src="{{.AssetBase}}app.js"></script>
+{{- end}}
+</body>
+</html>
+{{- end -}}
