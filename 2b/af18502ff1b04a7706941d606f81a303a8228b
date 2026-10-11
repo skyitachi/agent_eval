@@ -1,0 +1,234 @@
+.gitignore
+  h_5a1c62fd74efa2 1-19
+.workbuddy/memory/2026-10-09.md
+  h_5a1c62fd74efa2 1-148
+.workbuddy/memory/2026-10-10.md
+  h_5a1c62fd74efa2 1-64
+.workbuddy/memory/2026-10-11.md
+  h_5a1c62fd74efa2 1-40
+.workbuddy/memory/MEMORY.md
+  h_5a1c62fd74efa2 1-112
+README.md
+  h_5a1c62fd74efa2 1-592
+README.zh-CN.md
+  h_5a1c62fd74efa2 1-427
+cmd/aeval/main.go
+  h_5a1c62fd74efa2 1-1197
+datasets/demo/dataset.yaml
+  h_5a1c62fd74efa2 1-25
+datasets/demo/grades/implement-slugify/test_slugify.py
+  h_5a1c62fd74efa2 1-33
+datasets/demo/oracles/fix-average.patch
+  h_5a1c62fd74efa2 1-10
+datasets/demo/oracles/implement-slugify.patch
+  h_5a1c62fd74efa2 1-12
+datasets/demo/prompts/fix-average.md
+  h_5a1c62fd74efa2 1-21
+datasets/demo/prompts/implement-slugify.md
+  h_5a1c62fd74efa2 1-34
+datasets/demo/prompts/read-and-answer.md
+  h_5a1c62fd74efa2 1-15
+datasets/demo/single_task.json
+  h_5a1c62fd74efa2 1-24
+datasets/demo/tasks.jsonl
+  h_5a1c62fd74efa2 1-3
+datasets/demo/workspaces/fix-average/calc.py
+  h_5a1c62fd74efa2 1-12
+datasets/demo/workspaces/fix-average/test_calc.py
+  h_5a1c62fd74efa2 1-23
+datasets/demo/workspaces/implement-slugify/slugify.py
+  h_5a1c62fd74efa2 1-9
+datasets/demo/workspaces/read-and-answer/logic.py
+  h_5a1c62fd74efa2 1-14
+docs/design.md
+  h_5a1c62fd74efa2 1-8
+docs/real-repo-eval.md
+  h_5a1c62fd74efa2 1-336
+docs/rl-environment.md
+  h_5a1c62fd74efa2 1-379
+examples/aeval.yaml
+  h_5a1c62fd74efa2 1-257
+go.mod
+  h_5a1c62fd74efa2 1-20
+go.sum
+  h_5a1c62fd74efa2 1-54
+internal/agent/agent.go
+  h_5a1c62fd74efa2 1-259
+internal/agent/agent_test.go
+  h_5a1c62fd74efa2 1-317
+internal/agent/claude.go
+  h_5a1c62fd74efa2 1-393
+internal/agent/mock.go
+  h_5a1c62fd74efa2 1-156
+internal/agent/registry.go
+  h_5a1c62fd74efa2 1-87
+internal/audit/audit.go
+  h_5a1c62fd74efa2 1-693
+internal/audit/audit_test.go
+  h_5a1c62fd74efa2 1-476
+internal/config/config.go
+  h_5a1c62fd74efa2 1-410
+internal/config/config_test.go
+  h_5a1c62fd74efa2 1-626
+internal/dataset/loader.go
+  h_5a1c62fd74efa2 1-554
+internal/dataset/loader_test.go
+  h_5a1c62fd74efa2 1-250
+internal/dataset/reward_test.go
+  h_5a1c62fd74efa2 1-255
+internal/dataset/spec.go
+  h_5a1c62fd74efa2 1-413
+internal/engine/backend.go
+  h_5a1c62fd74efa2 1-189
+internal/engine/demo_integration_test.go
+  h_5a1c62fd74efa2 1-258
+internal/engine/engine.go
+  h_5a1c62fd74efa2 1-1124
+internal/engine/engine_test.go
+  h_5a1c62fd74efa2 1-1624
+internal/engine/guard.go
+  h_5a1c62fd74efa2 1-77
+internal/engine/record.go
+  h_5a1c62fd74efa2 1-370
+internal/engine/verify.go
+  h_5a1c62fd74efa2 1-160
+internal/engine/verify_test.go
+  h_5a1c62fd74efa2 1-444
+internal/engine/workspace.go
+  h_5a1c62fd74efa2 1-80
+internal/grader/artifacts.go
+  h_5a1c62fd74efa2 1-106
+internal/grader/command.go
+  h_5a1c62fd74efa2 1-232
+internal/grader/exact_match.go
+  h_5a1c62fd74efa2 1-281
+internal/grader/grader.go
+  h_5a1c62fd74efa2 1-539
+internal/grader/grader_test.go
+  h_5a1c62fd74efa2 1-803
+internal/grader/llm_judge.go
+  h_5a1c62fd74efa2 1-402
+internal/grader/patch.go
+  h_5a1c62fd74efa2 1-162
+internal/grader/pytest.go
+  h_5a1c62fd74efa2 1-423
+internal/grader/regex.go
+  h_5a1c62fd74efa2 1-34
+internal/llm/client.go
+  h_5a1c62fd74efa2 1-415
+internal/metric/builtin.go
+  h_5a1c62fd74efa2 1-641
+internal/metric/custom.go
+  h_5a1c62fd74efa2 1-581
+internal/metric/expr.go
+  h_5a1c62fd74efa2 1-1091
+internal/metric/metric.go
+  h_5a1c62fd74efa2 1-539
+internal/metric/metric_test.go
+  h_5a1c62fd74efa2 1-861
+internal/report/assets/app.css
+  h_5a1c62fd74efa2 1-542
+internal/report/assets/app.js
+  h_5a1c62fd74efa2 1-1132
+internal/report/load.go
+  h_5a1c62fd74efa2 1-1308
+internal/report/model.go
+  h_5a1c62fd74efa2 1-397
+internal/report/render.go
+  h_5a1c62fd74efa2 1-277
+internal/report/report_test.go
+  h_5a1c62fd74efa2 1-1211
+internal/report/templates/page.html
+  h_5a1c62fd74efa2 1-64
+internal/reward/reward.go
+  h_5a1c62fd74efa2 1-130
+internal/reward/reward_test.go
+  h_5a1c62fd74efa2 1-121
+internal/rlenv/rlenv.go
+  h_5a1c62fd74efa2 1-1052
+internal/rlenv/rlenv_test.go
+  h_5a1c62fd74efa2 1-929
+internal/sandbox/docker.go
+  h_5a1c62fd74efa2 1-364
+internal/sandbox/glob.go
+  h_5a1c62fd74efa2 1-136
+internal/sandbox/local.go
+  h_5a1c62fd74efa2 1-180
+internal/sandbox/paths.go
+  h_5a1c62fd74efa2 1-30
+internal/sandbox/sandbox.go
+  h_5a1c62fd74efa2 1-216
+internal/sandbox/sandbox_test.go
+  h_5a1c62fd74efa2 1-446
+internal/sandbox/testdata/assets/from_assets.txt
+  h_5a1c62fd74efa2 1
+internal/sandbox/workspace.go
+  h_5a1c62fd74efa2 1-564
+internal/storage/schema.sql
+  h_5a1c62fd74efa2 1-194
+internal/storage/store.go
+  h_5a1c62fd74efa2 1-1174
+internal/storage/store_test.go
+  h_5a1c62fd74efa2 1-1389
+internal/trace/parser.go
+  h_5a1c62fd74efa2 1-413
+internal/trace/parser_test.go
+  h_5a1c62fd74efa2 1-215
+internal/trace/testdata/bare_stream.jsonl
+  h_5a1c62fd74efa2 1-5
+internal/trace/testdata/read_tool_stream.jsonl
+  h_5a1c62fd74efa2 1-50
+internal/trace/trace.go
+  h_5a1c62fd74efa2 1-275
+internal/web/rl.go
+  h_5a1c62fd74efa2 1-331
+internal/web/rl_test.go
+  h_5a1c62fd74efa2 1-670
+internal/web/server.go
+  h_5a1c62fd74efa2 1-478
+internal/web/server_test.go
+  h_5a1c62fd74efa2 1-567
+tests/e2e_test.go
+  h_5a1c62fd74efa2 1-1293
+tests/testdata/agents/bad.sh
+  h_5a1c62fd74efa2 1-36
+tests/testdata/agents/good.sh
+  h_5a1c62fd74efa2 1-40
+tests/testdata/audit/dataset.yaml
+  h_5a1c62fd74efa2 1-23
+tests/testdata/audit/oracles/sound.patch
+  h_5a1c62fd74efa2 1-7
+tests/testdata/audit/oracles/unsolvable.patch
+  h_5a1c62fd74efa2 1-6
+tests/testdata/audit/tasks.jsonl
+  h_5a1c62fd74efa2 1-3
+tests/testdata/audit/workspaces/solved/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/audit/workspaces/sound/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/audit/workspaces/unsolvable/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/rlenv/dataset.yaml
+  h_5a1c62fd74efa2 1-22
+tests/testdata/rlenv/tasks.jsonl
+  h_5a1c62fd74efa2 1-3
+tests/testdata/rlenv/workspaces/sparse/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/rlenv/workspaces/subtract/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/rlenv/workspaces/tamper/thing.py
+  h_5a1c62fd74efa2 1-6
+tests/testdata/rlenv/workspaces/tamper/verifier.py
+  h_5a1c62fd74efa2 1-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2baf18502ff1b04a7706941d606f81a303a8228b",
+  "prompts": {},
+  "humans": {
+    "h_5a1c62fd74efa2": {
+      "author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
