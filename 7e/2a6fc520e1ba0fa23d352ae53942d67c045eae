@@ -1,0 +1,29 @@
+internal/session/collect.go
+  s_7bc19e1c740b1e::t_71232d21fe96de 230,233
+  s_7bc19e1c740b1e::t_a6b6d0206d7cb3 375-381,383-389,391-395,398,403,405,408,411-417,420-426
+cmd/aeval/main.go
+  s_7bc19e1c740b1e::t_d843482e6d659c 438
+  s_7bc19e1c740b1e::t_c0fe4a9bc77e5e 743-744
+README.zh-CN.md
+  s_7bc19e1c740b1e::t_0fb3ce8c1f9645 316-319,322-325
+README.md
+  s_7bc19e1c740b1e::t_2f57e90f4562d0 368-375,379-384
+internal/session/collect_test.go
+  s_7bc19e1c740b1e::t_7b2a6fae20f212 756,783,785-792,824-826,828-829
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.49-trip",
+  "base_commit_sha": "7e2a6fc520e1ba0fa23d352ae53942d67c045eae",
+  "prompts": {},
+  "sessions": {
+    "s_7bc19e1c740b1e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ce5399f-b2ed-456e-9620-9fb6a4cb703e",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "yaosp <yaosp@trip.com>"
+    }
+  }
+}
