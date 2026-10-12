@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,14 +112,6 @@ type Item struct {
 	// BaselineFile is where Baseline is written, relative to the dataset
 	// directory. Task.Baseline.File points at it.
 	BaselineFile string
-	// SnapshotFrom is a host directory to copy into Task.Workspace.Assets when
-	// the dataset is written. Empty for every other kind of workspace.
-	//
-	// It is a field rather than something the writer re-derives because the
-	// copy has to happen where the dataset directory is known, which is not
-	// here -- and because a dry run must plan the workspace without performing
-	// it.
-	SnapshotFrom string
 }
 
 // Collect converts parsed sessions into tasks and baselines.
@@ -236,13 +227,10 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 	// A binding note describes what the workspace is, so it leads: it says
 	// whether the replay starts where the recording did, which is the first
 	// thing a reader of the comparison needs to know.
-	var (
-		boundNote string
-		snapshot  string
-	)
+	var boundNote string
 	if opts.WorkspaceCwd {
 		var err error
-		ws, boundNote, snapshot, err = bindCwd(s, opts)
+		ws, boundNote, err = bindCwd(s, opts)
 		if err != nil {
 			return Item{}, err
 		}
@@ -358,7 +346,6 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 			EditedFiles: editedFiles(s, turns),
 		},
 		BaselineFile: baselineFile,
-		SnapshotFrom: snapshot,
 	}, nil
 }
 
@@ -382,71 +369,61 @@ func workspace(opts Options) dataset.Workspace {
 // Binding a task to the directory its recording ran in
 // ---------------------------------------------------------------------------
 
-// maxSnapshotBytes caps what collect will copy into a dataset for one recording.
-//
-// The copy exists so a replay can have the files the recording had, and the
-// cost of that is a dataset that carries them. A directory past this size is
-// refused rather than silently copied: a gigabyte of assets turns every
-// `validate`, every `run` and every report into a copy of it, and the caller is
-// better off binding a repository instead.
-const maxSnapshotBytes = 256 << 20
-
 // bindCwd binds one task to the directory its recording ran in, and says what
 // the binding is.
 //
-// Two things are being decided, and both follow from what a transcript holds.
-// It records the directory a session ran in and the branch it was on, but not
-// the commit, so the tree the agent actually started from is not recoverable
-// from the capture -- for any workspace at all. What is recoverable is:
+// A transcript records the directory a session ran in and the branch it was on,
+// but not the commit, so the tree the agent actually started from is not
+// recoverable from the capture. What is recoverable is a repository cloned at
+// the recorded branch, which starts the replay from that branch's current tip;
+// the materializer drops the history, which is what stops the agent reading the
+// fix out of it. The note says the branch is as it stands now, because a commit
+// the recorded session made on it is in there.
 //
-//   - a repository with a commit: cloned at the recorded branch, so the replay
-//     starts from that branch's current tip. The history is dropped by the
-//     materializer, which is what stops the agent reading the fix out of it.
-//   - anything else: copied whole, exactly as it stands now.
+// Nothing is copied into the dataset. A recording that ran in a directory which
+// is not a repository cannot be reproduced at all, and saying so is the point:
+// copying the directory as it stands now would hand the replay a tree that
+// already contains whatever that session did, and a baseline comparison against
+// it would measure the copy rather than the agent. --workspace-repo names a
+// starting point instead, which is a decision the caller can make and this
+// package cannot.
 //
-// The second is the one to be careful with, and the note says so: "as it stands
-// now" is after the recorded session finished, so if that session fixed
-// something in there, the replay starts with it already fixed. That is the
-// caller's decision to make and not this package's, which is why it is printed
-// and recorded rather than assumed -- and it is also why the first case is
-// preferred whenever a commit exists to clone.
-//
-// The error for a directory that is gone is deliberate. --workspace-cwd means
-// "use the directory the recording ran in", and quietly falling back to an
-// empty workspace would produce a task that looks bound and measures nothing.
-func bindCwd(s *Session, opts Options) (dataset.Workspace, string, string, error) {
+// The error for a directory that is gone is deliberate for the same reason.
+// --workspace-cwd means "use the directory the recording ran in", and quietly
+// falling back to an empty workspace would produce a task that looks bound and
+// measures nothing.
+func bindCwd(s *Session, opts Options) (dataset.Workspace, string, error) {
 	cwd := s.Cwd
 	if cwd == "" {
-		return dataset.Workspace{}, "", "", fmt.Errorf(
+		return dataset.Workspace{}, "", fmt.Errorf(
 			"session %s records no working directory, so --workspace-cwd has nothing to bind "+
 				"(use --workspace-repo to name one)", shortID(s.ID))
 	}
 	if info, err := os.Stat(cwd); err != nil {
-		return dataset.Workspace{}, "", "", fmt.Errorf(
+		return dataset.Workspace{}, "", fmt.Errorf(
 			"the directory session %s ran in (%s) is not there any more, so --workspace-cwd cannot "+
-				"reproduce it (pass --workspace-repo to point somewhere that exists): %w",
+				"bind it (pass --workspace-repo to point somewhere that exists): %w",
 			shortID(s.ID), cwd, err)
 	} else if !info.IsDir() {
-		return dataset.Workspace{}, "", "", fmt.Errorf(
+		return dataset.Workspace{}, "", fmt.Errorf(
 			"session %s ran in %s, which is not a directory", shortID(s.ID), cwd)
 	}
-
-	if hasCommit(cwd) {
-		ref := s.GitBranch
-		note := "bound to the repository the recorded session ran in (" + cwd + ")"
-		if ref != "" {
-			note += " at branch " + ref
-		}
-		note += "; the transcript records the branch and not the commit, so this is that branch as it stands now"
-		return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: ref}, note, "", nil
+	if !hasCommit(cwd) {
+		return dataset.Workspace{}, "", fmt.Errorf(
+			"the directory session %s ran in (%s) is not a git repository with a commit, so "+
+				"--workspace-cwd cannot bind it: the transcript records the branch and not the commit, "+
+				"and the directory as it stands now is after that session finished, so a replay would "+
+				"start from the answer (pass --workspace-repo to name a starting point)",
+			shortID(s.ID), cwd)
 	}
 
-	// Not a repository, or a repository with no commits -- which clones to
-	// nothing. Copying is the only way to get those files back.
-	assets := filepath.ToSlash(filepath.Join("assets", sanitizeID(s.ID)))
-	note := "copied from the directory the recorded session ran in (" + cwd + ") as it stands now, " +
-		"which is after that session finished: the transcript does not record the commit it started from"
-	return dataset.Workspace{Type: dataset.WorkspaceFiles, Assets: assets}, note, cwd, nil
+	ref := s.GitBranch
+	note := "bound to the repository the recorded session ran in (" + cwd + ")"
+	if ref != "" {
+		note += " at branch " + ref
+	}
+	note += "; the transcript records the branch and not the commit, so this is that branch as it stands now"
+	return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: ref}, note, nil
 }
 
 // hasCommit reports whether dir is a git repository with at least one commit.
@@ -466,71 +443,6 @@ func hasCommit(dir string) bool {
 		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
 	return cmd.Run() == nil
-}
-
-// snapshotTree copies src into dst, leaving .git behind.
-//
-// The history is dropped for the same reason the materializer drops it from a
-// clone: a .git in the workspace is a history the agent can read the answer out
-// of, and it would also be committed as though it were part of the baseline the
-// agent started from.
-func snapshotTree(src, dst string) error {
-	var total int64
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return os.MkdirAll(dst, 0o755)
-		}
-		if d.IsDir() {
-			if d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return os.MkdirAll(filepath.Join(dst, rel), 0o755)
-		}
-		if !d.Type().IsRegular() {
-			return nil // skip sockets, devices, fifos
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		total += info.Size()
-		if total > maxSnapshotBytes {
-			return fmt.Errorf("the directory is larger than the %d MiB collect will copy into a "+
-				"dataset; bind a repository with --workspace-repo instead", maxSnapshotBytes>>20)
-		}
-		return copyFileInto(path, filepath.Join(dst, rel))
-	})
-}
-
-func copyFileInto(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, info.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
 }
 
 // deriveLimits sizes an attempt against the recorded one.
@@ -804,9 +716,6 @@ func WriteDataset(dir string, name string, description string, items []Item) err
 	if err := writeBaselines(dir, items); err != nil {
 		return err
 	}
-	if err := writeSnapshots(dir, items); err != nil {
-		return err
-	}
 
 	manifest := dataset.Manifest{
 		Name:        name,
@@ -916,9 +825,6 @@ func AppendDataset(dir, name, description string, items []Item) (AppendResult, e
 		return res, err
 	}
 	if err := writeBaselines(dir, res.Added); err != nil {
-		return res, err
-	}
-	if err := writeSnapshots(dir, res.Added); err != nil {
 		return res, err
 	}
 	lines, err := encodeTasks(res.Added)
@@ -1072,36 +978,6 @@ func encodeTasks(items []Item) (string, error) {
 		buf.WriteByte('\n')
 	}
 	return buf.String(), nil
-}
-
-// writeSnapshots copies each item's SnapshotFrom into the dataset.
-//
-// The destination is Task.Workspace.Assets, which the loader resolves against
-// the dataset directory, so a task whose assets are missing is a task that
-// silently materializes as an empty workspace. Copying before the task lines
-// that name them is the same ordering the baselines use: an interrupted write
-// leaves an unreferenced directory rather than a task pointing at nothing.
-//
-// A directory that is already there is copied over rather than replaced. Two
-// tasks from one recording share a destination, and the alternative -- removing
-// the directory first -- would delete whatever else a reader had put beside the
-// snapshot in order to keep a copy fresh that is about to hold the same files.
-func writeSnapshots(dir string, items []Item) error {
-	done := map[string]bool{}
-	for _, it := range items {
-		if it.SnapshotFrom == "" || it.Task.Workspace.Assets == "" {
-			continue
-		}
-		target := filepath.Join(dir, filepath.FromSlash(it.Task.Workspace.Assets))
-		if done[target] {
-			continue
-		}
-		done[target] = true
-		if err := snapshotTree(it.SnapshotFrom, target); err != nil {
-			return fmt.Errorf("snapshot %s into %s: %w", it.SnapshotFrom, target, err)
-		}
-	}
-	return nil
 }
 
 // writeBaselines writes one baseline document per item.

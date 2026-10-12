@@ -365,22 +365,23 @@ aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
 ```
 
 - A directory that is a git repository **with a commit** becomes `type: git`,
-  pinned to the branch the recording was on. The commit is not recorded, and the
-  task's notes say so.
-- Anything else — no repository, or a repository with no commits — is copied
-  into the dataset as `type: files` under `assets/<task-id>/`, with `.git`
-  excluded. The copy is "as it stands now", meaning after the recording
-  finished, and the task says that too.
+  pinned to the branch the recording was on. The commit is not recorded, so a
+  commit the recording made on that branch is in the tree the replay starts
+  from; the task's notes say so.
+- Anything else — no repository, or a repository with no commits — is refused,
+  naming the directory and pointing at `--workspace-repo`. Nothing is copied:
+  a copy would be the directory *after* the recording finished, so if that
+  session fixed something in there the replay would start from the answer, and
+  the baseline comparison would measure the copy rather than the agent.
 A directory that no longer exists is an error naming it, not a silently empty
 task.
 
-That first case produces a `type: git` workspace, and materialising one is
-where an empty repository would do its damage: `git clone` of a repository with
-no commits *succeeds* and carries nothing, so the run would silently measure an
-empty directory. It is refused instead, by name and with the reason (no commit
-at the branch, versus a ref that does not exist — the second is not the
-repository's fault). `--workspace-cwd` never reaches that path: it sends a
-commit-less repository down the `files` route above.
+Materialising a `type: git` workspace is where an empty repository would do its
+damage: `git clone` of a repository with no commits *succeeds* and carries
+nothing, so the run would silently measure an empty directory. It is refused
+instead, by name and with the reason (no commit at the branch, versus a ref that
+does not exist — the second is not the repository's fault). `--workspace-cwd`
+never reaches that path: it refuses a commit-less repository up front.
 
 Without the flag, an empty replay carries a note naming the recorded directory —
 so the gap is visible in the report rather than implied by an empty page, and

@@ -753,7 +753,7 @@ func TestABoundWorkspaceIsNotAlsoCalledAnEmptyReplay(t *testing.T) {
 
 // TestWorkspaceCwdClonesARepositoryWithACommit: a repository can be reproduced
 // faithfully enough to be worth preferring -- the branch is what the transcript
-// records -- so it is bound as a repository rather than copied.
+// records -- so it is bound as a repository.
 func TestWorkspaceCwdClonesARepositoryWithACommit(t *testing.T) {
 	dir := t.TempDir()
 	gitIn(t, dir, "init", "--quiet")
@@ -773,9 +773,6 @@ func TestWorkspaceCwdClonesARepositoryWithACommit(t *testing.T) {
 	if got.Type != dataset.WorkspaceGit || got.Repo != dir || got.Ref != "main" {
 		t.Fatalf("workspace = %+v, want the repository at its recorded branch", got)
 	}
-	if items[0].SnapshotFrom != "" {
-		t.Error("a cloned workspace has no snapshot to write")
-	}
 	// The note is what stops the comparison being read as like-for-like: the
 	// branch is not the commit.
 	if !strings.Contains(items[0].Baseline.Notes, "records the branch and not the commit") {
@@ -783,11 +780,16 @@ func TestWorkspaceCwdClonesARepositoryWithACommit(t *testing.T) {
 	}
 }
 
-// TestWorkspaceCwdCopiesWhatCannotBeCloned covers both halves of one rule: a
+// TestWorkspaceCwdRefusesWhatCannotBeCloned covers both halves of one rule: a
 // directory that is not a repository, and one that is but has no commits. The
-// second is the case that looks bindable and clones to nothing, which is
-// exactly the recorded directory that started this.
-func TestWorkspaceCwdCopiesWhatCannotBeCloned(t *testing.T) {
+// second is the case that looks bindable and clones to nothing.
+//
+// Neither is copied. A copy would be the directory as it stands now, which is
+// after the recorded session finished -- so if that session fixed something in
+// there, the replay starts from the answer and the baseline comparison measures
+// the copy instead of the agent. Refusing says that plainly; copying hides it in
+// a task that looks bound.
+func TestWorkspaceCwdRefusesWhatCannotBeCloned(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// prepare makes the directory and returns it.
@@ -819,68 +821,14 @@ func TestWorkspaceCwdCopiesWhatCannotBeCloned(t *testing.T) {
 			dir := tc.prepare(t)
 			s := parseFixture(t)
 			s.Cwd, s.GitBranch = dir, "main"
-			items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
-			if err != nil {
-				t.Fatal(err)
+			_, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+			if err == nil {
+				t.Fatal("a directory that cannot be cloned must be refused, not copied")
 			}
-			got := items[0].Task.Workspace
-			if got.Type != dataset.WorkspaceFiles || got.Assets == "" {
-				t.Fatalf("workspace = %+v, want a copy of the directory", got)
-			}
-			if items[0].SnapshotFrom != dir {
-				t.Errorf("SnapshotFrom = %q, want the recorded directory", items[0].SnapshotFrom)
-			}
-			// The copy is the directory as it stands now, which is after the
-			// session finished. That is the one thing about this binding a
-			// reader has to know and cannot infer.
-			if !strings.Contains(items[0].Baseline.Notes, "as it stands now") ||
-				!strings.Contains(items[0].Baseline.Notes, "does not record the commit") {
-				t.Errorf("the copy must be labelled with what it is, got: %q", items[0].Baseline.Notes)
+			if !strings.Contains(err.Error(), dir) || !strings.Contains(err.Error(), "--workspace-repo") {
+				t.Errorf("the error must name the directory and the way out, got: %v", err)
 			}
 		})
-	}
-}
-
-// TestTheCopiedWorkspaceIsWrittenWithoutItsHistory: .git is excluded, and not
-// only for tidiness. The materializer commits the workspace as the baseline the
-// agent starts from, so a carried-over .git is a history the agent can read the
-// answer out of -- the same reason a clone drops it.
-func TestTheCopiedWorkspaceIsWrittenWithoutItsHistory(t *testing.T) {
-	dir := t.TempDir()
-	gitIn(t, dir, "init", "--quiet")
-	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dir, "nested", ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "nested", "keep.py"), []byte("y\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	s := parseFixture(t)
-	s.Cwd = dir
-	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := filepath.Join(t.TempDir(), "ds")
-	if err := WriteDataset(out, "copied", "", items); err != nil {
-		t.Fatalf("WriteDataset: %v", err)
-	}
-
-	assets := filepath.Join(out, filepath.FromSlash(items[0].Task.Workspace.Assets))
-	for _, rel := range []string{".git", filepath.Join("nested", ".git")} {
-		if _, err := os.Stat(filepath.Join(assets, rel)); err == nil {
-			t.Errorf("%s was copied into the dataset; the agent could read it as history", rel)
-		}
-	}
-	// The rest of the tree comes across, including the directory that held a
-	// .git of its own: only the history is dropped, not the contents.
-	for _, rel := range []string{"README.md", filepath.Join("nested", "keep.py")} {
-		if _, err := os.Stat(filepath.Join(assets, rel)); err != nil {
-			t.Errorf("%s did not survive the copy: %v", rel, err)
-		}
 	}
 }
 

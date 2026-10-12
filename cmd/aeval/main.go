@@ -435,7 +435,7 @@ func warnUnboundReplays(w io.Writer, items []session.Item) {
 	}
 	fmt.Fprintf(w, "warning: %d task(s) replay in an empty workspace, but their recordings ran in %s%s.\n"+
 		"         A transcript does not carry the files a session worked on, so those replays start\n"+
-		"         without them. Re-collect with --workspace-cwd to put each recording's directory back,\n"+
+		"         without them. Re-collect with --workspace-cwd to bind each recording's repository,\n"+
 		"         or pass --workspace-repo <repo> --ref <commit> to bind one repository to all of them.\n",
 		n, strings.Join(shown, ", "), more)
 }
@@ -740,8 +740,8 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	if !*wsCwd {
 		warnUnboundReplays(stderr, plan.Added)
 	} else {
-		fmt.Fprintln(stderr, "note: --workspace-cwd reproduces each recording's directory as it stands "+
-			"now, which is after that recording finished; any fix the recorded session made is already in it")
+		fmt.Fprintln(stderr, "note: --workspace-cwd binds each recording's repository at the branch it ran on; "+
+			"a transcript records the branch and not the commit, so that is the branch as it stands now")
 	}
 	fmt.Fprintf(stdout, "\nNext: aeval validate --dataset %s\n", filepath.Join(dir, "dataset.yaml"))
 	return exitOK
