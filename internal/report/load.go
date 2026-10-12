@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/runner"
 	"github.com/skyitachi/agenteval/internal/store"
@@ -100,6 +102,7 @@ func LoadComparison(ctx context.Context, st *store.Store, leftID, rightID string
 	data := build(rightRun, right, opts)
 	data.Title = fmt.Sprintf("%s vs %s", label(leftRun), label(rightRun))
 	data.Compare = compare(leftRun, left, rightRun, right, opts)
+	data.Warnings = append(data.Warnings, comparisonWarnings(leftRun, rightRun)...)
 	return data, nil
 }
 
@@ -192,7 +195,7 @@ func build(run store.Run, attempts []store.Attempt, opts Options) *Data {
 	data.Metrics = metrics(summary)
 	data.Breakdowns = breakdowns(attempts, summary)
 	if !opts.NoTaskDetail {
-		data.Tasks = tasks(attempts, opts)
+		data.Tasks = tasks(attempts, run.AgentKind, opts)
 		data.Warnings = append(data.Warnings, fit(data, opts)...)
 	} else {
 		data.Warnings = append(data.Warnings, "per-task detail was omitted on request")
@@ -243,12 +246,89 @@ func runInfo(run store.Run, s runner.Summary) RunInfo {
 		SweepID:     run.SweepID,
 		Notes:       run.Notes,
 		ToolVersion: run.ToolVersion,
+		Skills:      skillView(run),
 		Summary:     s,
+		// Taken straight off the row. Nothing on an attempt says which cells
+		// shared a workspace, so a run whose flag was lost would be rendered as
+		// a set of independent samples -- the one reading that is certainly
+		// wrong about a chain.
+		ChainSessions: run.ChainSessions,
 	}
 	if run.EndedAt != nil {
 		info.EndedAt = run.EndedAt.UTC().Format(time.RFC3339)
 	}
 	return info
+}
+
+// skillView renders what a run's recorded configuration says about skills, or
+// nil when it recorded none.
+//
+// Nil is not "none": the harness only started storing the configuration in
+// schema v4, so every earlier row answers this question with silence, and a page
+// that turns silence into "this run loaded nothing" is asserting something it
+// was never told.
+func skillView(run store.Run) *Skills {
+	spec, ok := run.AgentSpec()
+	if !ok {
+		return nil
+	}
+	sv := &Skills{Dirs: spec.SkillsDeclared(), Active: spec.SkillsActive()}
+	switch {
+	case len(sv.Dirs) == 0:
+		sv.Text = "none declared"
+	case sv.Active:
+		sv.Text = fmt.Sprintf("%d plugin dir(s)", len(sv.Dirs))
+	default:
+		sv.RemovedBy = spec.SkillsReason()
+		sv.Text = fmt.Sprintf("%d plugin dir(s), not loaded (%s)", len(sv.Dirs), sv.RemovedBy)
+	}
+	return sv
+}
+
+// loadedSkills is the set that actually reached the agent.
+//
+// A declared directory that the isolation flags removed is not a skill the run
+// had, so two runs whose declarations differ only in inert entries are running
+// the same agent configuration -- and reporting that as a difference would make
+// the one real skill difference harder to see.
+func loadedSkills(spec agent.Spec) []string {
+	if !spec.SkillsActive() {
+		return nil
+	}
+	return spec.SkillsDeclared()
+}
+
+// skillLabel names a set of plugin directories for a sentence, capped so that
+// two of them fit on a line.
+func skillLabel(dirs []string) string {
+	switch len(dirs) {
+	case 0:
+		return "none"
+	case 1, 2:
+		return strings.Join(dirs, ", ")
+	default:
+		return fmt.Sprintf("%s and %d more", strings.Join(dirs[:2], ", "), len(dirs)-2)
+	}
+}
+
+// chainedLabel names the two states of the chaining flag for a sentence.
+func chainedLabel(chained bool) string {
+	if chained {
+		return "chained"
+	}
+	return "not chained"
+}
+
+func sameSkills(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func count(s runner.Summary) Counts {
@@ -445,7 +525,10 @@ func stopReasons(attempts []store.Attempt) Breakdown {
 	return b
 }
 
-func tasks(attempts []store.Attempt, opts Options) []Task {
+// tasks projects the cells. runAgent is the agent the run itself drove, which
+// the baseline card needs in order to say whether the recording it shows was
+// made by the same one.
+func tasks(attempts []store.Attempt, runAgent string, opts Options) []Task {
 	out := make([]Task, 0, len(attempts))
 	for _, a := range attempts {
 		t := Task{
@@ -473,7 +556,7 @@ func tasks(attempts []store.Attempt, opts Options) []Task {
 			Error:        a.Error,
 		}
 		diff, answer := clip(a.Diff, opts.MaxFieldBytes), clip(a.Answer, opts.MaxFieldBytes)
-		t.Baseline = baselineView(a, opts.MaxFieldBytes)
+		t.Baseline = baselineView(a, runAgent, opts.MaxFieldBytes)
 		// The recorded answer is a text field like any other, so it counts
 		// against the same budget and says so the same way when it is cut.
 		if diff != a.Diff || answer != a.Answer ||
@@ -529,7 +612,7 @@ func (t Task) priority() int {
 	}
 }
 
-func baselineView(a store.Attempt, maxField int) *BaselineView {
+func baselineView(a store.Attempt, runAgent string, maxField int) *BaselineView {
 	b, ok := a.ComparableBaseline()
 	if !ok {
 		// No comparison is shown for a cell that was never measured, so the row
@@ -550,7 +633,40 @@ func baselineView(a store.Attempt, maxField int) *BaselineView {
 		HasTokens:  hasTokens,
 		HasTime:    hasTime,
 		Output:     clip(b.Output, maxField),
+		// The provenance is not clipped: it is a name, not a transcript. The
+		// notes are, because a capture is free to write an essay there.
+		AgentName:      b.AgentName,
+		AgentModel:     b.AgentModel,
+		Source:         b.Source,
+		DifferentAgent: !sameAgent(b.AgentName, runAgent),
+		Notes:          clip(b.Notes, maxField),
 	}
+}
+
+// sameAgent reports whether a recording's producer and a run's implementation
+// are the same agent.
+//
+// The two names come from different layers and are spelled differently: a
+// recording names its producer the way the capture wrote it ("claude-code",
+// "cursor"), while a run names the implementation it registered ("claude_code").
+// Comparing them literally would flag every collected-and-replayed Claude Code
+// baseline as cross-agent, and a warning that fires on the ordinary case is how
+// the one real warning gets ignored.
+//
+// An unknown name on either side counts as "not different": an empty field is
+// the absence of a record, and the report already says that separately. It is
+// not evidence of a different agent.
+func sameAgent(recorded, ran string) bool {
+	if recorded == "" || ran == "" {
+		return true
+	}
+	fold := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, "-", "")
+		s = strings.ReplaceAll(s, "_", "")
+		return strings.ReplaceAll(s, " ", "")
+	}
+	return fold(recorded) == fold(ran)
 }
 
 // events projects the trajectory, keeping both ends when it has to be cut.
@@ -793,6 +909,101 @@ func compare(leftRun store.Run, left []store.Attempt,
 		return rank(cmp.Tasks[i].Verdict) > rank(cmp.Tasks[j].Verdict)
 	})
 	return cmp
+}
+
+// comparisonWarnings names what differed between the two runs beyond the thing
+// the reader is looking at.
+//
+// `report --compare a b` prints deltas between two runs whatever they are, and
+// those deltas are attributable only when the two differ in one thing. The
+// command cannot refuse the comparison -- "what changed between these two?" is
+// a fair question about any pair -- so it does the next best thing and says
+// what the delta is really a bundle of. Silence here reads as "these two
+// numbers measured the same thing", which is the one reading that is certainly
+// false.
+//
+// The skill set is checked here for the same reason. It is not one of the label
+// columns: it lives in plugin_dirs plus the isolation flags that decide whether
+// those directories survive, so a pair of runs that differ only in their skills
+// used to compare as identical and the page had no way to say otherwise.
+func comparisonWarnings(left, right store.Run) []string {
+	var differing []string
+	if !sameAgent(left.AgentKind, right.AgentKind) {
+		differing = append(differing, fmt.Sprintf(
+			"the agent (%s vs %s)", orUnset(left.AgentKind), orUnset(right.AgentKind)))
+	}
+	if left.AgentModel != right.AgentModel {
+		differing = append(differing, fmt.Sprintf(
+			"the model (%s vs %s)", orUnset(left.AgentModel), orUnset(right.AgentModel)))
+	}
+	if left.AgentBin != right.AgentBin {
+		differing = append(differing, fmt.Sprintf(
+			"the agent binary (%s vs %s)", orUnset(left.AgentBin), orUnset(right.AgentBin)))
+	}
+	if left.Backend != right.Backend {
+		differing = append(differing, fmt.Sprintf(
+			"the sandbox backend (%s vs %s)", orUnset(left.Backend), orUnset(right.Backend)))
+	}
+	lSpec, lKnown := left.AgentSpec()
+	rSpec, rKnown := right.AgentSpec()
+	if lKnown && rKnown {
+		lSkills, rSkills := loadedSkills(lSpec), loadedSkills(rSpec)
+		if !sameSkills(lSkills, rSkills) {
+			differing = append(differing, fmt.Sprintf(
+				"the skills loaded (%s vs %s)", skillLabel(lSkills), skillLabel(rSkills)))
+		}
+	}
+	// Chaining is checked for the same reason and is not the same kind of fact:
+	// it does not change which agent ran, it changes what the cells are. One
+	// run's cells each start from a fresh workspace and the other's start from
+	// their predecessor's, so the same task is a different question in each and
+	// the paired deltas below cannot be read as one agent beating another.
+	// Older rows read false, which is the correct answer for them rather than a
+	// gap, so this needs no "unknown" arm.
+	if left.ChainSessions != right.ChainSessions {
+		differing = append(differing, fmt.Sprintf(
+			"whether a session's tasks were chained into one workspace (%s vs %s)",
+			chainedLabel(left.ChainSessions), chainedLabel(right.ChainSessions)))
+	}
+
+	var out []string
+	switch len(differing) {
+	case 0:
+		// Nothing the run row records changed. That is not the same as nothing
+		// changed -- it is a statement about the columns that exist.
+	case 1:
+		out = append(out, "the two runs differ in "+differing[0]+
+			", so the deltas below are that one difference and nothing else")
+	default:
+		out = append(out, "the two runs differ in more than one thing ("+
+			strings.Join(differing, "; ")+
+			"), so no delta below can be attributed to any single one of them")
+	}
+	if left.DatasetHash != right.DatasetHash {
+		out = append(out, "the two runs did not run the same dataset content, "+
+			"so the cells paired below are different questions and their verdicts do not compare")
+	}
+	if lKnown != rKnown {
+		// Only one side can answer the skills question, so the comparison cannot
+		// answer it either. Which side is named: "one of these runs" would leave
+		// the reader to guess which, and the guess that matters -- that the
+		// silent one loaded nothing -- is the wrong one.
+		which := label(right)
+		if !lKnown {
+			which = label(left)
+		}
+		out = append(out, fmt.Sprintf(
+			"run %s recorded no agent configuration (it predates the harness storing one), "+
+				"so whether the two runs loaded the same skills is unknown", which))
+	}
+	return out
+}
+
+func orUnset(s string) string {
+	if s == "" {
+		return "(unset)"
+	}
+	return s
 }
 
 func taskRef(a store.Attempt, present bool) TaskRef {

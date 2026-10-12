@@ -44,6 +44,29 @@ CREATE TABLE IF NOT EXISTS runs (
     notes        TEXT NOT NULL DEFAULT '',
     tool_version TEXT NOT NULL DEFAULT '',
     config_json  TEXT NOT NULL DEFAULT '{}',
+    -- The agent configuration this run actually drove, as agent.Spec JSON.
+    --
+    -- The four columns above are the labels a run is compared by, and they are
+    -- not the whole configuration: the skill set lives in plugin_dirs plus the
+    -- isolation flags that decide whether it survives, and none of it was
+    -- recorded. So `report --compare` could not tell a run with the user's
+    -- skills loaded from one without them, and the page could not state either.
+    --
+    -- Empty means the row predates this column. That is not "no configuration":
+    -- it is the absence of a record, and a reader has to be able to say which.
+    agent_spec_json TEXT NOT NULL DEFAULT '',
+    -- Whether the run replayed each session's tasks in one workspace, in order.
+    --
+    -- It changes what every number beside it means: a chained cell starts from
+    -- the state its predecessor left, so its spend is not an independent sample
+    -- and the cells of a chain cannot be averaged as though they were. A page
+    -- that shows the cells without this says "k independent measurements" about
+    -- what is really one continuation.
+    --
+    -- 0 means the row predates this column, which is the same as not chained --
+    -- no earlier build could chain, so the two readings agree here and there is
+    -- no third state to keep apart.
+    chain_sessions INTEGER NOT NULL DEFAULT 0,
     error        TEXT NOT NULL DEFAULT ''
 );
 
@@ -102,6 +125,23 @@ CREATE TABLE IF NOT EXISTS attempts (
     -- each cost. Stored rather than re-read for the same reason as the numbers
     -- above: the report is a function of this file.
     baseline_output  TEXT    NOT NULL DEFAULT '',
+
+    -- Who made the recording, and what the recording says it does not cover.
+    --
+    -- A comparison is only readable if the reader can see what the two sides
+    -- are. Comparing a replay against a recording made by a *different* agent
+    -- is a legitimate thing to do -- it is what "replay a collected session"
+    -- means -- but presenting its delta without saying so lets a reader take a
+    -- cross-agent difference for a same-agent one.
+    --
+    -- These are the baseline's own claims about itself, carried verbatim:
+    -- notes is what the capture declared (a field it never recorded, an
+    -- estimate standing in for a measurement), and it replaces the report's
+    -- generic sentence rather than sitting beside it.
+    baseline_agent_name  TEXT NOT NULL DEFAULT '',
+    baseline_agent_model TEXT NOT NULL DEFAULT '',
+    baseline_source      TEXT NOT NULL DEFAULT '',
+    baseline_notes       TEXT NOT NULL DEFAULT '',
 
     error         TEXT NOT NULL DEFAULT '',
     workspace_dir TEXT NOT NULL DEFAULT '',

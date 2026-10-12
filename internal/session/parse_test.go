@@ -23,34 +23,65 @@ func TestParseCountsUsageOncePerMessage(t *testing.T) {
 	// each. A real session had 176 assistant records for 63 messages, so
 	// summing per record would have inflated the token count roughly threefold.
 	// The fixture's first assistant message is split into three records; its
-	// usage must be counted once.
+	// usage must be counted once. 210 is 100+100 from the two messages the
+	// cost-state covers plus 10 from the one after it: three messages, each
+	// counted once. Counting per record would give 410.
 	s := parseFixture(t)
-	if got := s.Usage.InputTokens; got != 200 {
-		t.Errorf("input tokens = %d, want 200 (100 per message, not 300 per record)", got)
+	if got := s.Usage.InputTokens; got != 210 {
+		t.Errorf("input tokens = %d, want 210 (three messages, not seven records)", got)
 	}
-	if got := s.Usage.OutputTokens; got != 30 {
-		t.Errorf("output tokens = %d, want 30", got)
+	if got := s.Usage.OutputTokens; got != 32 {
+		t.Errorf("output tokens = %d, want 32", got)
 	}
 	if got := s.Usage.CacheReadTokens; got != 50 {
 		t.Errorf("cache read tokens = %d, want 50", got)
 	}
-	if got := s.Usage.Total(); got != 280 {
-		t.Errorf("total = %d, want 280", got)
+	if got := s.Usage.Total(); got != 292 {
+		t.Errorf("total = %d, want 292", got)
 	}
 }
 
-func TestParseTrustsCostStateOverTheSummedMessages(t *testing.T) {
-	// The fixture's cost-state record lands before the last message, so the
-	// per-message sum (210/32) deliberately disagrees with it (200/30). The
-	// recorded total is authoritative: it is what Claude Code billed, and it is
-	// the only figure that stays right if a block is ever dropped from the
-	// transcript.
+func TestParseCompletesACostStateWithTheMessagesAfterIt(t *testing.T) {
+	// The fixture's cost-state record lands before the last message, so its
+	// 200/30 is the billed figure for a *prefix* of the session, not a total.
+	// The record stays authoritative for what it covers -- it is what Claude
+	// Code billed, and it stays right if a block is ever dropped from the
+	// transcript -- but the message after it has to be added, or the session
+	// total is whatever the checkpoint happened to reach. A real capture put
+	// its last checkpoint at line 178 of 905 and under-reported its tokens
+	// fourteenfold.
 	s := parseFixture(t)
 	if got := s.CostUSD; got != 0.25 {
 		t.Errorf("cost = %v, want 0.25", got)
 	}
-	if got := s.Usage.InputTokens; got != 200 {
-		t.Errorf("input tokens = %d, want the cost-state total 200, not the summed 210", got)
+	if got := s.Usage.InputTokens; got != 210 {
+		t.Errorf("input tokens = %d, want 210: the record's 200 plus the message it does not cover", got)
+	}
+	if !strings.Contains(strings.Join(s.BaselineNotes, " "), "cost covers only the start") {
+		t.Errorf("a partial cost must say so, got %q", s.BaselineNotes)
+	}
+}
+
+func TestParseTrustsAFreshCostStateAsATotal(t *testing.T) {
+	// Nothing follows this record, so it covers the session and is used as
+	// written. This is what most captures look like, and the point of the
+	// staleness check is that it leaves them alone.
+	stream := `{"type":"user","timestamp":"2026-01-02T03:00:00.000Z","origin":{"kind":"human"},"message":{"role":"user","content":"do it"}}
+{"type":"assistant","timestamp":"2026-01-02T03:00:05.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":999,"output_tokens":999,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
+{"type":"cost-state","timestamp":"2026-01-02T03:00:06.000Z","totalCostUSD":1.5,"totalAPIDuration":4000,"totalToolDuration":2000,"totalDuration":6000,"modelUsage":{"m":{"inputTokens":100,"outputTokens":20,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}
+`
+	s, err := Parse(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := s.Usage.InputTokens; got != 100 {
+		t.Errorf("input tokens = %d, want the recorded 100, not the message's 999", got)
+	}
+	if got := s.BusyMs; got != 6000 {
+		t.Errorf("busy = %d, want the recorded 6000", got)
+	}
+	if len(s.BaselineNotes) != 0 {
+		t.Errorf("a fresh capture needs no caveat, got %q", s.BaselineNotes)
 	}
 }
 
@@ -134,13 +165,20 @@ func TestParseSeparatesWallClockFromBusyTime(t *testing.T) {
 	// unattended run's wall clock against the session's wall clock would flatter
 	// the run; BusyMs is the comparable number. In a real session the two
 	// differed by 8.3x, which is why both are recorded.
+	//
+	// The fixture's cost-state record is not the last thing in the session, so
+	// its timers describe a prefix and are not used. The wall clock comes from
+	// the session's own span (03:04:05 to 03:05:02) and the busy time from the
+	// gaps that end at an assistant turn: 1s + 4s + 2s.
 	s := parseFixture(t)
-	if s.DurationMs != 60000 {
-		t.Errorf("wall clock = %d, want 60000", s.DurationMs)
+	if s.DurationMs != 57000 {
+		t.Errorf("wall clock = %d, want 57000", s.DurationMs)
 	}
-	if s.BusyMs != 6000 {
-		t.Errorf("busy = %d, want 6000 (api 4000 + tool 2000)", s.BusyMs)
+	if s.BusyMs != 7000 {
+		t.Errorf("busy = %d, want 7000 (the gaps ending at an assistant turn)", s.BusyMs)
 	}
+	// The record's own figures are kept: they are what the checkpoint said, and
+	// a reader comparing them against the session total can see it was partial.
 	if s.APIDurationMs != 4000 || s.ToolDurationMs != 2000 {
 		t.Errorf("api/tool = %d/%d", s.APIDurationMs, s.ToolDurationMs)
 	}
@@ -169,9 +207,22 @@ func TestParseCollectsProvenance(t *testing.T) {
 	if s.ThinkingMs != 500 {
 		t.Errorf("thinking = %d, want 500", s.ThinkingMs)
 	}
-	if len(s.TurnDurations) != 1 || s.TurnDurations[0] != 6000 {
-		t.Errorf("turn durations = %v", s.TurnDurations)
+	if got := turnDurationMs(s, 0); got != 6000 {
+		t.Errorf("first turn's clock = %d, want 6000", got)
 	}
+	if got := turnDurationMs(s, 1); got != 0 {
+		t.Errorf("second turn's clock = %d, want 0 (the build recorded none)", got)
+	}
+}
+
+// turnDurationMs is the clock the session recorded for the turn the nth prompt
+// started, summed over the turns that answer it.
+func turnDurationMs(s *Session, promptIndex int) int64 {
+	end := len(s.Turns)
+	if promptIndex+1 < len(s.Prompts) {
+		end = s.Prompts[promptIndex+1].TurnIndex
+	}
+	return sliceDurationMs(s.Turns[s.Prompts[promptIndex].TurnIndex:end])
 }
 
 func TestParseTimestampsBracketTheSession(t *testing.T) {
@@ -212,6 +263,81 @@ func TestFinalOutputIsTheLastAssistantProse(t *testing.T) {
 	s := parseFixture(t)
 	if got := s.FinalOutput(); got != "好的。" {
 		t.Errorf("final output = %q, want the last non-empty assistant text", got)
+	}
+}
+
+func TestParseReadsPromptsSentAsTextBlocks(t *testing.T) {
+	// The IDE extensions send prompts through the SDK, which writes the content
+	// as text blocks -- the typed request, then the attached file reference --
+	// rather than a bare string. Reading only the bare-string form found no
+	// prompt at all in such a session. A text block in a tool-result record is
+	// still not a prompt.
+	stream := `{"type":"user","timestamp":"2026-01-02T03:04:05.000Z","origin":{"kind":"human"},"promptSource":"sdk","message":{"role":"user","content":[{"type":"text","text":"metrics的前缀是什么"},{"type":"text","text":"[@A.java](file:///work/A.java)"}]}}
+{"type":"user","timestamp":"2026-01-02T03:04:06.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"},{"type":"text","text":"not a prompt"}]}}
+{"type":"user","timestamp":"2026-01-02T03:04:07.000Z","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+`
+	s, err := Parse(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(s.Prompts) != 1 {
+		t.Fatalf("got %d prompts, want 1: %+v", len(s.Prompts), s.Prompts)
+	}
+	want := "metrics的前缀是什么\n[@A.java](file:///work/A.java)"
+	if s.Prompts[0].Text != want {
+		t.Errorf("prompt = %q, want %q", s.Prompts[0].Text, want)
+	}
+	if s.ToolResults != 1 {
+		t.Errorf("tool results = %d, want 1", s.ToolResults)
+	}
+}
+
+func TestParseAttachesATurnClockToTheTurnItCloses(t *testing.T) {
+	// A prompt typed while the agent is still working is written into the
+	// transcript before the running turn's duration record lands. Reading the
+	// clocks by their ordinal among prompts would hand every later turn the
+	// clock of the one before it; the clock belongs to the assistant output it
+	// followed.
+	stream := `{"type":"user","timestamp":"2026-01-02T03:00:00.000Z","origin":{"kind":"human"},"message":{"role":"user","content":"first"}}
+{"type":"assistant","timestamp":"2026-01-02T03:00:01.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"working"}]}}
+{"type":"user","timestamp":"2026-01-02T03:00:02.000Z","origin":{"kind":"human"},"message":{"role":"user","content":"queued"}}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-01-02T03:00:06.000Z","durationMs":6000}
+{"type":"assistant","timestamp":"2026-01-02T03:00:07.000Z","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"done"}]}}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-01-02T03:00:14.000Z","durationMs":7000}
+`
+	s, err := Parse(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(s.Turns) != 4 {
+		t.Fatalf("turns = %d, want 4", len(s.Turns))
+	}
+	if got := s.Turns[1].DurationMs; got != 6000 {
+		t.Errorf("first turn's clock = %d, want 6000 on its own assistant output", got)
+	}
+	if got := s.Turns[2].DurationMs; got != 0 {
+		t.Errorf("the queued prompt carries %d, want 0: a prompt is not a turn's clock", got)
+	}
+	if got := s.Turns[3].DurationMs; got != 7000 {
+		t.Errorf("second turn's clock = %d, want 7000", got)
+	}
+}
+
+func TestParseDropsAClockWithNoOutputToAttachTo(t *testing.T) {
+	// The second record has no assistant output after the first, so there is
+	// nothing it can belong to. Overwriting the first turn's clock would report
+	// a duration the transcript never recorded for it.
+	stream := `{"type":"user","timestamp":"2026-01-02T03:00:00.000Z","origin":{"kind":"human"},"message":{"role":"user","content":"first"}}
+{"type":"assistant","timestamp":"2026-01-02T03:00:01.000Z","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"working"}]}}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-01-02T03:00:06.000Z","durationMs":6000}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-01-02T03:00:14.000Z","durationMs":9999}
+`
+	s, err := Parse(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := s.Turns[1].DurationMs; got != 6000 {
+		t.Errorf("turn clock = %d, want the recorded 6000", got)
 	}
 }
 

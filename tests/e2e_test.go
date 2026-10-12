@@ -238,7 +238,24 @@ type runInfo struct {
 	FactorLevel string `json:"factor_level"`
 	SweepID     string `json:"sweep_id"`
 
+	// Skills is what the run's own configuration says it loaded. Absent means
+	// the row predates the harness recording its configuration, which the page
+	// states rather than rendering as "none".
+	Skills *runSkills `json:"skills"`
+
+	// ChainSessions is whether each session's tasks shared one workspace. The
+	// page has to be able to say so, because the cells of a chain are one
+	// continuation rather than independent samples.
+	ChainSessions bool `json:"chain_sessions"`
+
 	Summary summary `json:"summary"`
+}
+
+type runSkills struct {
+	Dirs      []string `json:"dirs"`
+	Active    bool     `json:"active"`
+	RemovedBy string   `json:"removed_by"`
+	Text      string   `json:"text"`
 }
 
 type summary struct {
@@ -298,6 +315,13 @@ type task struct {
 		TokenDelta int    `json:"token_delta"`
 		MsDelta    int64  `json:"ms_delta"`
 		Output     string `json:"output"`
+		// The recording's provenance. Without these the report cannot say that
+		// a replay is a cross-agent comparison rather than a like-for-like one.
+		AgentName      string `json:"agent_name"`
+		AgentModel     string `json:"agent_model"`
+		Source         string `json:"source"`
+		DifferentAgent bool   `json:"different_agent"`
+		Notes          string `json:"notes"`
 	} `json:"baseline"`
 
 	Error   string `json:"error"`
@@ -642,6 +666,20 @@ func TestCLIEndToEnd(t *testing.T) {
 			t.Errorf("pass rate verdict = %q, want worse", m.Verdict)
 		}
 	}
+	// The two runs differ in their model and in their binary, so every delta
+	// above is a bundle. Saying nothing would read as "these two numbers
+	// measured the same thing", which is the one reading that is certainly
+	// false -- so the comparison has to name what it bundled.
+	bundle := strings.Join(delta.Warnings, "\n")
+	for _, want := range []string{
+		"differ in more than one thing",
+		"the model (scripted-good vs scripted-bad)",
+		"the agent binary",
+	} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("the comparison should say %q, got:\n%s", want, bundle)
+		}
+	}
 
 	// --- listing sees both runs ---------------------------------------------
 	l := runCLI(t, "list", "--db", db)
@@ -652,6 +690,81 @@ func TestCLIEndToEnd(t *testing.T) {
 		if !strings.Contains(l.stdout, id) {
 			t.Errorf("list does not mention run %s:\n%s", id, l.stdout)
 		}
+	}
+}
+
+// TestCLIComparesTwoRunsHoweverTheFlagsAreOrdered covers a spelling that is
+// natural to write, is what --help invites, and used to fail.
+//
+// Go's flag package stops at the first non-flag word, so everything after
+// `--compare a b` sits unparsed until the command re-parses from that word. The
+// store used to be opened before that re-parse, so `--db` arrived after the file
+// had already been opened at its default path: the runs were looked for in
+// aeval.db and reported missing. Writing `--db` first worked -- and that is the
+// shape every other test in this file uses, which is exactly why nothing
+// noticed. The failure was not silent, but it was also not the user's mistake,
+// so the flag order must not be load-bearing.
+func TestCLIComparesTwoRunsHoweverTheFlagsAreOrdered(t *testing.T) {
+	work := t.TempDir()
+	ds := writeChainedTurnDataset(t, filepath.Join(work, "ds"))
+	db := filepath.Join(work, "runs.db")
+
+	run := func(name string, extra ...string) string {
+		t.Helper()
+		report := filepath.Join(work, name+".html")
+		args := append([]string{"run",
+			"--dataset", ds,
+			"--agent", "mock",
+			"--bin", filepath.Join(agents, "chain.sh"),
+			"--name", name,
+			"--db", db,
+			"--work-root", filepath.Join(work, "work-"+name),
+			"--report", report,
+		}, extra...)
+		r := runCLI(t, args...)
+		if r.exitCode != 0 {
+			t.Fatalf("%s run exited %d\nstdout:\n%s\nstderr:\n%s", name, r.exitCode, r.stdout, r.stderr)
+		}
+		return payloadFromHTML(t, report).Run.ID
+	}
+	idPlain := run("plain")
+	idChained := run("chained", "--chain-sessions")
+
+	// The order that used to fail: the database comes after the run ids.
+	after := filepath.Join(work, "after.html")
+	r := runCLI(t, "report", "--compare", idPlain, idChained, "--db", db, "-o", after)
+	if r.exitCode != 0 {
+		t.Fatalf("--db after the positional run ids failed (%d): %s", r.exitCode, r.stderr)
+	}
+	if r.stderr != "" {
+		t.Errorf("a comparison over a database that holds both runs should say nothing to stderr:\n%s", r.stderr)
+	}
+
+	// The order that always worked, both so the two are pinned as equivalent
+	// and so a fix for one cannot quietly break the other.
+	before := filepath.Join(work, "before.html")
+	r = runCLI(t, "report", "--db", db, "--compare", idPlain, idChained, "-o", before)
+	if r.exitCode != 0 {
+		t.Fatalf("--db before the positional run ids failed (%d): %s", r.exitCode, r.stderr)
+	}
+	if !samePayload(t, payloadFromHTML(t, after), payloadFromHTML(t, before)) {
+		t.Error("the same comparison rendered differently depending on where --db was written")
+	}
+
+	// And a comparison that really is looking in the wrong file has to name
+	// that file: an error reading "not found in aeval.db" while the caller typed
+	// another path is the diagnostic that points at --db, and it was unavailable
+	// while the store was opened from a half-parsed command line.
+	empty := filepath.Join(work, "empty.db")
+	r = runCLI(t, "report", "--compare", idPlain, idChained, "--db", empty, "-o", filepath.Join(work, "x.html"))
+	if r.exitCode == 0 {
+		t.Fatal("comparing runs in a database that does not hold them must fail")
+	}
+	if !strings.Contains(r.stderr, "not found in "+empty) {
+		t.Errorf("the failure must name the database it looked in, got:\n%s", r.stderr)
+	}
+	if strings.Contains(r.stderr, "aeval.db") {
+		t.Errorf("the failure named the default database rather than the one that was passed:\n%s", r.stderr)
 	}
 }
 
@@ -716,6 +829,32 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 		t.Error("the collected task has no baseline, which is the whole point of collecting")
 	}
 
+	// The fixture session holds two prompts and the default split collects the
+	// opening request, so half of it is not in the dataset. Nothing in a
+	// one-task collection says that on its own -- the reader who assumed it
+	// covered the session would take one question for two -- so collect
+	// declares it, on stderr and on the baseline that travels with the task.
+	for _, want := range []string{"hold more prompts than this dataset collected", "(1 of 2)", "--split turn"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("collect should say %q, got:\n%s", want, r.stderr)
+		}
+	}
+	base, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(collected.Baseline.File)))
+	if err != nil {
+		t.Fatalf("read the baseline: %v", err)
+	}
+	var baseline struct {
+		Notes string `json:"notes"`
+	}
+	if err := json.Unmarshal(base, &baseline); err != nil {
+		t.Fatalf("the baseline does not decode: %v", err)
+	}
+	for _, want := range []string{"holds 2 prompts", "collected the first one only", "the other 1 are not in it"} {
+		if !strings.Contains(baseline.Notes, want) {
+			t.Errorf("the baseline should say %q, got:\n%s", want, baseline.Notes)
+		}
+	}
+
 	// The output is an ordinary dataset, so the ordinary validator must accept
 	// it -- otherwise collect produces something only it can read.
 	if v := runCLI(t, "validate", "--dataset", out); v.exitCode != 0 {
@@ -752,23 +891,26 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 		t.Errorf("the absent pass rate needs a reason, got %q", got)
 	}
 
-	// The baseline is the point of collecting: the recorded session's own token
-	// count is what the replay is measured against.
+	// The baseline is the point of collecting: what the recorded attempt spent
+	// on *this* request is what the replay is measured against. The fixture
+	// session holds two prompts, and only the first is the task, so the
+	// follow-up's turn is not charged to it.
 	cell := p.taskByID(t, "aaaabbbb")
 	if cell.Baseline == nil {
 		t.Fatal("the collected task lost its baseline")
 	}
 	if cell.Baseline.Tokens != 280 {
-		t.Errorf("baseline tokens = %d, want the recorded session's 280", cell.Baseline.Tokens)
+		t.Errorf("baseline tokens = %d, want the opening request's 280", cell.Baseline.Tokens)
 	}
 	if cell.Baseline.TokenDelta != -280 {
 		t.Errorf("token delta = %d, want -280 (the replay spent nothing)", cell.Baseline.TokenDelta)
 	}
 	// The recording's own answer travels with its numbers. A replay that spent
 	// less and concluded something else is the comparison a reader is after,
-	// and the spend alone cannot express it.
-	if !strings.Contains(cell.Baseline.Output, "好的。") {
-		t.Errorf("baseline output = %q, want the recorded session's last assistant text", cell.Baseline.Output)
+	// and the spend alone cannot express it. "好的。" is the answer to the
+	// follow-up, which this task never asks.
+	if !strings.Contains(cell.Baseline.Output, "已修复，减号写反了。") {
+		t.Errorf("baseline output = %q, want the recorded answer to the opening request", cell.Baseline.Output)
 	}
 	if p.Run.Summary.BaselineCells != 1 {
 		t.Errorf("summary counted %d baseline cells, want 1", p.Run.Summary.BaselineCells)
@@ -776,6 +918,605 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 	if _, ok := metricByKey(p, "baseline_tokens"); !ok {
 		t.Error("a run with a baseline should headline its token delta, not bury it in the task")
 	}
+}
+
+// TestCLICollectAppendsToAnExistingDataset collects into the same --out twice,
+// the way a user grows a dataset from a working directory over time.
+func TestCLICollectAppendsToAnExistingDataset(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "grown")
+	session := filepath.Join(repoRoot, "tests", "testdata", "session", "basic.jsonl")
+	tasks := filepath.Join(out, "tasks.jsonl")
+
+	if r := runCLI(t, "collect", "--session", session, "--out", out); r.exitCode != 0 {
+		t.Fatalf("first collect exited %d\n%s", r.exitCode, r.stderr)
+	}
+
+	// Per-turn tasks from the same session: the first prompt is already there.
+	dry := runCLI(t, "collect", "--session", session, "--split", "turn", "--out", out, "--dry-run")
+	if dry.exitCode != 0 {
+		t.Fatalf("--dry-run exited %d\n%s", dry.exitCode, dry.stderr)
+	}
+	if !strings.Contains(dry.stdout, "would append 1 task(s)") || !strings.Contains(dry.stdout, "skipped 1 already collected: aaaabbbb-p0") {
+		t.Errorf("--dry-run should describe the append, got:\n%s", dry.stdout)
+	}
+	if got := taskIDsIn(t, tasks); strings.Join(got, ",") != "aaaabbbb" {
+		t.Errorf("--dry-run changed the dataset: %v", got)
+	}
+
+	r := runCLI(t, "collect", "--session", session, "--split", "turn", "--out", out)
+	if r.exitCode != 0 {
+		t.Fatalf("append exited %d\n%s", r.exitCode, r.stderr)
+	}
+	if !strings.Contains(r.stdout, "appended 1 task(s)") {
+		t.Errorf("append should say what it did, got:\n%s", r.stdout)
+	}
+	if got := taskIDsIn(t, tasks); strings.Join(got, ",") != "aaaabbbb,aaaabbbb-p1" {
+		t.Errorf("tasks after append = %v, want the original kept and the follow-up added", got)
+	}
+	if v := runCLI(t, "validate", "--dataset", out); v.exitCode != 0 {
+		t.Fatalf("the appended dataset does not validate (%d):\n%s\n%s", v.exitCode, v.stdout, v.stderr)
+	}
+
+	// Running the same collection again is a no-op, not an error.
+	again := runCLI(t, "collect", "--session", session, "--split", "turn", "--out", out)
+	if again.exitCode != 0 || !strings.Contains(again.stdout, "appended 0 task(s)") {
+		t.Errorf("re-collecting should add nothing (exit %d):\n%s", again.exitCode, again.stdout)
+	}
+
+	// --overwrite is the old behaviour: the dataset is exactly this collection.
+	ow := runCLI(t, "collect", "--session", session, "--split", "turn", "--out", out, "--overwrite")
+	if ow.exitCode != 0 {
+		t.Fatalf("--overwrite exited %d\n%s", ow.exitCode, ow.stderr)
+	}
+	if got := taskIDsIn(t, tasks); strings.Join(got, ",") != "aaaabbbb-p0,aaaabbbb-p1" {
+		t.Errorf("tasks after --overwrite = %v, want only this collection", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// collect --source cursor
+// ---------------------------------------------------------------------------
+
+// TestCLICollectsACursorConversation drives the Cursor path the way a user
+// would: point at a state database, ask what is in it, collect one
+// conversation, and replay it.
+//
+// The fixture is synthesised rather than taken from the Cursor installation on
+// this machine. A copied database would pin the reader to one Cursor version
+// and one person's private chat history; a synthesised one states exactly which
+// shapes collect claims to understand.
+func TestCLICollectsACursorConversation(t *testing.T) {
+	work := t.TempDir()
+	cursorDB := filepath.Join(work, "state.vscdb")
+	writeCursorFixture(t, cursorDB)
+
+	const (
+		full     = "aaaaaaaa-1111-2222-3333-444444444444"
+		second   = "bbbbbbbb-1111-2222-3333-444444444444"
+		noPrompt = "cccccccc-1111-2222-3333-444444444444"
+	)
+
+	// --list answers "what is in there" and needs no --out: looking is the whole
+	// point of it.
+	list := runCLI(t, "collect", "--source", "cursor", "--cursor-db", cursorDB, "--list")
+	if list.exitCode != 0 {
+		t.Fatalf("--list exited %d\nstderr:\n%s", list.exitCode, list.stderr)
+	}
+	if !strings.Contains(list.stdout, "3 cursor conversation(s)") {
+		t.Errorf("--list should count what the database holds, got:\n%s", list.stdout)
+	}
+	row := cursorListRow(t, list.stdout, full)
+	if row[3] != "5" {
+		t.Errorf("--list msgs = %s, want the conversation's 5 bubbles: %v", row[3], row)
+	}
+	// The prompt count is what tells a reader whether a conversation is
+	// collectable at all.
+	if row[4] != "1" {
+		t.Errorf("--list prompts = %s, want the conversation's 1 human turn: %v", row[4], row)
+	}
+	if got := cursorListRow(t, list.stdout, noPrompt)[4]; got != "0" {
+		t.Errorf("a draft with no request should list 0 prompts, got %s", got)
+	}
+
+	// The two flags are not interchangeable, and saying so is cheaper than a
+	// collection that silently read the wrong history.
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"cursor-db without --source cursor", []string{"--cursor-db", cursorDB, "--out", filepath.Join(work, "x")},
+			"--cursor-db only means something with --source cursor"},
+		{"--root with --source cursor", []string{"--source", "cursor", "--cursor-db", cursorDB, "--root", work, "--out", filepath.Join(work, "x")},
+			"--root only means something with --source claude"},
+		{"an unknown source", []string{"--source", "vscode", "--out", filepath.Join(work, "x")},
+			`--source must be "claude" or "cursor"`},
+		{"neither --out nor --dry-run", []string{"--source", "cursor", "--cursor-db", cursorDB, "--latest"},
+			"--out is required"},
+		{"no way to name a conversation", []string{"--source", "cursor", "--cursor-db", cursorDB, "--out", filepath.Join(work, "x")},
+			"name what to collect"},
+	} {
+		r := runCLI(t, append([]string{"collect"}, tc.args...)...)
+		if r.exitCode != 2 {
+			t.Errorf("%s: exit %d, want the usage code 2\nstderr:\n%s", tc.name, r.exitCode, r.stderr)
+		}
+		if !strings.Contains(r.stderr, tc.want) {
+			t.Errorf("%s: stderr should say %q, got:\n%s", tc.name, tc.want, r.stderr)
+		}
+	}
+
+	// --- one conversation, selected by id prefix -------------------------
+	out := filepath.Join(work, "from-cursor")
+	r := runCLI(t, "collect",
+		"--source", "cursor",
+		"--cursor-db", cursorDB,
+		"--session", "aaaaaaaa",
+		"--out", out,
+		"--name", "cursor-demo",
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("collect --source cursor exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"dataset.yaml", "tasks.jsonl", filepath.Join("baselines", "aaaaaaaa.json")} {
+		if _, err := os.Stat(filepath.Join(out, want)); err != nil {
+			t.Errorf("collect did not write %s: %v", want, err)
+		}
+	}
+	// The manifest names the capture. "from recorded Claude Code sessions" was
+	// true only while there was one source.
+	manifest, err := os.ReadFile(filepath.Join(out, "dataset.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), "Cursor") {
+		t.Errorf("the manifest should name the source it was collected from, got:\n%s", manifest)
+	}
+
+	task := readOneTask(t, out)
+	if task.ID != "aaaaaaaa" {
+		t.Errorf("task id = %q, want the conversation's 8-character prefix", task.ID)
+	}
+	if task.Prompt != "add a slugify helper" {
+		t.Errorf("task prompt = %q, want the first human turn verbatim", task.Prompt)
+	}
+	if task.Output == nil || task.Output.Type != "stdout" {
+		t.Errorf("a Cursor task has no workspace, so it expects an answer on stdout: %+v", task.Output)
+	}
+	// A transcript carries no ground truth. Emitting a grader would invent one.
+	if len(task.Graders) != 0 {
+		t.Errorf("a collected cursor task got graders: %+v", task.Graders)
+	}
+	if task.Baseline == nil || task.Baseline.File != "baselines/aaaaaaaa.json" {
+		t.Errorf("task baseline = %+v, want the sibling baseline document", task.Baseline)
+	}
+	// The budget is derived from the recording, so a conversation that took a
+	// minute of real work does not get a toy's 30-second timeout: 60s of busy
+	// time triples to 180s, which the floor lifts to 300s, and four assistant
+	// bubbles give a turn budget of 8, which the floor lifts to 20.
+	if task.Limits == nil || task.Limits.TimeoutS != 300 || task.Limits.MaxTurns != 20 {
+		t.Errorf("limits = %+v, want {timeout_s:300 max_turns:20}", task.Limits)
+	}
+	for key, want := range map[string]string{
+		"source":     "cursor-composer",
+		"session_id": full,
+		"cwd":        "/Users/x/lab/alpha",
+	} {
+		if got, _ := task.Metadata[key].(string); got != want {
+			t.Errorf("metadata[%q] = %q, want %q", key, got, want)
+		}
+	}
+	if got, _ := task.Metadata["baseline_tokens"].(float64); got != 3000 {
+		t.Errorf("metadata[baseline_tokens] = %v, want the recorded 3000", task.Metadata["baseline_tokens"])
+	}
+
+	// The baseline document is where the recording's caveats have to survive,
+	// because they describe what the numbers beside them do and do not mean.
+	base := readBaseline(t, out, "aaaaaaaa")
+	if base.Source != "cursor-composer" {
+		t.Errorf("baseline source = %q, want the capture named", base.Source)
+	}
+	if base.AgentName != "cursor" {
+		t.Errorf("baseline agent_name = %q, want the agent the recording actually drove", base.AgentName)
+	}
+	if base.AgentModel != "claude-opus-4-7" {
+		t.Errorf("baseline agent_model = %q", base.AgentModel)
+	}
+	if base.Usage.InputTokens != 2600 || base.Usage.OutputTokens != 400 {
+		t.Errorf("baseline usage = %+v, want the recorded 2600/400", base.Usage)
+	}
+	if base.FinalOutput != "Done." {
+		t.Errorf("baseline final_output = %q, want the recording's last answer", base.FinalOutput)
+	}
+	// Busy time is the gaps that end at an assistant bubble -- 10s + 20s + 20s
+	// + 10s -- and not the 360s the conversation reports as its span, which
+	// runs on past its last message.
+	if base.BusyMs != 60000 {
+		t.Errorf("baseline busy_ms = %d, want 60000; the recorded span was %d", base.BusyMs, base.DurationMs)
+	}
+	if base.DurationMs != 360000 {
+		t.Errorf("baseline duration_ms = %d, want the conversation's 360000 span", base.DurationMs)
+	}
+	var roles []string
+	for _, tn := range base.Turns {
+		roles = append(roles, tn.Role)
+	}
+	if got, want := strings.Join(roles, ","), "user,assistant,assistant,assistant,assistant"; got != want {
+		t.Errorf("baseline turns = %s, want %s", got, want)
+	}
+	if len(base.EditedFiles) != 1 || !strings.HasSuffix(base.EditedFiles[0], "slugify.py") {
+		t.Errorf("edited files = %v, want the one file the recording wrote", base.EditedFiles)
+	}
+	for _, want := range []string{"no cost", "finer unit"} {
+		if !strings.Contains(base.Notes, want) {
+			t.Errorf("baseline notes should mention %q, got %q", want, base.Notes)
+		}
+	}
+	// A fully counted conversation must not be labelled a lower bound, or the
+	// caveat stops meaning anything.
+	if strings.Contains(base.Notes, "lower bound") {
+		t.Errorf("a fully counted baseline should not claim a lower bound, got %q", base.Notes)
+	}
+
+	// The output is an ordinary dataset, so the ordinary validator must accept
+	// it -- otherwise collect produces something only it can read.
+	if v := runCLI(t, "validate", "--dataset", out); v.exitCode != 0 {
+		t.Fatalf("the collected cursor dataset does not validate (%d):\n%s\n%s", v.exitCode, v.stdout, v.stderr)
+	}
+
+	// Replaying it measures a fresh attempt against the recording.
+	reportPath := filepath.Join(work, "cursor.html")
+	replay := runCLI(t, "run",
+		"--dataset", out,
+		"--agent", "mock",
+		"--bin", "/bin/true",
+		"--model", "replay",
+		"--name", "cursor-replay",
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"),
+		"--report", reportPath,
+	)
+	if replay.exitCode != 0 {
+		t.Fatalf("replaying the cursor dataset exited %d\nstdout:\n%s\nstderr:\n%s",
+			replay.exitCode, replay.stdout, replay.stderr)
+	}
+	p := payloadFromHTML(t, reportPath)
+	cell := p.taskByID(t, "aaaaaaaa")
+	if cell.Baseline == nil {
+		t.Fatal("the cursor task lost its baseline in the report")
+	}
+	if cell.Baseline.Tokens != 3000 {
+		t.Errorf("baseline tokens = %d, want the recorded 2600+400", cell.Baseline.Tokens)
+	}
+	if cell.Baseline.TokenDelta != -3000 {
+		t.Errorf("token delta = %d, want -3000 (the replay spent nothing)", cell.Baseline.TokenDelta)
+	}
+	if !strings.Contains(cell.Baseline.Output, "Done.") {
+		t.Errorf("baseline output = %q, want the recording's answer", cell.Baseline.Output)
+	}
+	// The recording's identity has to survive the whole chain -- collect,
+	// dataset, runner, database, report -- because the report is a function of
+	// the database and never sees the baseline document beside the dataset.
+	// Without it, a Cursor session replayed by another agent renders as a
+	// like-for-like comparison, which is the one thing it is not.
+	if cell.Baseline.AgentName != "cursor" || cell.Baseline.Source != "cursor-composer" {
+		t.Errorf("the report does not name the recording: agent_name=%q source=%q",
+			cell.Baseline.AgentName, cell.Baseline.Source)
+	}
+	if !cell.Baseline.DifferentAgent {
+		t.Errorf("a cursor recording replayed by a %s run must be flagged cross-agent",
+			p.Run.AgentKind)
+	}
+	// The capture's own caveats replace the framework's generic sentence about
+	// busy time, rather than sitting beside it: two caveat rows in one card is
+	// how both stop being read.
+	if !strings.Contains(cell.Baseline.Notes, "no cost") {
+		t.Errorf("the card should carry the recording's own caveats, got %q", cell.Baseline.Notes)
+	}
+
+	// --- a whole working directory, with a draft dropped -------------------
+	byCwd := filepath.Join(work, "by-cwd")
+	all := runCLI(t, "collect",
+		"--source", "cursor",
+		"--cursor-db", cursorDB,
+		"--cwd", "/Users/x/lab/alpha",
+		"--out", byCwd,
+	)
+	if all.exitCode != 0 {
+		t.Fatalf("collect --cwd exited %d\nstdout:\n%s\nstderr:\n%s", all.exitCode, all.stdout, all.stderr)
+	}
+	// A conversation with no human prompt is not a task. Dropping it with a
+	// count is what keeps one draft from aborting a whole collection.
+	if !strings.Contains(all.stderr, "skipped 1 conversation(s) with no human prompt") {
+		t.Errorf("dropping a prompt-less conversation should be reported, got stderr:\n%s", all.stderr)
+	}
+	if got := taskIDsIn(t, filepath.Join(byCwd, "tasks.jsonl")); strings.Join(got, ",") != "aaaaaaaa,bbbbbbbb" {
+		t.Errorf("collected tasks = %v, want the two conversations that hold a request", got)
+	}
+	// The second conversation has two prompts, so its task is the first prompt
+	// and the turns answering it -- and none of those turns carries a token
+	// count. Both facts have to be stated: a lower bound presented as a
+	// measurement, or a slice presented as the session, would each be a number
+	// the recording does not support.
+	second2 := readBaseline(t, byCwd, "bbbbbbbb")
+	if !strings.Contains(second2.Notes, "lower bound") {
+		t.Errorf("a baseline with no token counts should say so, got %q", second2.Notes)
+	}
+	if !strings.Contains(second2.Notes, "per-turn baseline inside a longer session") {
+		t.Errorf("a sliced baseline should say it is a slice, got %q", second2.Notes)
+	}
+	// The slice is the baseline: two turns answered the first prompt, and the
+	// two that answered the follow-up are not this task's cost.
+	if len(second2.Turns) != 2 {
+		t.Errorf("sliced baseline has %d turns, want the 2 that answered the first prompt", len(second2.Turns))
+	}
+	if b := readBaseline(t, byCwd, "aaaaaaaa"); strings.Contains(b.Notes, "lower bound") {
+		t.Errorf("a fully counted baseline should not claim a lower bound, got %q", b.Notes)
+	}
+
+	// --- --latest ---------------------------------------------------------
+	latestDir := filepath.Join(work, "latest")
+	latest := runCLI(t, "collect", "--source", "cursor", "--cursor-db", cursorDB, "--latest",
+		"--out", latestDir, "--dry-run")
+	if latest.exitCode != 0 {
+		t.Fatalf("--latest exited %d\nstderr:\n%s", latest.exitCode, latest.stderr)
+	}
+	if !strings.Contains(latest.stdout, "would write 1 task(s) from 1 session(s)") {
+		t.Errorf("--latest should pick exactly one conversation, got:\n%s", latest.stdout)
+	}
+	if !strings.Contains(latest.stdout, "aaaaaaaa") {
+		t.Errorf("--latest should pick the most recently updated conversation, got:\n%s", latest.stdout)
+	}
+	if _, err := os.Stat(latestDir); err == nil {
+		t.Error("--dry-run wrote the dataset it said it would not write")
+	}
+}
+
+// cursorListRow finds the --list row for one conversation and returns its
+// columns: id, touched, mode, msgs, prompts, name.
+func cursorListRow(t *testing.T, out, id string) []string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 5 && fields[0] == id {
+			return fields
+		}
+	}
+	t.Fatalf("no --list row for %s in:\n%s", id, out)
+	return nil
+}
+
+// cursorTask is the slice of a collected task these tests care about.
+type cursorTask struct {
+	ID     string `json:"id"`
+	Prompt string `json:"prompt"`
+	Output *struct {
+		Type string `json:"type"`
+	} `json:"output"`
+	Limits *struct {
+		TimeoutS int `json:"timeout_s"`
+		MaxTurns int `json:"max_turns"`
+	} `json:"limits"`
+	Baseline *struct {
+		File string `json:"file"`
+	} `json:"baseline"`
+	Graders  []any          `json:"graders"`
+	Metadata map[string]any `json:"metadata"`
+}
+
+func readOneTask(t *testing.T, dir string) cursorTask {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("want one collected task, got %d", len(lines))
+	}
+	var tk cursorTask
+	if err := json.Unmarshal([]byte(lines[0]), &tk); err != nil {
+		t.Fatalf("the collected task does not decode: %v\n%s", err, lines[0])
+	}
+	return tk
+}
+
+func taskIDsIn(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var tk struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal([]byte(line), &tk); err != nil {
+			t.Fatalf("decode task: %v\n%s", err, line)
+		}
+		ids = append(ids, tk.ID)
+	}
+	return ids
+}
+
+// cursorBaseline is the slice of a baseline document these tests care about.
+type cursorBaseline struct {
+	ID          string `json:"id"`
+	Source      string `json:"source"`
+	AgentName   string `json:"agent_name"`
+	AgentModel  string `json:"agent_model"`
+	Cwd         string `json:"cwd"`
+	FinalOutput string `json:"final_output"`
+	Notes       string `json:"notes"`
+	BusyMs      int64  `json:"busy_ms"`
+	DurationMs  int64  `json:"duration_ms"`
+	Usage       struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
+	Turns []struct {
+		Role string `json:"role"`
+	} `json:"turns"`
+	EditedFiles []string `json:"edited_files"`
+}
+
+func readBaseline(t *testing.T, dir, id string) cursorBaseline {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "baselines", id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b cursorBaseline
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatalf("the baseline does not decode: %v\n%s", err, raw)
+	}
+	return b
+}
+
+// writeCursorFixture builds a state.vscdb with three conversations.
+//
+// The bubbles are laid out so the derived numbers are checkable by hand. The
+// first conversation's four gaps run 10s, 20s, 20s and 10s, so 60s ends at an
+// assistant bubble and is counted as machine time; its lastUpdatedAt sits five
+// minutes past its final message, so its wall clock is 360s. The two figures
+// are kept apart on purpose: one is an estimate from the gaps, the other is
+// what the conversation says its span was.
+func writeCursorFixture(t *testing.T, path string) {
+	t.Helper()
+	const cwd = "/Users/x/lab/alpha"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open cursor fixture: %v", err)
+	}
+	defer db.Close()
+	for _, ddl := range []string{
+		`CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)`,
+		`CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT,
+		 createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+		 recency INTEGER, checkpointAt INTEGER, value TEXT, subagentTypeName TEXT)`,
+	} {
+		if _, err := db.Exec(ddl); err != nil {
+			t.Fatalf("create cursor fixture: %v", err)
+		}
+	}
+	put := func(key, value string) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO cursorDiskKV (key, value) VALUES (?, ?)`, key, value); err != nil {
+			t.Fatalf("insert %s: %v", key, err)
+		}
+	}
+
+	// aaaaaaaa -- one prompt, and a trajectory of a read, an edit and an
+	// answer. One prompt is what makes the whole conversation the baseline of
+	// the task rather than a slice of it.
+	// Newest, so it is what --latest picks.
+	const a = "aaaaaaaa-1111-2222-3333-444444444444"
+	put("composerData:"+a, cursorComposer(t, a, cwd, "claude-opus-4-7", 1767225960000,
+		"user:u1", "assistant:a1", "assistant:a2", "assistant:a3", "assistant:a4"))
+	put("bubbleId:"+a+":u1", cursorBubble(t, "u1", false, "2026-01-01T00:00:00Z",
+		map[string]any{"text": "add a slugify helper"}))
+	put("bubbleId:"+a+":a1", cursorBubble(t, "a1", true, "2026-01-01T00:00:10Z",
+		map[string]any{
+			"text":       "I will look at the repo first.",
+			"tokenCount": map[string]any{"inputTokens": 300, "outputTokens": 50},
+		}))
+	put("bubbleId:"+a+":a2", cursorBubble(t, "a2", true, "2026-01-01T00:00:30Z",
+		map[string]any{
+			"toolFormerData": map[string]any{
+				"toolCallId": "call-1", "name": "read_file_v2", "status": "completed",
+				"params": `{"targetFile":"/Users/x/lab/alpha/app.py"}`,
+				"result": `{"contents":"..."}`,
+			},
+			"tokenCount": map[string]any{"inputTokens": 500, "outputTokens": 20},
+		}))
+	// edit_file_v2 fills neither params nor rawArgs, so its target only exists
+	// in codeBlocks -- which is what the reader falls back to.
+	put("bubbleId:"+a+":a3", cursorBubble(t, "a3", true, "2026-01-01T00:00:50Z",
+		map[string]any{
+			"toolFormerData": map[string]any{
+				"toolCallId": "call-2", "name": "edit_file_v2", "status": "completed",
+				"result": `{"success":true}`,
+			},
+			"codeBlocks": []map[string]any{{
+				"uri":     map[string]any{"path": cwd + "/slugify.py", "scheme": "file"},
+				"content": "def slugify(s): ...",
+			}},
+			"tokenCount": map[string]any{"inputTokens": 600, "outputTokens": 30},
+		}))
+	put("bubbleId:"+a+":a4", cursorBubble(t, "a4", true, "2026-01-01T00:01:00Z",
+		map[string]any{
+			"text":       "Done.",
+			"tokenCount": map[string]any{"inputTokens": 1200, "outputTokens": 300},
+		}))
+
+	// bbbbbbbb -- two prompts, and no token count anywhere. The baseline of a
+	// task is the turns that answer *its* prompt, so this one is sliced at the
+	// follow-up and its zero total is a lower bound rather than a measurement.
+	const b = "bbbbbbbb-1111-2222-3333-444444444444"
+	put("composerData:"+b, cursorComposer(t, b, cwd, "grok-4.5", 1767225000000,
+		"user:u1", "assistant:a1", "user:u2", "assistant:a2"))
+	put("bubbleId:"+b+":u1", cursorBubble(t, "u1", false, "2026-01-01T00:00:00Z",
+		map[string]any{"text": "为什么这个测试会失败"}))
+	put("bubbleId:"+b+":a1", cursorBubble(t, "a1", true, "2026-01-01T00:00:30Z",
+		map[string]any{"text": "因为夹具没有初始化。"}))
+	put("bubbleId:"+b+":u2", cursorBubble(t, "u2", false, "2026-01-01T00:01:00Z",
+		map[string]any{"text": "那怎么办"}))
+	put("bubbleId:"+b+":a2", cursorBubble(t, "a2", true, "2026-01-01T00:01:30Z",
+		map[string]any{"text": "改夹具。"}))
+
+	// cccccccc -- attached context and nothing else. A history is full of
+	// these, and none of them is a task.
+	const c = "cccccccc-1111-2222-3333-444444444444"
+	put("composerData:"+c, cursorComposer(t, c, cwd, "grok-4.5", 1767224000000,
+		"assistant:a1"))
+	put("bubbleId:"+c+":a1", cursorBubble(t, "a1", true, "2026-01-01T00:00:00Z",
+		map[string]any{"text": "attached: main.go"}))
+}
+
+func cursorComposer(t *testing.T, id, cwd, model string, updated int64, bubbles ...string) string {
+	t.Helper()
+	headers := make([]map[string]any, 0, len(bubbles))
+	for _, b := range bubbles {
+		typ, bid, _ := strings.Cut(b, ":")
+		n := 1
+		if typ == "assistant" {
+			n = 2
+		}
+		headers = append(headers, map[string]any{"bubbleId": bid, "type": n})
+	}
+	doc := map[string]any{
+		"_v":                          18,
+		"composerId":                  id,
+		"createdAt":                   int64(1767225600000), // 2026-01-01T00:00:00Z
+		"lastUpdatedAt":               updated,
+		"fullConversationHeadersOnly": headers,
+		"workspaceIdentifier": map[string]any{
+			"uri": map[string]any{"$mid": 1, "fsPath": cwd, "path": cwd, "scheme": "file"},
+		},
+		"modelConfig": map[string]any{"modelName": model},
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal composer: %v", err)
+	}
+	return string(body)
+}
+
+func cursorBubble(t *testing.T, id string, assistant bool, at string, extra map[string]any) string {
+	t.Helper()
+	typ := 1
+	if assistant {
+		typ = 2
+	}
+	doc := map[string]any{"_v": 3, "type": typ, "bubbleId": id, "createdAt": at}
+	for k, v := range extra {
+		doc[k] = v
+	}
+	body, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("marshal bubble: %v", err)
+	}
+	return string(body)
 }
 
 func metricByKey(p payload, key string) (metric, bool) {
@@ -1227,6 +1968,158 @@ func TestCLIReportsAFailingRunAsSuccess(t *testing.T) {
 	}
 }
 
+// writeSlashCommandDataset is a one-task dataset whose prompt is a recorded
+// slash-command invocation, with a recording that took real work.
+//
+// The baseline is what makes the mistake visible rather than merely wrong: with
+// nothing to compare against, a run that did nothing has nothing to be
+// favourably measured against, and the assertion below would hold either way.
+func writeSlashCommandDataset(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "baselines"), 0o755); err != nil {
+		t.Fatalf("create dataset dir: %v", err)
+	}
+	manifest := `name: slash-command
+description: a prompt that opens with a slash command, recorded on another agent
+tasks:
+  - id: oncall
+    prompt: "/bff-oncall  测试环境 新服务 76be4c8d-add2-4fc4-b576-4b3741638b2f"
+    workspace: {type: empty}
+    output: {type: stdout}
+    baseline:
+      file: baselines/oncall.json
+      notes: recorded from cursor
+`
+	baseline := `{
+  "id": "rec-oncall",
+  "source": "cursor-composer",
+  "agent_name": "cursor",
+  "final_output": "fetched 72780201.json",
+  "turns": [
+    {"role": "user", "text": "/bff-oncall  测试环境"},
+    {"role": "assistant", "text": "fetched 72780201.json"}
+  ],
+  "busy_ms": 32664,
+  "duration_ms": 32664
+}`
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	write("dataset.yaml", manifest)
+	write(filepath.Join("baselines", "oncall.json"), baseline)
+	return dir
+}
+
+// TestASlashCommandPromptThatCannotResolveIsNotScoredAsARun covers the two ends
+// of one failure.
+//
+// A task collected from one agent carries that agent's invocation syntax, so the
+// prompt here opens with "/bff-oncall" -- a command Claude Code resolves only if
+// the harness loaded the skill that provides it. Under the clean-room defaults it
+// does not, and the CLI then answers "Unknown command" *locally*: no API call,
+// exit zero, subtype "success", is_error false.
+//
+// The stand-in agent replays the stream a real Claude Code 2.1.205 emitted in
+// exactly that situation, captured verbatim, so this runs offline while still
+// testing the shape that broke. Recorded as a measurement, such an attempt is
+// indistinguishable from one that answered in zero tokens -- and it earned a
+// favourable delta against a recording that took half a minute of real work.
+//
+// So: the CLI warns before the attempt is paid for, and the run reports a
+// harness error rather than a measurement.
+func TestASlashCommandPromptThatCannotResolveIsNotScoredAsARun(t *testing.T) {
+	work := t.TempDir()
+	ds := writeSlashCommandDataset(t, filepath.Join(work, "ds"))
+	out := filepath.Join(work, "run.html")
+
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--bin", filepath.Join(agents, "slash-command.sh"),
+		"--model", "recorded-model",
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"),
+		"--report", out,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	// The warning is the only part that can still change the outcome, so it has
+	// to name the command and the flags that would load it.
+	for _, want := range []string{"1 task(s)", "/bff-oncall", "--disable-slash-commands=false"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("stderr should mention %q before the attempt is paid for:\n%s", want, r.stderr)
+		}
+	}
+
+	if !strings.Contains(r.stdout, "harness errors  1") {
+		t.Errorf("a cell that never reached the model is a harness error:\n%s", r.stdout)
+	}
+	// The recording took 32.6s of real work. Reporting a saving against it is
+	// the specific mistake this test exists for.
+	if strings.Contains(r.stdout, "vs baseline") {
+		t.Errorf("a non-measurement was reported as a saving against the recording:\n%s", r.stdout)
+	}
+
+	p := payloadFromHTML(t, out)
+	if p.Counts.HarnessErrors != 1 {
+		t.Errorf("counts.harness_errors = %d, want 1", p.Counts.HarnessErrors)
+	}
+	if p.Counts.Ungraded != 0 {
+		t.Errorf("a harness error is not a measurement, so counts.ungraded = %d, want 0", p.Counts.Ungraded)
+	}
+	if m, ok := metricByKey(p, "harness_errors"); !ok || m.Display != "1" {
+		t.Errorf("harness_errors metric = %+v (present %v), want a headline 1", m, ok)
+	}
+	if len(p.Tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1", len(p.Tasks))
+	}
+	task := p.Tasks[0]
+	if task.Status != "error" || task.StopReason != "harness_error" {
+		t.Errorf("task = %s/%s, want error/harness_error", task.Status, task.StopReason)
+	}
+	// The reason has to name the command, because that is the only part of this
+	// a reader can act on.
+	if !strings.Contains(task.Error, "/bff-oncall") {
+		t.Errorf("the failure does not name the command it could not resolve: %q", task.Error)
+	}
+	// The recording is not put beside the failure at all: store.Attempt
+	// .ComparableBaseline excludes harness errors, so there is neither a delta
+	// to be read as a saving nor a card to be read as a match. What the
+	// recording cost stays readable on the dataset, just not here.
+	if task.Baseline != nil {
+		t.Errorf("a cell that was never measured should carry no comparison, got %+v", task.Baseline)
+	}
+}
+
+// TestTheSlashCommandWarningIsTiedToTheIsolation is the other half of the guard.
+//
+// The warning is about the harness, not about the prompt: the same dataset under
+// a run that loads the user's skills has nothing to warn about. A warning that
+// fired regardless would be the kind nobody reads.
+func TestTheSlashCommandWarningIsTiedToTheIsolation(t *testing.T) {
+	work := t.TempDir()
+	ds := writeSlashCommandDataset(t, filepath.Join(work, "ds"))
+
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--bin", filepath.Join(agents, "slash-command.sh"),
+		"--model", "recorded-model",
+		"--bare=false", "--disable-slash-commands=false",
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"),
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	if strings.Contains(r.stderr, "open with a slash command") {
+		t.Errorf("a run that loads the user's skills warned about them anyway:\n%s", r.stderr)
+	}
+}
+
 // TestRunHintsACommandThatWorks takes the "Next:" line literally and runs it.
 //
 // The hint is a promise, and it used to be a false one: it named the run but not
@@ -1525,11 +2418,14 @@ func TestCLIReadsADatabaseFromBeforeTheRecordedAnswer(t *testing.T) {
 	}
 }
 
-// downgradeToV1 rewrites a database into the shape v1 had: the recorded-answer
-// column gone, the version stamped back.
+// downgradeToV1 rewrites a database into the shape v1 had: the columns every
+// later revision added gone, the version stamped back.
 //
-// It removes what v2 added rather than writing out a v1 DDL, so the fixture
-// cannot drift away from what v1 actually was.
+// It removes what v2, v3 and v4 added rather than writing out a v1 DDL, so the
+// fixture cannot drift away from what v1 actually was. Dropping only the column
+// named in the test's title is how it did drift: the result was a database
+// labelled v1 that already carried the columns the upgrade steps exist to add,
+// which passes whether or not those steps work.
 func downgradeToV1(t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
@@ -1539,10 +2435,296 @@ func downgradeToV1(t *testing.T, path string) {
 	defer db.Close()
 	for _, stmt := range []string{
 		`ALTER TABLE attempts DROP COLUMN baseline_output`,
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_name`,
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_model`,
+		`ALTER TABLE attempts DROP COLUMN baseline_source`,
+		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
+		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
+		`ALTER TABLE runs DROP COLUMN chain_sessions`,
 		`UPDATE schema_meta SET value='1' WHERE key='version'`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
 			t.Fatalf("rewrite %s into v1 (%s): %v", filepath.Base(path), stmt, err)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// The skill set a run drove
+// ---------------------------------------------------------------------------
+
+// TestCLIProvesWhichSkillsARunLoaded is the end of the chain the skill factor
+// needs: a run records the configuration it drove, the page states what that
+// configuration loaded, and a comparison names skills as a difference.
+//
+// None of that used to be checkable. The run row carried the agent, the model,
+// the binary and the backend, and a skill set is none of those: it is the plugin
+// directories plus the isolation flags that decide whether they survive. Two
+// runs differing only in their skills therefore compared as identical, and the
+// report had no way to say otherwise -- while the reading a silent comparison
+// invites, that the two measured the same thing, is the one that is certainly
+// wrong.
+//
+// The two runs here differ in exactly one thing, so the comparison has to name
+// it as the single cause rather than as part of a bundle.
+func TestCLIProvesWhichSkillsARunLoaded(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	skills := filepath.Join(work, "skills")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	runNamed := func(name, id string, extra ...string) {
+		t.Helper()
+		args := append([]string{"run",
+			"--dataset", ds, "--bin", filepath.Join(agents, "one-turn.sh"),
+			"--model", "stand-in", "--name", name, "--run-id", id,
+			"--db", db, "--work-root", filepath.Join(work, "work-"+name),
+		}, extra...)
+		if r := runCLI(t, args...); r.exitCode != 0 {
+			t.Fatalf("run %s exited %d\nstderr:\n%s", name, r.exitCode, r.stderr)
+		}
+	}
+	runNamed("with-skills", "skills-on",
+		"--plugin-dir", skills, "--bare=false", "--disable-slash-commands=false")
+	runNamed("without-skills", "skills-off")
+
+	// The page can state the configuration: one declared directory, and it
+	// reached the agent because both flags that would have removed it were off.
+	only := filepath.Join(work, "skills-on.html")
+	if r := runCLI(t, "report", "--db", db, "--run", "skills-on", "-o", only); r.exitCode != 0 {
+		t.Fatalf("report failed (%d): %s", r.exitCode, r.stderr)
+	}
+	on := payloadFromHTML(t, only)
+	if on.Run.Skills == nil {
+		t.Fatal("the run page must state what the run loaded, not leave it out")
+	}
+	if !on.Run.Skills.Active || on.Run.Skills.Text != "1 plugin dir(s)" {
+		t.Errorf("skills = %+v, want the one declared directory reported as loaded", on.Run.Skills)
+	}
+	if len(on.Run.Skills.Dirs) != 1 || on.Run.Skills.Dirs[0] != skills {
+		t.Errorf("skills.dirs = %v, want the declared directory %s", on.Run.Skills.Dirs, skills)
+	}
+
+	cmp := filepath.Join(work, "compare.html")
+	r := runCLI(t, "report", "--db", db, "--compare", "skills-on", "skills-off", "-o", cmp)
+	if r.exitCode != 0 {
+		t.Fatalf("compare failed (%d): %s", r.exitCode, r.stderr)
+	}
+	delta := payloadFromHTML(t, cmp)
+
+	// The comparison page describes the run it is about -- the right-hand one --
+	// so this reads "none declared" beside a warning that says the left one
+	// loaded a directory. Both statements are about a real difference and the
+	// page makes neither of them up.
+	if delta.Run.Skills == nil || delta.Run.Skills.Active {
+		t.Errorf("skills = %+v, want the right-hand run's own configuration", delta.Run.Skills)
+	}
+
+	// And the comparison names it. Everything else about these two runs is the
+	// same -- agent, model, binary, backend and dataset -- so if the skill
+	// difference is not the named cause, the deltas below read as the effect of
+	// nothing at all.
+	bundle := strings.Join(delta.Warnings, "\n")
+	for _, want := range []string{"differ in the skills loaded", skills, "vs none",
+		"that one difference and nothing else"} {
+		if !strings.Contains(bundle, want) {
+			t.Errorf("the comparison should say %q, got:\n%s", want, bundle)
+		}
+	}
+}
+
+// TestCLIReadsTheSkillFlags: declaring a directory is not loading it, and the
+// page has to keep the two apart. The clean-room default is precisely the state
+// in which a declared directory does nothing, so a run that declares one and
+// leaves the flags alone must not be reported as having skills.
+func TestCLIReadsTheSkillFlags(t *testing.T) {
+	work := t.TempDir()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	skills := filepath.Join(work, "skills")
+	if err := os.MkdirAll(skills, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	report := filepath.Join(work, "r.html")
+	r := runCLI(t, "run",
+		"--dataset", ds, "--bin", filepath.Join(agents, "one-turn.sh"),
+		"--plugin-dir", skills, // and the clean-room defaults, which remove it
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"), "--report", report)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	p := payloadFromHTML(t, report)
+	if p.Run.Skills == nil {
+		t.Fatal("the run page must state what the run loaded")
+	}
+	if p.Run.Skills.Active {
+		t.Errorf("skills = %+v, want them reported as declared but not loaded: the clean-room flags are on",
+			p.Run.Skills)
+	}
+	if !strings.Contains(p.Run.Skills.Text, "not loaded") ||
+		!strings.Contains(p.Run.Skills.RemovedBy, "--bare") {
+		t.Errorf("skills = %+v, want the flags that removed it named", p.Run.Skills)
+	}
+}
+
+// TestCLIChainsASessionsTasksIntoOneWorkspace is the end of the chain the
+// turn split needs.
+//
+// `collect --split turn` makes each prompt of a session its own task, and the
+// later prompts refer to what the earlier ones produced -- one of them here is
+// literally "why was this sent", about a file the first one wrote. Replayed in
+// separate, freshly materialised workspaces, every follow-up asks the agent
+// about files that were never there, and the run measures the harness's choice
+// of workspace rather than the agent.
+//
+// So the test runs the same dataset twice and checks the one thing that
+// separates the two: whether the second task can see what the first one left.
+// An assertion on the run's own flag would pass even if the workspaces were
+// still separate.
+func TestCLIChainsASessionsTasksIntoOneWorkspace(t *testing.T) {
+	work := t.TempDir()
+	ds := writeChainedTurnDataset(t, filepath.Join(work, "ds"))
+	db := filepath.Join(work, "runs.db")
+	agent := filepath.Join(agents, "chain.sh")
+
+	run := func(name string, extra ...string) payload {
+		t.Helper()
+		report := filepath.Join(work, name+".html")
+		args := append([]string{"run",
+			"--dataset", ds, "--bin", agent,
+			"--model", "stand-in", "--name", name, "--run-id", name,
+			"--db", db, "--work-root", filepath.Join(work, "work-"+name),
+			"--report", report,
+		}, extra...)
+		if r := runCLI(t, args...); r.exitCode != 0 {
+			t.Fatalf("run %s exited %d\nstderr:\n%s", name, r.exitCode, r.stderr)
+		}
+		return payloadFromHTML(t, report)
+	}
+
+	// Off: two tasks, two workspaces, and the follow-up finds nothing.
+	plain := run("unchained")
+	if plain.Run.ChainSessions {
+		t.Error("the page claims a run chained its sessions when the flag was not passed")
+	}
+	if got := plain.taskByID(t, "s1-p1").Answer; got != "missing" {
+		t.Errorf("unchained follow-up answered %q, want it to find nothing: the two tasks must not share a workspace", got)
+	}
+	// The verdict says the same thing the answer does, and it is the verdict a
+	// reader acts on: the same task, graded, fails here and passes below.
+	if cell := plain.taskByID(t, "s1-p1"); !cell.Graded || cell.Passed {
+		t.Errorf("unchained follow-up graded=%v passed=%v, want a graded failure", cell.Graded, cell.Passed)
+	}
+
+	// On: one workspace per session, in recorded order, so the follow-up reads
+	// what the opening request wrote.
+	chained := run("chained", "--chain-sessions")
+	if !chained.Run.ChainSessions {
+		t.Error("the page has no way to say the run chained its sessions, so a reader cannot tell a sequence from a set")
+	}
+	if got := chained.taskByID(t, "s1-p1").Answer; got != "found: the-first-turn-wrote-this" {
+		t.Errorf("chained follow-up answered %q, want what the first task wrote", got)
+	}
+	// Same dataset, same agent, same prompt: the only thing that changed is
+	// whether the two tasks shared a workspace, and it is what decides the
+	// verdict.
+	if cell := chained.taskByID(t, "s1-p1"); !cell.Graded || !cell.Passed {
+		t.Errorf("chained follow-up graded=%v passed=%v, want a graded pass", cell.Graded, cell.Passed)
+	}
+	// The first task of the chain is unaffected either way -- it starts from the
+	// workspace in both runs, which is what makes the second one the evidence.
+	if got := chained.taskByID(t, "s1-p0").Answer; got != "wrote handoff.txt" {
+		t.Errorf("first task answered %q", got)
+	}
+	// The opening task still materialises: chaining must not cost the chain its
+	// starting state.
+	if chained.Counts.Cells != 2 {
+		t.Errorf("cells = %d, want both tasks of the session", chained.Counts.Cells)
+	}
+
+	// And the flag cannot be paired with a run that keeps several cells in
+	// flight: two cells of one chain would write over each other and no column
+	// would record that it happened.
+	bad := runCLI(t, "run", "--dataset", ds, "--bin", agent, "--model", "stand-in",
+		"--db", db, "--chain-sessions", "--concurrency", "4",
+		"--work-root", filepath.Join(work, "w-bad"))
+	if bad.exitCode != 2 {
+		t.Errorf("chaining with four cells in flight exited %d, want the usage error 2\nstderr:\n%s", bad.exitCode, bad.stderr)
+	}
+	if !strings.Contains(bad.stderr, "in flight") {
+		t.Errorf("the refusal must say what it cannot honour, got:\n%s", bad.stderr)
+	}
+}
+
+// writeChainedTurnDataset writes what `collect --split turn` writes for a
+// session of two prompts: two tasks that name the same recording, each with its
+// place in it.
+//
+// It is written out by hand rather than produced by collect because the subject
+// is the run, and going through collect would put the parser and the cursor
+// database between the test and the thing it is asserting on.
+func writeChainedTurnDataset(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `name: chained-turns
+description: two prompts of one session, collected turn by turn
+tasks_file: tasks.jsonl
+`
+	if err := os.WriteFile(filepath.Join(dir, "dataset.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tasks := `{"id":"s1-p0","prompt":"WRITE the handoff file","session":"s1","prompt_index":0,"workspace":{"type":"empty"},"output":{"type":"stdout"},"graders":[{"type":"exact_match","config":{"expected":"wrote handoff.txt","match_mode":"contains"}}]}
+{"id":"s1-p1","prompt":"READ the handoff file back","session":"s1","prompt_index":1,"workspace":{"type":"empty"},"output":{"type":"stdout"},"graders":[{"type":"exact_match","config":{"expected":"found: the-first-turn-wrote-this","match_mode":"contains"}}]}
+`
+	if err := os.WriteFile(filepath.Join(dir, "tasks.jsonl"), []byte(tasks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, "dataset.yaml")
+}
+
+// writeOneAnswerDataset writes a one-task dataset whose agent answers on stdout.
+//
+// It exists so a test about configuration can measure a run that succeeds: with
+// a cell that passes, a difference in the report is a difference the test put
+// there rather than one a failing fixture happened to make.
+func writeOneAnswerDataset(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, "baselines"), 0o755); err != nil {
+		t.Fatalf("create dataset dir: %v", err)
+	}
+	write := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("dataset.yaml", `name: one-answer
+description: one task, answered on stdout, recorded elsewhere
+tasks:
+  - id: answer
+    prompt: say done
+    workspace: {type: empty}
+    output: {type: stdout}
+    baseline:
+      file: baselines/answer.json
+      notes: recorded elsewhere
+`)
+	write(filepath.Join("baselines", "answer.json"), `{
+  "id": "rec-answer",
+  "agent_name": "claude-code",
+  "final_output": "done",
+  "turns": [
+    {"role": "user", "text": "say done"},
+    {"role": "assistant", "text": "done"}
+  ],
+  "busy_ms": 90000,
+  "duration_ms": 90000
+}`)
+	return dir
 }

@@ -11,7 +11,8 @@
 // regression suite was green.
 //
 // This file closes it the only way it can be closed: load a generated report in
-// a browser, open a cell, click every tab, and read the DOM back.
+// a browser, read the run header, open a cell, click every tab, and read the DOM
+// back.
 package tests
 
 import (
@@ -95,6 +96,8 @@ setTimeout(function () {
   }
   out.drawerOpen = !!body;
   out.strips = body ? body.querySelectorAll('.tabs').length : 0;
+  var head = document.querySelector('.card.runhead');
+  out.header = head ? head.textContent : '';
   names.forEach(function (name) {
     var tab = { name: name, present: false };
     var button = body ? document.querySelector('.drawer-body [data-tab="' + name + '"]') : null;
@@ -114,6 +117,9 @@ setTimeout(function () {
       tab.baseline = text.indexOf('Against the recorded baseline') >= 0;
       tab.answer = text.indexOf('Final answer') >= 0;
       tab.recorded = text.indexOf('recorded (baseline)') >= 0;
+      tab.recordedBy = text.indexOf('recorded by') >= 0;
+      tab.crossAgent = text.indexOf('The recording was made by') >= 0;
+      tab.genericNote = text.indexOf('the recorded time is the session') >= 0;
     }
     out.tabs.push(tab);
   });
@@ -135,12 +141,16 @@ type renderTab struct {
 	Baseline     bool   `json:"baseline"`
 	Answer       bool   `json:"answer"`
 	Recorded     bool   `json:"recorded"`
+	RecordedBy   bool   `json:"recordedBy"`
+	CrossAgent   bool   `json:"crossAgent"`
+	GenericNote  bool   `json:"genericNote"`
 }
 
 type renderResult struct {
 	Cells      int         `json:"cells"`
 	DrawerOpen bool        `json:"drawerOpen"`
 	Strips     int         `json:"strips"`
+	Header     string      `json:"header"`
 	Tabs       []renderTab `json:"tabs"`
 }
 
@@ -263,6 +273,51 @@ func TestReportDrawerRendersEveryTab(t *testing.T) {
 	}
 }
 
+// TestReportHeaderSaysTheCellsWereChained covers the one claim the run header
+// has to make about a chained run.
+//
+// The chip is drawn by the client from run.chain_sessions, so finding the string
+// in the payload proves nothing about the page: that is the same blind spot that
+// let every drawer tab render "[object HTMLDivElement]" while the file, the
+// payload and the exit code all stayed correct. The chip is built with raw(),
+// which is exactly where an interpolated node would print itself instead of its
+// content.
+//
+// It matters because a chained run still reports k samples per task, and a
+// reader who is not told will read a continuation as a repeat of one
+// measurement.
+func TestReportHeaderSaysTheCellsWereChained(t *testing.T) {
+	requireBrowser(t)
+	work := t.TempDir()
+	ds := writeChainedTurnDataset(t, filepath.Join(work, "ds"))
+	report := filepath.Join(work, "chained.html")
+
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--agent", "mock",
+		"--bin", filepath.Join(agents, "chain.sh"),
+		"--name", "chained",
+		"--chain-sessions",
+		"--db", filepath.Join(work, "chained.db"),
+		"--work-root", filepath.Join(work, "work"),
+		"--report", report,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	res := browserRender(t, report)
+	if res.Cells == 0 {
+		t.Fatal("the chained run drew no cells, so there is no page to read")
+	}
+	if !strings.Contains(res.Header, "chained in order") {
+		t.Errorf("the header does not say the cells were chained, so a continuation reads as a repeat\n%s", res.Header)
+	}
+	if strings.Contains(res.Header, "[object ") {
+		t.Errorf("the header shows a stringified object instead of its chips\n%s", res.Header)
+	}
+}
+
 // TestReportDrawerShowsTheRecordedBaseline covers the card a reader compares
 // against, which the checked-in demo dataset cannot reach: it has no baseline.
 func TestReportDrawerShowsTheRecordedBaseline(t *testing.T) {
@@ -317,6 +372,28 @@ func TestReportDrawerShowsTheRecordedBaseline(t *testing.T) {
 	if !strings.Contains(overview.Text, "31") {
 		t.Errorf("this attempt's own final answer is missing from the comparison\n%s", overview.Text)
 	}
+	// Who made the recording, and the one thing about that the reader has to be
+	// told outright. The replay ran `mock` against a recording made by `cursor`,
+	// so the deltas above are the difference between two agents -- and both the
+	// name and the notice are built by interpolating a fragment into a row,
+	// which is exactly where "[object Object]" would hide.
+	if !overview.RecordedBy {
+		t.Errorf("the card does not name who made the recording\n%s", overview.Text)
+	}
+	if !strings.Contains(overview.Text, "cursor") {
+		t.Errorf("the recording's producer is not on the page\n%s", overview.Text)
+	}
+	if !overview.CrossAgent {
+		t.Errorf("a recording from another agent must be flagged, not shown as like-for-like\n%s", overview.Text)
+	}
+	// The recording's own caveats replace the framework's generic sentence:
+	// two caveat rows in one card is how both stop being read.
+	if !strings.Contains(overview.Text, "records no cost") {
+		t.Errorf("the recording's own caveats did not reach the card\n%s", overview.Text)
+	}
+	if overview.GenericNote {
+		t.Errorf("the generic busy-time sentence should give way to the recording's own\n%s", overview.Text)
+	}
 }
 
 // writeBaselineDataset writes a one-task dataset whose recording carries an
@@ -347,7 +424,9 @@ tasks:
 	baseline := `{
   "id": "rec-1",
   "source": "render-test",
+  "agent_name": "cursor",
   "agent_model": "recorded-model",
+  "notes": "records no cost and no per-request timing",
   "final_output": "the recorded answer",
   "turns": [
     {"role": "user", "text": "state the answer"},

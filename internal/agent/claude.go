@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -85,6 +86,15 @@ func (c *ClaudeCode) Run(ctx context.Context, sb sandbox.Sandbox, spec Spec, pro
 		attempt.Failed = true
 		attempt.Error = reason
 	}
+	// A run that never reached the model is a harness error, not a measurement.
+	// This can only be seen in the stream -- the CLI exits zero and calls it a
+	// success -- so it is checked after the trace has been parsed.
+	if !attempt.Failed {
+		if reason := diagnoseNoWork(tr, prompt); reason != "" {
+			attempt.Failed = true
+			attempt.Error = reason
+		}
+	}
 	if res.Err != nil && attempt.ExitCode < 0 && !attempt.TimedOut && !attempt.TurnsExceeded {
 		attempt.Failed = true
 		attempt.Error = res.Err.Error()
@@ -113,6 +123,65 @@ func diagnoseEmptyRun(res *sandbox.ExecResult) string {
 		detail = "(no stderr)"
 	}
 	return fmt.Sprintf("agent produced no stream output (exit %d): %s%s", res.ExitCode, detail, hint)
+}
+
+// diagnoseNoWork detects a run that started the CLI but never reached the model.
+//
+// The CLI reports these as a success -- subtype "success", is_error false -- and
+// it is not lying: nothing went wrong, the prompt simply never became an API
+// call. Filed that way, an attempt that did nothing is indistinguishable from
+// one that answered in zero tokens, and it earns a favourable delta against a
+// baseline that took real work. Every number such a run produces describes the
+// CLI rather than the agent, which is what a harness error is for.
+//
+// The common cause is a prompt that opens with a slash command the agent does
+// not expose: a task collected from one agent can carry that agent's invocation
+// syntax into a replay on another, and the CLI answers "Unknown command"
+// locally. Saying so requires knowing which commands were on offer, so the
+// trace's own init event is the source rather than a guess.
+func diagnoseNoWork(tr *trace.Trace, prompt string) string {
+	if tr == nil || tr.Incomplete {
+		// With no terminal result event the stream is already diagnosed as
+		// incomplete; a second reason would only replace the truer one.
+		return ""
+	}
+	// Any of these means the model ran, whatever it then produced.
+	if tr.Result.NumTurns > 0 || tr.Usage().Total() > 0 || len(tr.ToolCalls) > 0 {
+		return ""
+	}
+	if cmd, ok := LeadingSlashCommand(prompt); ok && !slices.Contains(tr.SlashCommands, cmd) {
+		return fmt.Sprintf(
+			"the agent never ran: the prompt invokes /%s, which this run did not expose "+
+				"(%d slash command(s) available), so the CLI answered %q without calling the model",
+			cmd, len(tr.SlashCommands), firstLine(tr.Result.ResultText))
+	}
+	return fmt.Sprintf(
+		"the agent never ran: no turns, no tokens and no tool calls, and the CLI answered %q",
+		firstLine(tr.Result.ResultText))
+}
+
+// LeadingSlashCommand reports the slash command a prompt opens with.
+//
+// Only a bare first token counts. A prompt that opens with a path -- /Users/me/x
+// -- is a path rather than an invocation, and is rejected here instead of being
+// reported later as a command the agent failed to provide.
+//
+// It is exported because the question is worth asking before a run as well as
+// after one: a command that cannot resolve is only diagnosable once it has been
+// paid for.
+func LeadingSlashCommand(prompt string) (string, bool) {
+	s := strings.TrimSpace(prompt)
+	if !strings.HasPrefix(s, "/") {
+		return "", false
+	}
+	name := s[1:]
+	if i := strings.IndexAny(name, " \t\r\n"); i >= 0 {
+		name = name[:i]
+	}
+	if name == "" || strings.ContainsAny(name, "/\\.") {
+		return "", false
+	}
+	return name, true
 }
 
 // ---------------------------------------------------------------------------

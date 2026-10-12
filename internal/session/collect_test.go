@@ -1,6 +1,9 @@
 package session
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -101,11 +104,29 @@ func TestLimitsAreAnchoredToTheRecordedAttempt(t *testing.T) {
 		t.Errorf("max turns = %d, want the 20 floor", got)
 	}
 
-	// A slow baseline raises it.
-	s.BusyMs = 600_000 // 10 minutes
+	// A slow baseline raises it. The clock sits on the last assistant entry of
+	// the turn the opening prompt started, which is what the slice reads.
+	s.Turns[2].DurationMs = 600_000 // 10 minutes
 	slow, _ := Collect([]*Session{s}, Options{})
 	if got := slow[0].Task.Limits.TimeoutS; got != 1800 {
 		t.Errorf("timeout = %d, want 3x the baseline's 600s", got)
+	}
+}
+
+func TestOnePromptSessionSizesItsBudgetFromTheSessionTotal(t *testing.T) {
+	// With a single prompt the slice is the whole session, so the session's own
+	// busy time applies -- including the case where that time had to be
+	// estimated because the capture recorded none.
+	s := parseFixture(t)
+	s.Prompts = s.Prompts[:1]
+	s.Turns = s.Turns[:3]
+	s.BusyMs = 600_000
+	items, _ := Collect([]*Session{s}, Options{})
+	if got := items[0].Task.Limits.TimeoutS; got != 1800 {
+		t.Errorf("timeout = %d, want 3x the session's 600s", got)
+	}
+	if got := items[0].Baseline.BusyMs; got != 600_000 {
+		t.Errorf("baseline busy = %d, want the session's 600000", got)
 	}
 }
 
@@ -135,20 +156,25 @@ func TestSplitTurnEmitsOneTaskPerPrompt(t *testing.T) {
 }
 
 func TestSplitTurnSlicesTheTrajectoryRatherThanRepeatingIt(t *testing.T) {
-	// The follow-up's baseline must start at the follow-up. Repeating the whole
-	// session would charge the first prompt's cost to the second one.
+	// Each task's baseline must stop where its own prompt's answer stops.
+	// Letting it run to the end of the session charges the first task for every
+	// turn that came after it, and the fixture's two prompts make that visible:
+	// the first task covers three turns, not all five.
 	s := parseFixture(t)
 	items, _ := Collect([]*Session{s}, Options{Split: SplitTurn})
 
 	first, second := items[0].Baseline, items[1].Baseline
-	if len(first.Turns) != 5 {
-		t.Errorf("first baseline turns = %d, want the whole session", len(first.Turns))
+	if len(first.Turns) != 3 {
+		t.Errorf("first baseline turns = %d, want only the turns answering it", len(first.Turns))
 	}
 	if len(second.Turns) != 2 {
 		t.Errorf("second baseline turns = %d, want the slice from turn 3", len(second.Turns))
 	}
 	if second.Turns[0].Role != RoleUser || second.Turns[0].Text != "好的" {
 		t.Errorf("second baseline starts at %+v, want its own prompt", second.Turns[0])
+	}
+	if got, want := first.Usage.Total(), 280; got != want {
+		t.Errorf("first baseline tokens = %d, want %d (its own two messages)", got, want)
 	}
 	if got, want := second.Usage.Total(), 12; got != want {
 		t.Errorf("second baseline tokens = %d, want %d (only the last message)", got, want)
@@ -183,9 +209,9 @@ func TestMetadataAgreesWithTheBaselineItAccompanies(t *testing.T) {
 	}
 }
 
-// The per-turn split is nested by design -- the first task keeps the whole
-// session, each later one starts at its own prompt -- so the fields that
-// describe the trajectory must stay sliced even as the totals above follow them.
+// Every per-turn task covers exactly one prompt and the turns answering it, so
+// the fields that describe the trajectory have to stay sliced, and the totals
+// above them have to follow the slice rather than the session.
 func TestLaterSplitTurnsStillCarryOnlyTheirOwnTrajectory(t *testing.T) {
 	items, _ := Collect([]*Session{parseFixture(t)}, Options{Split: SplitTurn})
 	if len(items) != 2 {
@@ -194,8 +220,8 @@ func TestLaterSplitTurnsStillCarryOnlyTheirOwnTrajectory(t *testing.T) {
 	if got := items[1].Task.Metadata["baseline_tokens"]; got != 12 {
 		t.Errorf("second task baseline_tokens = %v, want 12 (the follow-up's own spend)", got)
 	}
-	if got := items[0].Task.Metadata["baseline_tokens"]; got != 292 {
-		t.Errorf("first task baseline_tokens = %v, want 292 (every turn it covers)", got)
+	if got := items[0].Task.Metadata["baseline_tokens"]; got != 280 {
+		t.Errorf("first task baseline_tokens = %v, want 280 (only the turns it covers)", got)
 	}
 }
 
@@ -220,6 +246,11 @@ func TestMinPromptRunesDropsConversationalNoise(t *testing.T) {
 	}
 	if len(items) != 1 {
 		t.Fatalf("items = %d, want 1 (\"好的\" is a turn, not a task)", len(items))
+	}
+	// The dropped prompt still ends the slice. Its answer belongs to it, so
+	// letting the kept task run on would charge it for a turn it did not cause.
+	if got := len(items[0].Baseline.Turns); got != 3 {
+		t.Errorf("kept task covers %d turns, want 3: the follow-up's own turns are not its", got)
 	}
 	if _, err := Collect([]*Session{s}, Options{Split: SplitTurn, MinPromptRunes: 100}); err == nil {
 		t.Error("filtering everything away must be an error, not an empty dataset")
@@ -305,20 +336,24 @@ func TestWriteDatasetRoundTripsThroughTheLoader(t *testing.T) {
 		}
 	}
 	first := ds.Tasks[0]
-	// 292 is the summed per-message figure, not the cost-state total of 280:
-	// this is a per-turn baseline, and the session-scoped total cannot describe
-	// one turn of it. The fixture makes the two disagree on purpose.
-	if first.ResolvedBaseline.Usage.Total() != 292 {
-		t.Errorf("per-turn baseline tokens = %d, want 292 (the summed messages)", first.ResolvedBaseline.Usage.Total())
+	// 280 is the first turn's own two messages, and it happens to equal the
+	// cost-state session total here. What matters is that it is the slice's
+	// sum: the session total would have been 292 with the follow-up folded in,
+	// and the cost-state figure cannot describe one turn of a longer session.
+	if first.ResolvedBaseline.Usage.Total() != 280 {
+		t.Errorf("per-turn baseline tokens = %d, want 280 (the slice's own messages)", first.ResolvedBaseline.Usage.Total())
 	}
-	if first.ResolvedBaseline.FinalOutput != "好的。" {
-		t.Errorf("baseline final output = %q", first.ResolvedBaseline.FinalOutput)
+	if first.ResolvedBaseline.FinalOutput != "已修复，减号写反了。" {
+		t.Errorf("baseline final output = %q, want the answer to the first prompt", first.ResolvedBaseline.FinalOutput)
 	}
 }
 
-func TestSessionSplitUsesTheRecordedSessionTotal(t *testing.T) {
-	// The session-scoped baseline is the one place the cost-state record
-	// applies, and it is authoritative there.
+func TestSessionSplitMeasuresTheOpeningRequest(t *testing.T) {
+	// The session split is one task per session, and the task is the opening
+	// request -- so the baseline has to be the opening request's own turns. On a
+	// session where the human kept asking, the whole trajectory answers
+	// questions this task never asks, and a replay measured against it would be
+	// reported as cheaper than a recording it does not correspond to.
 	s := parseFixture(t)
 	items, _ := Collect([]*Session{s}, Options{})
 	dir := filepath.Join(t.TempDir(), "collected")
@@ -329,11 +364,127 @@ func TestSessionSplitUsesTheRecordedSessionTotal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := ds.Tasks[0].ResolvedBaseline.Usage.Total(); got != 280 {
-		t.Errorf("session baseline tokens = %d, want the recorded 280", got)
+	base := ds.Tasks[0].ResolvedBaseline
+	if got := len(base.Turns); got != 3 {
+		t.Errorf("session baseline turns = %d, want the 3 answering the opening request", got)
 	}
-	if got := ds.Tasks[0].ResolvedBaseline.CostUSD; got != 0.25 {
-		t.Errorf("session baseline cost = %v, want 0.25", got)
+	if got := base.Usage.Total(); got != 280 {
+		t.Errorf("session baseline tokens = %d, want 280 (the opening request's own messages)", got)
+	}
+	if base.FinalOutput != "已修复，减号写反了。" {
+		t.Errorf("session baseline final output = %q, want the answer to the opening request", base.FinalOutput)
+	}
+	// Cost is a session total, and this baseline is not the session.
+	if base.CostUSD != 0 {
+		t.Errorf("session baseline cost = %v, want unset", base.CostUSD)
+	}
+	if !strings.Contains(base.Notes, "not attributable") {
+		t.Errorf("the baseline must say what it does not cover, got %q", base.Notes)
+	}
+}
+
+func TestTheSessionSplitSaysWhichPromptsItLeftOut(t *testing.T) {
+	// TestSessionSplitMeasuresTheOpeningRequest pins what the session split
+	// measures. This pins what it declares: the prompts past the first are not
+	// in the dataset at all, and nothing else in a one-task collection says how
+	// many prompts the recording held. A reader who does not know to look for
+	// that takes the opening request's slice for the whole session -- which, on
+	// a session the human kept asking in, is a fraction of it.
+	s := parseFixture(t)
+	if len(s.Prompts) < 2 {
+		t.Fatalf("the fixture holds %d prompt(s); this test needs one the human kept asking in", len(s.Prompts))
+	}
+	items, err := Collect([]*Session{s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("the session split emitted %d task(s), want 1", len(items))
+	}
+	notes := items[0].Baseline.Notes
+	for _, want := range []string{
+		fmt.Sprintf("holds %d prompts", len(s.Prompts)),
+		"collected the first one only",
+		fmt.Sprintf("the other %d are not in it", len(s.Prompts)-1),
+		"--split turn",
+	} {
+		if !strings.Contains(notes, want) {
+			t.Errorf("the baseline must say %q, got:\n%s", want, notes)
+		}
+	}
+
+	// A one-prompt session is the case the split is for and there is nothing to
+	// declare: the slice is the session.
+	one := parseFixture(t)
+	one.Prompts = one.Prompts[:1]
+	one.Turns = one.Turns[:3]
+	only, err := Collect([]*Session{one}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := only[0].Baseline.Notes; strings.Contains(got, "collected the first one only") {
+		t.Errorf("a one-prompt session is the whole session, so it must not be declared partial:\n%s", got)
+	}
+
+	// And the turn split collects them, so the claim belongs to the session
+	// split alone rather than to every multi-prompt session.
+	all, err := Collect([]*Session{parseFixture(t)}, Options{Split: SplitTurn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) < 2 {
+		t.Fatalf("the turn split emitted %d task(s), want one per prompt", len(all))
+	}
+	for _, it := range all {
+		if strings.Contains(it.Baseline.Notes, "not in it") {
+			t.Errorf("the turn split collected every prompt, so nothing is missing:\n%s", it.Baseline.Notes)
+		}
+	}
+}
+
+// TestCollectedTurnsCarryTheSessionAsFieldsAndMetadata covers the duplication
+// that makes a turn-split dataset replayable as a chain.
+//
+// The two copies exist for different readers: the metadata entries are the
+// human-facing provenance block, which the engine is not allowed to interpret,
+// and the fields are the copy the runner may act on when it is asked to put a
+// session's turns back in one workspace. Two copies of one fact drift unless
+// something pins them, and the drift here is quiet -- a chain that groups the
+// wrong tasks still runs and still writes rows.
+func TestCollectedTurnsCarryTheSessionAsFieldsAndMetadata(t *testing.T) {
+	s := parseFixture(t)
+	items, err := Collect([]*Session{s}, Options{Split: SplitTurn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) < 2 {
+		t.Fatalf("the fixture gave %d turn task(s); this test needs more than one", len(items))
+	}
+	for i, it := range items {
+		task := it.Task
+		if task.Session != s.ID {
+			t.Errorf("%s: session field = %q, want the recording's %q", task.ID, task.Session, s.ID)
+		}
+		if task.PromptIndex == nil {
+			t.Fatalf("%s: no prompt index, so the chain has no order to replay in", task.ID)
+		}
+		if *task.PromptIndex != i {
+			t.Errorf("%s: prompt index = %d, want %d", task.ID, *task.PromptIndex, i)
+		}
+		// And the metadata the reader sees says the same thing.
+		if got, _ := task.Metadata["session_id"].(string); got != task.Session {
+			t.Errorf("%s: metadata session_id = %q but the field says %q", task.ID, got, task.Session)
+		}
+		if got, ok := task.Metadata["prompt_index"].(int); !ok || got != *task.PromptIndex {
+			t.Errorf("%s: metadata prompt_index = %v but the field says %d", task.ID, task.Metadata["prompt_index"], *task.PromptIndex)
+		}
+	}
+
+	// A task with no recording behind it must not claim a session, or the flag
+	// would chain hand-written tasks together by accident.
+	hand := dataset.TaskSpec{ID: "hand"}
+	if hand.Session != "" || hand.PromptIndex != nil {
+		t.Error("a task written by hand starts with no session and no index")
 	}
 }
 
@@ -398,9 +549,352 @@ func TestWriteDatasetRefusesNothing(t *testing.T) {
 	}
 }
 
+func TestAppendAddsOnlyWhatIsNotAlreadyCollected(t *testing.T) {
+	// Collecting the same directory again after more sessions is what append is
+	// for. The first prompt is already in the dataset; only the follow-up may be
+	// added, or the same recording would be counted twice in every aggregate.
+	s := parseFixture(t)
+	dir := filepath.Join(t.TempDir(), "ds")
+	first, _ := Collect([]*Session{s}, Options{})
+	if err := WriteDataset(dir, "n", "hand-edited", first); err != nil {
+		t.Fatal(err)
+	}
+	manifestBefore, _ := os.ReadFile(filepath.Join(dir, "dataset.yaml"))
+
+	turns, _ := Collect([]*Session{s}, Options{Split: SplitTurn})
+	res, err := AppendDataset(dir, "other", "ignored", turns)
+	if err != nil {
+		t.Fatalf("AppendDataset: %v", err)
+	}
+	if res.Fresh {
+		t.Fatal("an existing dataset was treated as a new one")
+	}
+	if len(res.Added) != 1 || res.Added[0].Task.ID != "aaaabbbb-p1" {
+		t.Errorf("added = %v, want only the follow-up", itemIDs(res.Added))
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0] != "aaaabbbb-p0" {
+		t.Errorf("skipped = %v, want the first prompt, which is already collected", res.Skipped)
+	}
+
+	ds, err := dataset.Load(dir)
+	if err != nil {
+		t.Fatalf("the appended dataset does not load: %v", err)
+	}
+	var ids []string
+	for _, task := range ds.Tasks {
+		ids = append(ids, task.ID)
+		if task.ResolvedBaseline == nil {
+			t.Errorf("task %s lost its baseline", task.ID)
+		}
+	}
+	if strings.Join(ids, ",") != "aaaabbbb,aaaabbbb-p1" {
+		t.Errorf("tasks = %v, want the original followed by the follow-up", ids)
+	}
+	// The manifest may have been edited by hand since it was generated.
+	if after, _ := os.ReadFile(filepath.Join(dir, "dataset.yaml")); string(after) != string(manifestBefore) {
+		t.Errorf("appending rewrote the manifest:\n%s", after)
+	}
+
+	// A second identical append is a no-op, not an error.
+	again, err := AppendDataset(dir, "n", "", turns)
+	if err != nil {
+		t.Fatalf("second AppendDataset: %v", err)
+	}
+	if len(again.Added) != 0 || len(again.Skipped) != 2 {
+		t.Errorf("re-appending added %v and skipped %v, want nothing added", itemIDs(again.Added), again.Skipped)
+	}
+}
+
+func TestAppendRenamesAnIdTakenByADifferentRecording(t *testing.T) {
+	// Ids are an 8-character session prefix, so two sessions can collide. The
+	// second one is a different recording and must still be collectable.
+	dir := filepath.Join(t.TempDir(), "ds")
+	first, _ := Collect([]*Session{parseFixture(t)}, Options{})
+	if err := WriteDataset(dir, "n", "", first); err != nil {
+		t.Fatal(err)
+	}
+	other := parseFixture(t)
+	other.ID = "aaaabbbb-9999-different-session"
+	items, _ := Collect([]*Session{other}, Options{})
+
+	res, err := AppendDataset(dir, "n", "", items)
+	if err != nil {
+		t.Fatalf("AppendDataset: %v", err)
+	}
+	if got := res.Renamed["aaaabbbb"]; got != "aaaabbbb-2" {
+		t.Errorf("renamed = %v, want aaaabbbb -> aaaabbbb-2", res.Renamed)
+	}
+	ds, err := dataset.Load(dir)
+	if err != nil {
+		t.Fatalf("the appended dataset does not load: %v", err)
+	}
+	if len(ds.Tasks) != 2 {
+		t.Fatalf("tasks = %d, want 2", len(ds.Tasks))
+	}
+	// The renamed task must point at its own baseline, not at the original's.
+	renamedTask := ds.Tasks[1]
+	if renamedTask.Baseline.File != "baselines/aaaabbbb-2.json" || renamedTask.ResolvedBaseline.ID != other.ID {
+		t.Errorf("renamed task's baseline = %s (session %s), want its own", renamedTask.Baseline.File, renamedTask.ResolvedBaseline.ID)
+	}
+	if ds.Tasks[0].ResolvedBaseline.ID == other.ID {
+		t.Error("the append overwrote the original task's baseline")
+	}
+}
+
+func TestAppendToAnEmptyDirectoryWritesANewDataset(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "fresh")
+	items, _ := Collect([]*Session{parseFixture(t)}, Options{})
+	res, err := AppendDataset(dir, "n", "", items)
+	if err != nil {
+		t.Fatalf("AppendDataset: %v", err)
+	}
+	if !res.Fresh {
+		t.Error("a directory with no manifest holds no dataset to append to")
+	}
+	if _, err := dataset.Load(dir); err != nil {
+		t.Errorf("the new dataset does not load: %v", err)
+	}
+}
+
+func TestAppendRefusesAnInlineDataset(t *testing.T) {
+	// Appending to inline tasks would mean rewriting the manifest, and with it
+	// whatever was written there by hand.
+	dir := t.TempDir()
+	manifest := "name: inline\ntasks:\n  - id: t1\n    prompt: hi\n    graders: [{type: exit_code}]\n"
+	if err := os.WriteFile(filepath.Join(dir, "dataset.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items, _ := Collect([]*Session{parseFixture(t)}, Options{})
+	if _, err := AppendDataset(dir, "n", "", items); err == nil || !strings.Contains(err.Error(), "--overwrite") {
+		t.Errorf("err = %v, want a refusal that names the way out", err)
+	}
+}
+
+func itemIDs(items []Item) []string {
+	var ids []string
+	for _, it := range items {
+		ids = append(ids, it.Task.ID)
+	}
+	return ids
+}
+
 func TestUnknownSplitIsRejected(t *testing.T) {
 	s := parseFixture(t)
 	if _, err := Collect([]*Session{s}, Options{Split: "half"}); err == nil {
 		t.Error("an unknown split must be rejected rather than guessed at")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Binding a task to the directory its recording ran in
+// ---------------------------------------------------------------------------
+
+// gitIn runs git in dir with the developer's own configuration kept out of it:
+// a global trace2 hook or a diff driver is an uncontrolled input, and a test
+// that depends on one is a test that fails on someone else's machine.
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	full := append([]string{"-C", dir, "-c", "commit.gpgsign=false",
+		"-c", "user.name=agenteval", "-c", "user.email=eval@agenteval.local"}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %s", args, out)
+	}
+}
+
+// TestAnEmptyReplaySaysWhereTheRecordingRan is the defect this closes.
+//
+// A collected task starts from an empty workspace -- the transcript holds the
+// branch and not the commit, so the tree cannot be rebuilt from it -- while the
+// session it was collected from ran somewhere with files in it. Both halves are
+// true in the ordinary case and the dataset used to state neither, which left a
+// report comparing two attempts that were not the same task.
+func TestAnEmptyReplaySaysWhereTheRecordingRan(t *testing.T) {
+	s := parseFixture(t)
+	s.Cwd = "/Users/someone/tmp/1015oncall/未命名"
+	items, err := Collect([]*Session{s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := items[0].Task.Workspace.Type; got != dataset.WorkspaceEmpty {
+		t.Fatalf("workspace type = %q, want the unbound default", got)
+	}
+	notes := items[0].Baseline.Notes
+	if !strings.Contains(notes, s.Cwd) || !strings.Contains(notes, "replays in an empty workspace") {
+		t.Errorf("the baseline must say the replay has no workspace and where the recording ran, got: %q", notes)
+	}
+	// The claim is kept to what is known: that the session needed those files is
+	// not knowable from a transcript.
+	if strings.Contains(notes, "the files it worked on") {
+		t.Errorf("the note must not claim the session needed files it may never have opened: %q", notes)
+	}
+}
+
+// TestABoundWorkspaceIsNotAlsoCalledAnEmptyReplay: the note describes the
+// workspace, so a task that has one must not carry the sentence about not
+// having one.
+func TestABoundWorkspaceIsNotAlsoCalledAnEmptyReplay(t *testing.T) {
+	s := parseFixture(t)
+	s.Cwd = "/Users/someone/tmp/whatever"
+	items, err := Collect([]*Session{s}, Options{WorkspaceRepo: "/repos/proj", WorkspaceRef: "abc123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := items[0].Task.Workspace; got.Type != dataset.WorkspaceGit || got.Repo != "/repos/proj" {
+		t.Fatalf("workspace = %+v, want the bound repository", got)
+	}
+	if strings.Contains(items[0].Baseline.Notes, "empty workspace") {
+		t.Errorf("a bound task must not be described as an empty replay: %q", items[0].Baseline.Notes)
+	}
+}
+
+// TestWorkspaceCwdClonesARepositoryWithACommit: a repository can be reproduced
+// faithfully enough to be worth preferring -- the branch is what the transcript
+// records -- so it is bound as a repository rather than copied.
+func TestWorkspaceCwdClonesARepositoryWithACommit(t *testing.T) {
+	dir := t.TempDir()
+	gitIn(t, dir, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "code.py"), []byte("buggy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "--quiet", "-m", "c")
+
+	s := parseFixture(t)
+	s.Cwd, s.GitBranch = dir, "main"
+	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := items[0].Task.Workspace
+	if got.Type != dataset.WorkspaceGit || got.Repo != dir || got.Ref != "main" {
+		t.Fatalf("workspace = %+v, want the repository at its recorded branch", got)
+	}
+	if items[0].SnapshotFrom != "" {
+		t.Error("a cloned workspace has no snapshot to write")
+	}
+	// The note is what stops the comparison being read as like-for-like: the
+	// branch is not the commit.
+	if !strings.Contains(items[0].Baseline.Notes, "records the branch and not the commit") {
+		t.Errorf("the binding must say what it is, got: %q", items[0].Baseline.Notes)
+	}
+}
+
+// TestWorkspaceCwdCopiesWhatCannotBeCloned covers both halves of one rule: a
+// directory that is not a repository, and one that is but has no commits. The
+// second is the case that looks bindable and clones to nothing, which is
+// exactly the recorded directory that started this.
+func TestWorkspaceCwdCopiesWhatCannotBeCloned(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// prepare makes the directory and returns it.
+		prepare func(t *testing.T) string
+	}{
+		{
+			name: "not a repository at all",
+			prepare: func(t *testing.T) string {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+		},
+		{
+			name: "a repository with no commits",
+			prepare: func(t *testing.T) string {
+				dir := t.TempDir()
+				gitIn(t, dir, "init", "--quiet")
+				if err := os.WriteFile(filepath.Join(dir, "checked-out.txt"), []byte("x\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return dir
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := tc.prepare(t)
+			s := parseFixture(t)
+			s.Cwd, s.GitBranch = dir, "main"
+			items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := items[0].Task.Workspace
+			if got.Type != dataset.WorkspaceFiles || got.Assets == "" {
+				t.Fatalf("workspace = %+v, want a copy of the directory", got)
+			}
+			if items[0].SnapshotFrom != dir {
+				t.Errorf("SnapshotFrom = %q, want the recorded directory", items[0].SnapshotFrom)
+			}
+			// The copy is the directory as it stands now, which is after the
+			// session finished. That is the one thing about this binding a
+			// reader has to know and cannot infer.
+			if !strings.Contains(items[0].Baseline.Notes, "as it stands now") ||
+				!strings.Contains(items[0].Baseline.Notes, "does not record the commit") {
+				t.Errorf("the copy must be labelled with what it is, got: %q", items[0].Baseline.Notes)
+			}
+		})
+	}
+}
+
+// TestTheCopiedWorkspaceIsWrittenWithoutItsHistory: .git is excluded, and not
+// only for tidiness. The materializer commits the workspace as the baseline the
+// agent starts from, so a carried-over .git is a history the agent can read the
+// answer out of -- the same reason a clone drops it.
+func TestTheCopiedWorkspaceIsWrittenWithoutItsHistory(t *testing.T) {
+	dir := t.TempDir()
+	gitIn(t, dir, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "nested", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "nested", "keep.py"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := parseFixture(t)
+	s.Cwd = dir
+	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "ds")
+	if err := WriteDataset(out, "copied", "", items); err != nil {
+		t.Fatalf("WriteDataset: %v", err)
+	}
+
+	assets := filepath.Join(out, filepath.FromSlash(items[0].Task.Workspace.Assets))
+	for _, rel := range []string{".git", filepath.Join("nested", ".git")} {
+		if _, err := os.Stat(filepath.Join(assets, rel)); err == nil {
+			t.Errorf("%s was copied into the dataset; the agent could read it as history", rel)
+		}
+	}
+	// The rest of the tree comes across, including the directory that held a
+	// .git of its own: only the history is dropped, not the contents.
+	for _, rel := range []string{"README.md", filepath.Join("nested", "keep.py")} {
+		if _, err := os.Stat(filepath.Join(assets, rel)); err != nil {
+			t.Errorf("%s did not survive the copy: %v", rel, err)
+		}
+	}
+}
+
+// TestWorkspaceCwdRefusesADirectoryThatIsGone: the flag means "use the
+// directory the recording ran in", and falling back to an empty workspace would
+// produce a task that looks bound and measures nothing.
+func TestWorkspaceCwdRefusesADirectoryThatIsGone(t *testing.T) {
+	s := parseFixture(t)
+	s.Cwd = filepath.Join(t.TempDir(), "deleted-after-the-session")
+	_, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err == nil {
+		t.Fatal("binding a directory that is gone must fail rather than fall back")
+	}
+	if !strings.Contains(err.Error(), s.Cwd) {
+		t.Errorf("the error must name the directory, got: %v", err)
 	}
 }

@@ -159,8 +159,14 @@ init:   workspace: {type: empty|files|git, ...}
 output: type: patch|files|stdout|none, paths, ignore_paths, expect_answer
 score:  graders: [...], limits: {max_turns, timeout_s}
 base:   baseline: {file, notes}
+origin: session, prompt_index   # the recording a task came from, and which prompt
 meta:   metadata: {...}          # free-form provenance, never interpreted
 ```
+
+`session` and `prompt_index` are the two fields the engine reads rather than
+merely stores, and they exist because `metadata` is contractually opaque: a
+value the engine interprets cannot live in the block it never interprets.
+`collect` writes both; a hand-written task may leave them out.
 
 `workspace.type: git` takes `repo`, `ref` (a commit SHA is reproducible, a branch
 is not) and `subdir`; the upstream `.git` is dropped and the baseline rebuilt, so
@@ -282,6 +288,104 @@ so the task is measurable and unscorable. Grading it as a failure would invent a
 verdict; grading it as a pass would invent the opposite. Attach a grader
 explicitly with `--grader` if you have one.
 
+### How much of a session one task covers
+
+`--split` decides that, and the default is `session`: one task holding the
+opening request, measured against the turns that answered it.
+
+On a session the human kept asking in, that is the **first prompt only**. The
+baseline stops at the next prompt, because the whole trajectory answers
+questions this task never asks and a replay measured against it would be
+reported as cheaper than a recording it does not correspond to. The prompts
+after the first are therefore not collected at all — which is a fact nothing
+else in a one-task dataset records, so `collect` states it, in the task's
+baseline notes and on stderr:
+
+```
+warning: 1 session(s) hold more prompts than this dataset collected: 1f2114cd (1 of 3).
+         Re-run with --split turn to collect each prompt as its own task.
+```
+
+`--split turn` emits one task per prompt, each measured against its own slice,
+and `--min-prompt-runes` drops conversational noise like "ok" or "try again"
+under that split — the same warning tells you when it did.
+
+### Replaying a session's turns as one sequence
+
+`--split turn` plans each prompt as an independent cell: its own fresh sandbox,
+run in whatever order `--concurrency` happens to schedule. That is the right
+measurement for "how does this agent do on this prompt", and the wrong one for a
+recording the human kept going — the second prompt asks about the file the first
+one wrote, so a replay in a fresh directory asks a question about a file that was
+never there. `--chain-sessions` makes the collected provenance load-bearing:
+
+```sh
+aeval run -d datasets/mine --chain-sessions
+```
+
+- Tasks sharing a `session` run in **one workspace**, in `prompt_index` order —
+  the order the prompts were asked, not the order the tasks file lists them.
+- The chain materialises that workspace once, before its first cell, and removes
+  it after its last. The later cells start from what the earlier ones left
+  because nothing put the directory back in between.
+- A task with no `session` is its own chain, which is what keeps the flag from
+  changing an ordinary dataset at all.
+- Samples stay independent: a chain is replayed once per sample, so sample 1
+  never starts from sample 0's leftovers.
+- Chaining needs `--concurrency 1`, and says so as a usage error rather than
+  quietly serialising: two cells of one chain in flight would write over each
+  other with nothing on the row to record that it happened.
+- `--resume` refuses a chain that is only half recorded, naming it and how much
+  is left. A chained cell's predecessor's workspace went away with its cell, so
+  the rest would start from nothing and their rows would describe the missing
+  files rather than the agent.
+
+Because of that, a chained run's cells are a **sequence, not repeats**: `k=1` is
+the usual setting, and a `pass_rate` over a chain answers "did the whole
+conversation get there". The run row records that it chained, the report header
+says so, and comparing a chained run with a plain one reports the difference
+instead of showing the deltas as like-for-like.
+
+When `--out` already holds a dataset, `collect` appends to it. Tasks whose
+recording (the same session and prompt) is already in it are skipped, and a
+task whose id is taken by a different recording gets a `-2` suffix. The
+existing tasks and manifest are left as they are. `--dry-run` shows what would
+be appended, and `--overwrite` replaces the dataset instead.
+
+### Binding a task to the directory it ran in
+
+A collected task replays in an **empty** workspace, because a transcript records
+the prompt and the answers but not the files that were checked out. That is
+honest and nearly useless: the recording ran against a real tree, so the re-run
+is measuring a different task. `--workspace-cwd` binds each task to its own
+recording's directory instead:
+
+```sh
+aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
+```
+
+- A directory that is a git repository **with a commit** becomes `type: git`,
+  pinned to the branch the recording was on. The commit is not recorded, and the
+  task's notes say so.
+- Anything else — no repository, or a repository with no commits — is copied
+  into the dataset as `type: files` under `assets/<task-id>/`, with `.git`
+  excluded. The copy is "as it stands now", meaning after the recording
+  finished, and the task says that too.
+A directory that no longer exists is an error naming it, not a silently empty
+task.
+
+That first case produces a `type: git` workspace, and materialising one is
+where an empty repository would do its damage: `git clone` of a repository with
+no commits *succeeds* and carries nothing, so the run would silently measure an
+empty directory. It is refused instead, by name and with the reason (no commit
+at the branch, versus a ref that does not exist — the second is not the
+repository's fault). `--workspace-cwd` never reaches that path: it sends a
+commit-less repository down the `files` route above.
+
+Without the flag, an empty replay carries a note naming the recorded directory —
+so the gap is visible in the report rather than implied by an empty page, and
+`collect` prints the same thing to stderr.
+
 ## Reports
 
 `aeval report` writes a self-contained `.html` file — CSS and JS inlined — that
@@ -300,6 +404,19 @@ exceeds it the builder sheds by priority: passing cells lose their trajectory an
 diff first, failing cells keep their evidence longest, and every degradation is
 recorded in the report's own warnings. A trajectory that is truncated keeps both
 ends — the opening events frame the task, the last ones carry the answer.
+
+A run's header also states the configuration the run drove, including its
+skills: which plugin directories were declared, whether they reached the agent,
+and which flag removed them if not. Declaring a directory is not loading it —
+`--bare` and `--disable-slash-commands` each remove the user's skills on their
+own, and the clean-room default turns both on. Two runs that differ only in
+their skills therefore used to compare as identical; now the comparison names
+that as the difference, and a comparison where one side recorded no
+configuration says *that* instead of quieting down into "nothing changed". The
+whole `agent.Spec` is stored per run (`runs.agent_spec_json`, schema v4), since
+the four label columns — agent, model, binary, backend — cannot identify a run
+that differs only in its skills. Rows written before v4 answer this question
+with silence, and the page keeps silence apart from "none".
 
 ## Package layout
 

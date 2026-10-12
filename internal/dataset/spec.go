@@ -312,6 +312,23 @@ type TaskSpec struct {
 	// against except another run of this harness.
 	Baseline *BaselineRef `json:"baseline,omitempty" yaml:"baseline,omitempty"`
 
+	// Session names the recording this task was collected from, and
+	// PromptIndex is its position among that recording's prompts.
+	//
+	// They are fields rather than metadata entries because the engine reads
+	// them: `run --chain-sessions` needs to know which tasks are turns of one
+	// session and in what order, and metadata is the human-facing provenance
+	// block that the engine never interprets. So a turn-split collection writes
+	// both -- these for the harness, the metadata entries of the same name for
+	// the reader -- and a test pins that they agree.
+	//
+	// Empty Session means the task stands alone: hand-written tasks, and
+	// collected ones from before these were fields, chain with nothing.
+	Session string `json:"session,omitempty" yaml:"session,omitempty"`
+	// PromptIndex is nil on a task with no session, which is not the same as
+	// the first prompt of one.
+	PromptIndex *int `json:"prompt_index,omitempty" yaml:"prompt_index,omitempty"`
+
 	// Metadata is free-form provenance: source benchmark, upstream instance id,
 	// PR links, license, etc. Never interpreted by the engine.
 	Metadata map[string]any `json:"metadata,omitempty" yaml:"metadata,omitempty"`

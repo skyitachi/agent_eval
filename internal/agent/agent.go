@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -122,6 +123,65 @@ type Spec struct {
 
 	// Timeout bounds the whole attempt.
 	Timeout time.Duration `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+}
+
+// EffectiveIsolation is the isolation this spec asks for, with the preset
+// applied.
+//
+// Isolation is a pointer so that an all-false configuration -- one that
+// deliberately accepts whatever the host has configured -- is distinguishable
+// from an omitted one. Every reader therefore has to resolve nil, and a reader
+// that does not reads the clean-room default as "no isolation"; this is the one
+// place that resolution happens.
+func (s Spec) EffectiveIsolation() Isolation {
+	if s.Isolation == nil {
+		return DefaultIsolation()
+	}
+	return *s.Isolation
+}
+
+// SkillsDeclared are the plugin directories this spec hands to the agent,
+// sorted so that two specs can be compared as strings.
+func (s Spec) SkillsDeclared() []string {
+	out := append([]string(nil), s.PluginDirs...)
+	sort.Strings(out)
+	return out
+}
+
+// SkillsActive reports whether the declared plugin directories will actually
+// reach the agent.
+//
+// Declaring a directory is not the same as loading it. --bare drops the user's
+// skills, and --disable-slash-commands drops every skill including the ones
+// named by --plugin-dir, so a spec with three plugin directories under either
+// flag loads none of them. That is exactly the configuration a clean-room run
+// starts from, so "skills: on" read off PluginDirs alone would be wrong in the
+// common case -- and it is the claim a report has to be able to make or
+// withhold.
+func (s Spec) SkillsActive() bool {
+	if len(s.PluginDirs) == 0 {
+		return false
+	}
+	iso := s.EffectiveIsolation()
+	return !iso.Bare && !iso.DisableSlashCommands
+}
+
+// SkillsReason says why the declared skill directories are not in effect, for
+// the sentence a report writes beside them. Empty means they are in effect, or
+// that none were declared.
+func (s Spec) SkillsReason() string {
+	if len(s.PluginDirs) == 0 || s.SkillsActive() {
+		return ""
+	}
+	iso := s.EffectiveIsolation()
+	var flags []string
+	if iso.Bare {
+		flags = append(flags, "--bare")
+	}
+	if iso.DisableSlashCommands {
+		flags = append(flags, "--disable-slash-commands")
+	}
+	return strings.Join(flags, " and ") + " removed them"
 }
 
 // Attempt is the complete record of one agent run against one task.

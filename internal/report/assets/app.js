@@ -260,6 +260,21 @@
     chips.push(raw(tpl`<span class="chip">agent <b>${r.agent_kind || '-'}</b></span>`));
     if (r.agent_model) chips.push(raw(tpl`<span class="chip">model <b>${r.agent_model}</b></span>`));
     chips.push(raw(tpl`<span class="chip">backend <b>${r.backend || '-'}</b></span>`));
+    /* Skills are always shown, including when nothing is known about them.
+     * The skill set is not one of the labels above -- it is the plugin
+     * directories plus the flags that decide whether they survive -- and a
+     * header that omits it is a header claiming every run configured the same
+     * agent. "not recorded" is a distinct claim from "none declared", so the
+     * two are never rendered the same way. */
+    if (r.skills) {
+      /* Alert on the contradiction, not on absence: directories the run
+       * declared and the flags then removed are worth colouring, while a run
+       * that declared none is simply a run with no skills. */
+      var alertCls = r.skills.removed_by ? ' mode-alert' : '';
+      chips.push(raw(tpl`<span class="chip${alertCls}">skills <b>${r.skills.text}</b></span>`));
+    } else {
+      chips.push(raw(tpl`<span class="chip">skills <b>not recorded</b></span>`));
+    }
     /* The sweep coordinates are rendered because a run that is one point of a
      * sweep reads very differently from a standalone one: its numbers are only
      * meaningful next to the control level's. */
@@ -267,6 +282,14 @@
       chips.push(raw(tpl`<span class="chip mode-alert">sweep <b>${r.factor_axis}=${r.factor_level || '?'}</b></span>`));
     }
     chips.push(raw(tpl`<span class="chip">k=<b>${r.samples_per_task}</b> · concurrency <b>${r.concurrency}</b></span>`));
+    /* Whether each session's tasks shared one workspace and ran in order. It
+     * belongs beside k because that is the reading it corrects: a chained run
+     * still reports so many samples, but the cells of one chain start from each
+     * other's state, so they are one continuation rather than repeats of one
+     * measurement. */
+    if (r.chain_sessions) {
+      chips.push(raw('<span class="chip mode-alert">sessions <b>chained in order</b></span>'));
+    }
     chips.push(raw(tpl`<span class="chip">started <b>${clock(r.started_at)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">duration <b>${dur(r.duration_ms)}</b></span>`));
     if (r.tool_version) chips.push(raw(tpl`<span class="chip">tool <b>${r.tool_version}</b></span>`));
@@ -664,6 +687,28 @@
     return raw(tpl`<dl class="kv">${items}</dl>`);
   }
 
+  /* The recording's identity, when the run that compared against it kept one.
+   * Empty on a row written before schema v3, which is the absence of a record
+   * rather than a recording that had no agent -- so nothing is printed, and
+   * the card does not claim to know who made the recording. */
+  function recordedBy(b) {
+    var parts = [];
+    if (b.agent_name) parts.push(b.agent_name + (b.agent_model ? ' (model ' + b.agent_model + ')' : ''));
+    if (b.source) parts.push('captured by ' + b.source);
+    return parts.join(', ');
+  }
+
+  /* A replay against a recording made by a different agent is a real
+   * comparison -- it is what replaying a collected session means -- but its
+   * delta is the difference between two agents, not the effect of one. Saying
+   * so is the whole difference between a number and a claim, so it is a notice
+   * rather than a fourth row of figures. */
+  function crossAgentNote(b) {
+    if (!b || !b.different_agent) return '';
+    var ran = (P.run && P.run.agent_kind) ? P.run.agent_kind : 'this attempt\u2019s agent';
+    return raw(tpl`The recording was made by <b>${b.agent_name}</b>; this attempt ran <b>${ran}</b>. The deltas below are the difference between two agents, not the effect of ${ran}.`);
+  }
+
   function baselineRows(t) {
     var b = t.baseline;
     if (!b) return [];
@@ -680,9 +725,13 @@
     } else {
       rows.push(['busy time', dur(t.duration_ms) + ' now; the recording carries no busy time to compare against']);
     }
+    rows.push(['turns', int(t.turns) + ' now vs ' + int(b.turns) + ' recorded']);
+    rows.push(['recorded by', recordedBy(b)]);
+    /* The recording's own caveats when it declared any, and the one thing the
+     * framework knows about every collected baseline when it did not. Two
+     * caveat rows in one card is how both stop being read, so it is one row. */
     rows.push(
-      ['turns', int(t.turns) + ' now vs ' + int(b.turns) + ' recorded'],
-      ['note', 'the recorded time is the session\u2019s busy time (API plus tool), not its wall clock: it had a human in the loop']
+      ['note', b.notes ? b.notes : 'the recorded time is the session\u2019s busy time (API plus tool), not its wall clock: it had a human in the loop']
     );
     return rows;
   }
@@ -716,6 +765,8 @@
     var brows = baselineRows(t);
     if (brows.length) {
       frag.appendChild(el(tpl`<h3 class="small muted mt">Against the recorded baseline</h3>`));
+      var cross = crossAgentNote(t.baseline);
+      if (cross) frag.appendChild(el(tpl`<div class="notice warn">${cross}</div>`));
       frag.appendChild(el(tpl`<div class="card" style="padding:14px 16px">${kv(brows)}</div>`));
     }
 

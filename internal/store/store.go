@@ -38,6 +38,7 @@ import (
 
 	_ "modernc.org/sqlite" // pure-Go driver, no cgo required
 
+	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/grader"
 )
 
@@ -62,7 +63,32 @@ var schemaFS embed.FS
 // database upgrades with a single ALTER TABLE and reads back with that column
 // empty, which is exactly true of it -- the column did not exist when those
 // rows were written, so the recording's answer was never kept.
-const schemaVersion = 2
+//
+// v3 adds attempts.baseline_agent_name, baseline_agent_model, baseline_source
+// and baseline_notes: who made the recording, and what the recording itself
+// says it does not cover. v1 and v2 rows read back with all four empty, which
+// again is exactly true of them -- a baseline is an input, so the run that
+// compared against one only knew what the dataset told it, and before v3 it
+// recorded none of it. Empty therefore means "the recording's provenance was
+// never kept", not "the recording had no agent"; the report says the first
+// thing rather than the second.
+//
+// v4 adds runs.agent_spec_json: the agent configuration the run actually drove,
+// serialised whole. The four label columns are what a comparison is *keyed* by,
+// and they are not the whole configuration -- the skill set is plugin_dirs plus
+// the isolation flags that decide whether it survives, so two runs that differ
+// only in their skills looked identical and the page could not state either
+// one's. v1-v3 rows read back empty, which is the absence of a record rather
+// than a claim that nothing was configured.
+//
+// v5 adds runs.chain_sessions: whether the run gave each session's tasks one
+// shared workspace and ran them in order. Like v4 it records how the run was
+// driven rather than what it drove, and for the same reason -- the cells of a
+// chain are not independent samples, and nothing else on the row says so. An
+// earlier row reads back as 0, which here is not a gap in the record: no build
+// that wrote those rows could chain, so "predates the column" and "did not
+// chain" are the same fact and do not need keeping apart.
+const schemaVersion = 5
 
 // ErrNotFound is matched by every missing-record error. It is a sentinel, not a
 // message: the errors that match it carry their own text, which names the record
@@ -156,7 +182,37 @@ type Run struct {
 	Notes       string `json:"notes,omitempty"`
 	ToolVersion string `json:"tool_version,omitempty"`
 	ConfigJSON  string `json:"config_json,omitempty"`
-	Error       string `json:"error,omitempty"`
+	// AgentSpecJSON is the agent.Spec this run drove, serialised. Empty on a
+	// row written before v4, which means the configuration was never recorded
+	// rather than that there was none.
+	//
+	// It is stored because the label columns do not identify a run: two runs
+	// differing only in the skills they loaded agree on every one of them, and
+	// a report that cannot see the difference presents the pair as one change.
+	AgentSpecJSON string `json:"agent_spec_json,omitempty"`
+	// ChainSessions is whether this run gave each session's tasks one shared
+	// workspace and ran them in order.
+	//
+	// It changes how the cells below it read, so it is recorded rather than
+	// inferred: a chained cell starts from what its predecessor left, which
+	// makes the cells of one chain a sequence and not independent samples. A
+	// row written before v5 reads false, and that is correct rather than
+	// missing -- no earlier build could chain.
+	ChainSessions bool   `json:"chain_sessions,omitempty"`
+	Error         string `json:"error,omitempty"`
+}
+
+// AgentSpec decodes the recorded configuration. ok is false when the row has
+// none, which is a fact about the record and not an error.
+func (r Run) AgentSpec() (agent.Spec, bool) {
+	var spec agent.Spec
+	if strings.TrimSpace(r.AgentSpecJSON) == "" {
+		return spec, false
+	}
+	if err := json.Unmarshal([]byte(r.AgentSpecJSON), &spec); err != nil {
+		return agent.Spec{}, false
+	}
+	return spec, true
 }
 
 // Attempt is one (task, sample) cell.
@@ -219,6 +275,24 @@ type BaselineComparison struct {
 	// a recording may have no final assistant text, and every row written
 	// before schema v2 has none by construction.
 	Output string `json:"output,omitempty"`
+
+	// AgentName and AgentModel are who produced the recording, and Source names
+	// the capture that wrote it ("claude-code-session", "cursor-composer").
+	//
+	// They exist so the report can say what is being compared with what. A
+	// replay against a recording made by a different agent is a legitimate
+	// comparison, but a delta shown without that fact reads as a like-for-like
+	// one. AgentName is the producing tool ("cursor"), which is NOT the same
+	// vocabulary as Run.AgentKind ("claude_code") -- see report.sameAgent.
+	AgentName  string `json:"agent_name,omitempty"`
+	AgentModel string `json:"agent_model,omitempty"`
+	Source     string `json:"source,omitempty"`
+
+	// Notes is what the recording said about itself: a field it never captured,
+	// an estimate standing in for a measurement. It travels with the baseline
+	// because it describes what the numbers beside it do and do not mean, and
+	// it is empty for every row written before schema v3.
+	Notes string `json:"notes,omitempty"`
 }
 
 // TokenTotal is the attempt's total token spend, billed and cached alike.
@@ -409,6 +483,9 @@ func (s *Store) migrate() error {
 // the next open.
 var migrations = []func(*Store) error{
 	upgradeV1ToV2,
+	upgradeV2ToV3,
+	upgradeV3ToV4,
+	upgradeV4ToV5,
 }
 
 // upgrade walks from a database's revision to this build's.
@@ -432,6 +509,47 @@ func (s *Store) upgrade(from int) error {
 // upgradeV1ToV2 adds the recorded answer to a database that predates it.
 func upgradeV1ToV2(s *Store) error {
 	return s.addColumnIfMissing("attempts", "baseline_output", "TEXT NOT NULL DEFAULT ''")
+}
+
+// upgradeV2ToV3 adds the recording's provenance to a database that predates it.
+//
+// Four columns rather than one blob: they are read independently -- the report
+// shows the agent the recording drove even when the recording declared no
+// caveats -- and a JSON blob would move the "is this empty or malformed"
+// question into every reader of it.
+func upgradeV2ToV3(s *Store) error {
+	for _, col := range []struct{ name, decl string }{
+		{"baseline_agent_name", "TEXT NOT NULL DEFAULT ''"},
+		{"baseline_agent_model", "TEXT NOT NULL DEFAULT ''"},
+		{"baseline_source", "TEXT NOT NULL DEFAULT ''"},
+		{"baseline_notes", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.addColumnIfMissing("attempts", col.name, col.decl); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// upgradeV3ToV4 adds the run's own agent configuration.
+//
+// One column rather than one per knob: the configuration is the agent.Spec the
+// run passed down and nothing reads it field by field out of SQL, so splitting
+// it would pin a list of agent flags into a schema that has no business
+// knowing them.
+func upgradeV3ToV4(s *Store) error {
+	return s.addColumnIfMissing("runs", "agent_spec_json", "TEXT NOT NULL DEFAULT ''")
+}
+
+// upgradeV4ToV5 adds whether the run chained a session's tasks into one
+// workspace.
+//
+// A separate column rather than a key in config_json: that field is the sweep's
+// own metadata and this is a fact about how the harness drove the cells, which
+// every reader of the run needs and none of them should have to decode a
+// document to find.
+func upgradeV4ToV5(s *Store) error {
+	return s.addColumnIfMissing("runs", "chain_sessions", "INTEGER NOT NULL DEFAULT 0")
 }
 
 // addColumnIfMissing is why the steps above can be re-run: ADD COLUMN is not
@@ -505,7 +623,7 @@ const runColumns = `id, name, status, started_at, ended_at, duration_ms,
 	dataset_path, dataset_name, dataset_hash,
 	agent_kind, agent_model, agent_bin, backend,
 	samples, concurrency, factor_axis, factor_level, sweep_id,
-	notes, tool_version, config_json, error`
+	notes, tool_version, config_json, agent_spec_json, chain_sessions, error`
 
 // CreateRun inserts a run. The caller sets StartedAt; a run with no status is
 // recorded as running.
@@ -526,7 +644,7 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 		r.DatasetPath, r.DatasetName, r.DatasetHash,
 		r.AgentKind, r.AgentModel, r.AgentBin, r.Backend,
 		r.Samples, r.Concurrency, r.FactorAxis, r.FactorLevel, r.SweepID,
-		r.Notes, r.ToolVersion, r.ConfigJSON, r.Error,
+		r.Notes, r.ToolVersion, r.ConfigJSON, r.AgentSpecJSON, boolInt(r.ChainSessions), r.Error,
 	}
 	if err := checkArity("runs", runColumns, args); err != nil {
 		return err
@@ -544,7 +662,9 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 			factor_axis=excluded.factor_axis, factor_level=excluded.factor_level,
 			sweep_id=excluded.sweep_id,
 			notes=excluded.notes, tool_version=excluded.tool_version,
-			config_json=excluded.config_json, error=excluded.error`,
+			config_json=excluded.config_json, agent_spec_json=excluded.agent_spec_json,
+			chain_sessions=excluded.chain_sessions,
+			error=excluded.error`,
 		args...)
 	if err != nil {
 		return fmt.Errorf("store: create run: %w", err)
@@ -652,6 +772,7 @@ const attemptColumns = `id, run_id, task_id, sample_index, category, tags_json,
 	diff, answer, grades_json, trace_json,
 	has_baseline, baseline_id, baseline_ref, baseline_tokens, baseline_ms,
 	baseline_cost, baseline_turns, baseline_output,
+	baseline_agent_name, baseline_agent_model, baseline_source, baseline_notes,
 	error, workspace_dir`
 
 // SaveAttempt inserts or replaces one cell.
@@ -687,6 +808,7 @@ func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
 		boolInt(a.Baseline.Present), a.Baseline.ID, a.Baseline.Ref,
 		a.Baseline.Tokens, a.Baseline.Ms, a.Baseline.Cost, a.Baseline.Turns,
 		a.Baseline.Output,
+		a.Baseline.AgentName, a.Baseline.AgentModel, a.Baseline.Source, a.Baseline.Notes,
 		a.Error, a.WorkspaceDir,
 	}
 	if err := checkArity("attempts", attemptColumns, args); err != nil {
@@ -712,6 +834,10 @@ func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
 			baseline_ms=excluded.baseline_ms, baseline_cost=excluded.baseline_cost,
 			baseline_turns=excluded.baseline_turns,
 			baseline_output=excluded.baseline_output,
+			baseline_agent_name=excluded.baseline_agent_name,
+			baseline_agent_model=excluded.baseline_agent_model,
+			baseline_source=excluded.baseline_source,
+			baseline_notes=excluded.baseline_notes,
 			error=excluded.error, workspace_dir=excluded.workspace_dir`,
 		args...)
 	if err != nil {
@@ -760,14 +886,16 @@ func scanRun(sc scanner) (Run, error) {
 	var r Run
 	var started string
 	var ended sql.NullString
+	var chained int
 	err := sc.Scan(&r.ID, &r.Name, &r.Status, &started, &ended, &r.DurationMs,
 		&r.DatasetPath, &r.DatasetName, &r.DatasetHash,
 		&r.AgentKind, &r.AgentModel, &r.AgentBin, &r.Backend,
 		&r.Samples, &r.Concurrency, &r.FactorAxis, &r.FactorLevel, &r.SweepID,
-		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.Error)
+		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.AgentSpecJSON, &chained, &r.Error)
 	if err != nil {
 		return Run{}, err
 	}
+	r.ChainSessions = chained != 0
 	r.StartedAt = parseTime(started)
 	if ended.Valid {
 		t := parseTime(ended.String)
@@ -789,6 +917,7 @@ func scanAttempt(sc scanner) (Attempt, error) {
 		&hasBaseline, &a.Baseline.ID, &a.Baseline.Ref,
 		&a.Baseline.Tokens, &a.Baseline.Ms, &a.Baseline.Cost, &a.Baseline.Turns,
 		&a.Baseline.Output,
+		&a.Baseline.AgentName, &a.Baseline.AgentModel, &a.Baseline.Source, &a.Baseline.Notes,
 		&a.Error, &a.WorkspaceDir)
 	if err != nil {
 		return Attempt{}, err

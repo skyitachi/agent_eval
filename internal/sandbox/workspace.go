@@ -114,6 +114,20 @@ func materializeGit(ctx context.Context, sb Sandbox, ws dataset.Workspace, datas
 			return fmt.Errorf("git checkout %s: %s", ws.Ref, firstLine(out))
 		}
 	}
+	// A clone of a repository with no commits succeeds and leaves nothing
+	// behind, so the failure mode is not an error here but a silently empty
+	// workspace three layers away -- where it reads as an agent that had
+	// nothing to work on. A ref that does not exist fails differently and
+	// loudly, so this is about the repository, not the checkout.
+	if out, err := runHost(ctx, cloneInto, "rev-parse", "--verify", "HEAD"); err != nil {
+		where := "its default branch"
+		if ws.Ref != "" {
+			where = ws.Ref
+		}
+		return fmt.Errorf("workspace repo %s has no commit at %s, so the workspace would be empty "+
+			"(cloning a repository with no commits succeeds and carries nothing): %s",
+			repo, where, firstLine(out))
+	}
 
 	src := cloneInto
 	if ws.Subdir != "" {

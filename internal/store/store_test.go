@@ -34,6 +34,12 @@ func sampleRun(id string) Run {
 		Backend: "local", Samples: 3, Concurrency: 4,
 		FactorAxis: "model", FactorLevel: "opus", SweepID: "sw1",
 		Notes: "n", ToolVersion: "dev", ConfigJSON: `{"a":1}`,
+		AgentSpecJSON: `{"kind":"claude_code","model":"opus","plugin_dirs":["/skills/a"],` +
+			`"isolation":{"bare":false,"strict_mcp_config":true,"disable_slash_commands":false}}`,
+		// True here so the round trip covers it: a chained run has to stay
+		// distinguishable after the fact, because its cells are a sequence and
+		// not independent samples and nothing on an attempt row says so.
+		ChainSessions: true,
 	}
 }
 
@@ -53,6 +59,10 @@ func sampleAttempt(runID, taskID string) Attempt {
 			Present: true, ID: "sess-1", Ref: "baselines/x.json",
 			Tokens: 9000, Ms: 60000, Cost: 0.25, Turns: 12,
 			Output: "the recorded answer",
+			// The recording's provenance, which is what lets the report say
+			// what is being compared with what.
+			AgentName: "cursor", AgentModel: "grok-4.5",
+			Source: "cursor-composer", Notes: "records no cost",
 		},
 		Error: "warn", WorkspaceDir: "/tmp/ws",
 	}
@@ -128,9 +138,18 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The database is built by taking today's schema and deleting what v2, v3,
+	// v4 and v5 added, rather than by pasting in an old DDL file: a copy of the
+	// old schema would drift from the migrations and stop testing them.
 	for _, stmt := range []string{
 		string(body),
 		`ALTER TABLE attempts DROP COLUMN baseline_output`,
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_name`,
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_model`,
+		`ALTER TABLE attempts DROP COLUMN baseline_source`,
+		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
+		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
+		`ALTER TABLE runs DROP COLUMN chain_sessions`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','1')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id, baseline_tokens)
@@ -168,6 +187,13 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 	if !got[0].Baseline.Present || got[0].Baseline.Tokens != 9000 || got[0].Baseline.ID != "sess-1" {
 		t.Errorf("the upgrade lost numbers that were already in the row: %+v", got[0].Baseline)
 	}
+	// Read at all is half the assertion: scanAttempt names the four provenance
+	// columns, so a migration that failed to add them fails here rather than
+	// returning zeros.
+	if got[0].Baseline.AgentName != "" || got[0].Baseline.AgentModel != "" ||
+		got[0].Baseline.Source != "" || got[0].Baseline.Notes != "" {
+		t.Errorf("provenance = %+v, want empty for a row written before v3", got[0].Baseline)
+	}
 	// The point of upgrading rather than refusing is being able to write to the
 	// old database at the new revision.
 	if err := s.SaveAttempt(ctx, Attempt{
@@ -184,6 +210,267 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		if a.TaskID == "t2" && a.Baseline.Output != "an answer kept after the upgrade" {
 			t.Errorf("baseline output = %q after the upgrade", a.Baseline.Output)
 		}
+	}
+}
+
+// TestOpenUpgradesAV2Database is the v2-to-v3 half of the same story: a
+// database written when a baseline carried its numbers but not its provenance.
+// It upgrades, and the row reads back with the provenance empty -- which is
+// exactly true of it, because those runs were told who made the recording by
+// the dataset and the store had nowhere to keep it.
+func TestOpenUpgradesAV2Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v2.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_name`,
+		`ALTER TABLE attempts DROP COLUMN baseline_agent_model`,
+		`ALTER TABLE attempts DROP COLUMN baseline_source`,
+		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
+		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
+		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','2')`,
+		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
+		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id,
+		 baseline_tokens, baseline_output)
+		 VALUES('r1','t1','ok',1,'sess-1',9000,'the recorded answer')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v2 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v2 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	got, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("attempts = %d, want the row that was already in the database", len(got))
+	}
+	// v2's own column is untouched: the upgrade adds, it does not rewrite.
+	if got[0].Baseline.Output != "the recorded answer" {
+		t.Errorf("baseline output = %q, want v2's column left alone", got[0].Baseline.Output)
+	}
+	// Empty provenance is the absence of a record, not a recording that had no
+	// agent. The report has to tell those apart, and cannot if the upgrade
+	// invents a name for a row that never had one.
+	if got[0].Baseline.AgentName != "" || got[0].Baseline.AgentModel != "" ||
+		got[0].Baseline.Source != "" || got[0].Baseline.Notes != "" {
+		t.Errorf("provenance = %+v, want empty for a row written before v3", got[0].Baseline)
+	}
+	// Being writable at the new revision is the point of upgrading rather than
+	// refusing a database that already holds a paid-for run.
+	if err := s.SaveAttempt(ctx, Attempt{
+		RunID: "r1", TaskID: "t2", Status: CellOK,
+		Baseline: BaselineComparison{
+			Present: true, AgentName: "cursor", Source: "cursor-composer",
+			Notes: "records no cost",
+		},
+	}); err != nil {
+		t.Fatalf("save provenance into an upgraded database: %v", err)
+	}
+	again, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range again {
+		if a.TaskID != "t2" {
+			continue
+		}
+		if a.Baseline.AgentName != "cursor" || a.Baseline.Source != "cursor-composer" ||
+			a.Baseline.Notes != "records no cost" {
+			t.Errorf("provenance = %+v after the upgrade", a.Baseline)
+		}
+	}
+}
+
+// TestOpenUpgradesAV3Database is the v3-to-v4 half: a database written when a
+// run recorded only the four labels it is compared by. It upgrades, and the run
+// reads back with no configuration -- which is what it is, not a run that
+// configured nothing.
+//
+// The distinction is the whole point of the column: the report has to be able
+// to say "this run loaded the user's skills" or "nothing was recorded about
+// skills", and an upgrade that filled in a plausible default would make the
+// second unreadable.
+func TestOpenUpgradesAV3Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v3.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
+		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','3')`,
+		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model)
+		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v3 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v3 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	run, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatalf("get the run that was already in the database: %v", err)
+	}
+	// Reading the row at all is half the assertion: runColumns names the new
+	// column, so a migration that failed to add it fails here.
+	if _, ok := run.AgentSpec(); ok {
+		t.Error("a row written before v4 must not claim to have recorded a configuration")
+	}
+	if run.AgentKind != "claude_code" || run.AgentModel != "sonnet" {
+		t.Errorf("the labels the row did carry were disturbed: %+v", run)
+	}
+	// Being writable at the new revision is the point of upgrading rather than
+	// refusing a database that already holds a paid-for run.
+	run.AgentSpecJSON = `{"kind":"claude_code","plugin_dirs":["/skills"]}`
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("write a configuration into an upgraded database: %v", err)
+	}
+	again, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := again.AgentSpec()
+	if !ok || len(spec.PluginDirs) != 1 || spec.PluginDirs[0] != "/skills" {
+		t.Errorf("spec = %+v, ok=%v after the upgrade", spec, ok)
+	}
+}
+
+// TestOpenUpgradesAV4Database covers the v4 -> v5 step, which is the one where
+// the new column is not a gap in the record.
+//
+// Every earlier column carried an "empty means nobody recorded this" reading,
+// and reading one of those wrong makes the tool report a fact as unknown. This
+// one is different: no build that wrote a v4 row could chain a session, so 0 is
+// not silence, it is the answer.
+func TestOpenUpgradesAV4Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v4.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','4')`,
+		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model, agent_spec_json)
+		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet',
+		        '{"kind":"claude_code"}')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v4 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v4 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	run, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatalf("get the run that was already in the database: %v", err)
+	}
+	if run.ChainSessions {
+		t.Error("a row written before v5 cannot have chained a session")
+	}
+	if _, ok := run.AgentSpec(); !ok {
+		t.Error("the upgrade disturbed what v4 had already recorded")
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("write into an upgraded database: %v", err)
+	}
+	again, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ChainSessions {
+		t.Error("an unchained run came back chained")
+	}
+}
+
+// TestRunRecordsWhetherItChainedASession is the round trip the report depends
+// on: a chained run has to be distinguishable from an unchained one after the
+// fact, because the cells of a chain are a sequence and not independent
+// samples, and nothing on an attempt row says so.
+func TestRunRecordsWhetherItChainedASession(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	r := sampleRun("chained")
+	r.ChainSessions = true
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRun(ctx, "chained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.ChainSessions {
+		t.Error("a chained run came back unchained, which is the state the report cannot recover from a cell")
+	}
+
+	// And the flag is not a one-way latch: a later write of the same run says
+	// what the current configuration is.
+	got.ChainSessions = false
+	if err := s.CreateRun(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	back, err := s.GetRun(ctx, "chained")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.ChainSessions {
+		t.Error("rewriting a run did not update whether it chained")
 	}
 }
 
@@ -245,6 +532,23 @@ func TestRunRoundTrip(t *testing.T) {
 	}
 	if got.Status != RunRunning {
 		t.Errorf("status = %q", got.Status)
+	}
+	// The configuration is read back whole, and the fields a comparison needs
+	// are among them: the plugin directories are what the skill factor varies,
+	// and the isolation flags decide whether they survive.
+	spec, ok := got.AgentSpec()
+	if !ok {
+		t.Fatalf("the run's configuration did not survive the round trip: %q", got.AgentSpecJSON)
+	}
+	if len(spec.PluginDirs) != 1 || spec.PluginDirs[0] != "/skills/a" || !spec.SkillsActive() {
+		t.Errorf("spec = %+v, want the declared skill directory and it active", spec)
+	}
+	// Whether the run chained a session's cells reads back too. The report
+	// cannot recover it from the cells -- two rows sharing a workspace look the
+	// same as two that happened to be given the same path -- so a lost flag is
+	// a page that presents one continuation as k independent samples.
+	if !got.ChainSessions {
+		t.Error("the run came back unchained, which no cell row can contradict")
 	}
 }
 
@@ -441,6 +745,16 @@ func TestAttemptRoundTrip(t *testing.T) {
 	// compare what two attempts cost but never whether they agreed.
 	if g.Baseline.Output != "the recorded answer" {
 		t.Errorf("baseline output = %q, want the recorded answer to survive storage", g.Baseline.Output)
+	}
+	// The provenance is stored rather than re-read for the same reason the
+	// numbers are: the report is a function of the database, and a baseline
+	// document living beside a dataset is not consulted at render time. Without
+	// these four, a replay against a recording made by another agent renders as
+	// a like-for-like comparison.
+	if g.Baseline.AgentName != "cursor" || g.Baseline.AgentModel != "grok-4.5" ||
+		g.Baseline.Source != "cursor-composer" || g.Baseline.Notes != "records no cost" {
+		t.Errorf("baseline provenance = %q/%q/%q/%q, want the recording's own",
+			g.Baseline.AgentName, g.Baseline.AgentModel, g.Baseline.Source, g.Baseline.Notes)
 	}
 }
 

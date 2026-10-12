@@ -345,3 +345,218 @@ func TestStopReasonPrecedence(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// A run that never reached the model
+// ---------------------------------------------------------------------------
+
+// The prompt-side half of the diagnosis: only a bare command name counts.
+//
+// Rejecting paths matters more than it looks. A recorded turn that opens with
+// /Users/me/x is a path, and reporting it as a command the agent failed to
+// expose would manufacture a harness error out of an ordinary prompt.
+func TestLeadingSlashCommandOnlyRecognisesABareCommandName(t *testing.T) {
+	cases := []struct {
+		prompt string
+		want   string
+		ok     bool
+	}{
+		{"/bff-oncall  测试环境 新服务", "bff-oncall", true},
+		{"  /run\nnow", "run", true},
+		{"/plugin:skill do it", "plugin:skill", true},
+		{"/bff-oncall", "bff-oncall", true},
+		{"/Users/me/lab fix the build", "", false},
+		{"/README.md rewrite this", "", false},
+		{"/", "", false},
+		{"", "", false},
+		{"just a sentence", "", false},
+		{"   ", "", false},
+		{"slash/in/the/middle", "", false},
+	}
+	for _, c := range cases {
+		got, ok := LeadingSlashCommand(c.prompt)
+		if ok != c.ok || got != c.want {
+			t.Errorf("LeadingSlashCommand(%q) = (%q, %v), want (%q, %v)", c.prompt, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// A run whose prompt resolved and whose model answered must not be touched: the
+// diagnosis exists for the absence of work, not for work that looks cheap.
+func TestANoWorkRunIsAHarnessErrorNotAMeasurement(t *testing.T) {
+	// What Claude Code 2.1.205 actually emits for an unexposed slash command:
+	// a synthetic assistant message, no turns, no tokens, is_error false.
+	unresolved := &trace.Trace{
+		SlashCommands: nil,
+		Result: trace.Result{
+			Subtype:    "success",
+			IsError:    false,
+			NumTurns:   0,
+			ResultText: "Unknown command: /bff-oncall",
+		},
+	}
+
+	cases := []struct {
+		name   string
+		tr     *trace.Trace
+		prompt string
+		want   string // "" means the run is left alone
+	}{
+		{
+			name:   "slash command the run did not expose",
+			tr:     unresolved,
+			prompt: "/bff-oncall  测试环境 新服务 76be4c8d",
+			want:   "the agent never ran: the prompt invokes /bff-oncall, which this run did not expose (0 slash command(s) available)",
+		},
+		{
+			name: "slash command the run did expose",
+			tr: &trace.Trace{
+				SlashCommands: []string{"other", "bff-oncall"},
+				Result:        trace.Result{Subtype: "success", NumTurns: 0, ResultText: "Unknown command: /bff-oncall"},
+			},
+			prompt: "/bff-oncall now",
+			// The command was on offer, so the CLI's refusal is its own; the
+			// run is still a non-measurement but the prompt is not the reason.
+			want: "the agent never ran: no turns, no tokens and no tool calls",
+		},
+		{
+			name:   "an ordinary prompt that did no work",
+			tr:     unresolved,
+			prompt: "fix the failing test",
+			want:   "the agent never ran: no turns, no tokens and no tool calls",
+		},
+		{
+			name: "a model that answered",
+			tr: &trace.Trace{
+				Result: trace.Result{Subtype: "success", NumTurns: 3, ResultText: "done"},
+			},
+			prompt: "/bff-oncall now",
+			want:   "",
+		},
+		{
+			name: "tokens billed but no result turns",
+			tr: &trace.Trace{
+				Result: trace.Result{NumTurns: 0, Usage: trace.Usage{InputTokens: 12}},
+			},
+			prompt: "/bff-oncall now",
+			want:   "",
+		},
+		{
+			name: "a tool ran",
+			tr: &trace.Trace{
+				ToolCalls: []trace.ToolCall{{Name: "Read"}},
+				Result:    trace.Result{NumTurns: 0},
+			},
+			prompt: "/bff-oncall now",
+			want:   "",
+		},
+		{
+			name: "the stream never terminated",
+			tr: &trace.Trace{
+				Incomplete: true,
+				Result:     trace.Result{NumTurns: 0},
+			},
+			prompt: "/bff-oncall now",
+			// Already reported as incomplete; a second reason would only
+			// replace the truer one.
+			want: "",
+		},
+		{
+			name:   "no trace at all",
+			tr:     nil,
+			prompt: "/bff-oncall now",
+			want:   "",
+		},
+	}
+	for _, c := range cases {
+		got := diagnoseNoWork(c.tr, c.prompt)
+		if c.want == "" {
+			if got != "" {
+				t.Errorf("%s: diagnoseNoWork = %q, want the run left alone", c.name, got)
+			}
+			continue
+		}
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: diagnoseNoWork =\n  %q\nwant it to contain\n  %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestASkillDirectoryIsNotLoadedJustBecauseItIsDeclared is the distinction the
+// run header and the comparison both rest on.
+//
+// The two flags remove the user's skills independently of one another, and the
+// clean-room preset sets both, so the ordinary configuration is one where three
+// declared plugin directories reach the agent not at all. A reader that takes
+// PluginDirs for an answer reports that run as having skills loaded.
+func TestASkillDirectoryIsNotLoadedJustBecauseItIsDeclared(t *testing.T) {
+	cases := []struct {
+		name   string
+		spec   Spec
+		active bool
+		reason string
+	}{
+		{
+			name:   "nothing declared",
+			spec:   Spec{Isolation: &Isolation{}},
+			active: false,
+			reason: "",
+		},
+		{
+			name:   "declared with both flags clear",
+			spec:   Spec{PluginDirs: []string{"/skills/a"}, Isolation: &Isolation{}},
+			active: true,
+			reason: "",
+		},
+		{
+			name:   "declared under the clean-room preset",
+			spec:   Spec{PluginDirs: []string{"/skills/a"}, Isolation: &Isolation{Bare: true, DisableSlashCommands: true}},
+			active: false,
+			reason: "--bare and --disable-slash-commands removed them",
+		},
+		{
+			name:   "declared with an omitted isolation means the preset",
+			spec:   Spec{PluginDirs: []string{"/skills/a"}},
+			active: false,
+			reason: "--bare and --disable-slash-commands removed them",
+		},
+		{
+			name:   "declared under bare alone",
+			spec:   Spec{PluginDirs: []string{"/skills/a"}, Isolation: &Isolation{Bare: true}},
+			active: false,
+			reason: "--bare removed them",
+		},
+		{
+			name:   "declared with slash commands alone disabled",
+			spec:   Spec{PluginDirs: []string{"/skills/a"}, Isolation: &Isolation{DisableSlashCommands: true}},
+			active: false,
+			reason: "--disable-slash-commands removed them",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.spec.SkillsActive(); got != c.active {
+				t.Errorf("SkillsActive = %v, want %v", got, c.active)
+			}
+			if got := c.spec.SkillsReason(); got != c.reason {
+				t.Errorf("SkillsReason = %q, want %q", got, c.reason)
+			}
+		})
+	}
+}
+
+// TestDeclaredSkillsAreSortedForComparison: two specs that name the same
+// directories in a different order configured the same agent, and a comparison
+// that reports them as different is crying wolf about the one difference that
+// matters.
+func TestDeclaredSkillsAreSortedForComparison(t *testing.T) {
+	spec := Spec{PluginDirs: []string{"/b", "/a"}}
+	got := spec.SkillsDeclared()
+	if len(got) != 2 || got[0] != "/a" || got[1] != "/b" {
+		t.Errorf("SkillsDeclared = %v, want them sorted", got)
+	}
+	got[0] = "/mutated"
+	if spec.PluginDirs[0] != "/b" {
+		t.Error("SkillsDeclared must not hand back the spec's own slice")
+	}
+}

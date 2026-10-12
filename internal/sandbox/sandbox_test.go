@@ -444,3 +444,69 @@ func TestGlobalGitConfigCannotInfluenceTheWorkspace(t *testing.T) {
 func shellQuoteForTest(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
+
+// TestAnEmptyRepositoryIsRefusedRatherThanMaterialized covers a failure that
+// used to be silent.
+//
+// Cloning a repository with no commits succeeds and carries nothing, so the
+// workspace comes out empty while everything upstream believes it was built.
+// The consequence is a run that grades an agent with nothing to work on, and
+// whose explanation -- "the agent answered without touching any files" -- points
+// at the agent instead of at the repository. Refusing here is the difference
+// between an error and a wrong number.
+//
+// This is also the shape of the recorded directory behind a failed replay: a
+// `git init` that was never committed to clones to exactly this.
+func TestAnEmptyRepositoryIsRefusedRatherThanMaterialized(t *testing.T) {
+	src := t.TempDir()
+	ctx := context.Background()
+	if out, err := runHost(ctx, src, "init", "--quiet"); err != nil {
+		t.Fatalf("git init: %s", out)
+	}
+
+	sb := newTestLocal(t)
+	ws := dataset.Workspace{Type: dataset.WorkspaceGit, Repo: src}
+	err := Materialize(ctx, sb, ws, ".")
+	if err == nil {
+		t.Fatal("materializing an empty repository must fail rather than produce an empty workspace")
+	}
+	// The message has to name the repository: "the workspace is empty" without
+	// saying why is the report the guard exists to replace.
+	if !strings.Contains(err.Error(), src) || !strings.Contains(err.Error(), "no commit") {
+		t.Errorf("error should name the repository and the reason, got: %v", err)
+	}
+}
+
+// TestARefThatDoesNotExistIsNotBlamedOnTheRepository: the check above asks
+// whether HEAD resolves, and a bad ref fails for its own reason. Saying "the
+// repository has no commits" about a typo in workspace.ref would send the reader
+// to the wrong place.
+func TestARefThatDoesNotExistIsNotBlamedOnTheRepository(t *testing.T) {
+	src := t.TempDir()
+	ctx := context.Background()
+	run := func(args ...string) {
+		t.Helper()
+		if out, err := runHost(ctx, src, args...); err != nil {
+			t.Fatalf("git %v: %s", args, out)
+		}
+	}
+	run("init", "--quiet")
+	if err := os.WriteFile(filepath.Join(src, "f.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", "-A")
+	run("commit", "--quiet", "-m", "c")
+
+	sb := newTestLocal(t)
+	ws := dataset.Workspace{
+		Type: dataset.WorkspaceGit, Repo: src,
+		Ref: "0000000000000000000000000000000000000000",
+	}
+	err := Materialize(ctx, sb, ws, ".")
+	if err == nil {
+		t.Fatal("a ref that does not exist must fail")
+	}
+	if strings.Contains(err.Error(), "no commit") {
+		t.Errorf("a missing ref must not be reported as an empty repository: %v", err)
+	}
+}

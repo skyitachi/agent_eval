@@ -156,9 +156,46 @@ type RunInfo struct {
 	Notes       string `json:"notes,omitempty"`
 	ToolVersion string `json:"tool_version,omitempty"`
 
+	// ChainSessions is whether the run gave each session's tasks one shared
+	// workspace and ran them in order.
+	//
+	// It is on the page because it changes what the cells mean. A chained cell
+	// starts from the state its predecessor left, so the cells of one chain are
+	// one continuation and not k independent samples -- and a page that lists
+	// them side by side without saying so invites the reader to average them.
+	ChainSessions bool `json:"chain_sessions,omitempty"`
+
+	// Skills is what this run's own configuration says about the agent's
+	// skills. Nil means the run recorded no configuration -- it predates the
+	// harness storing one -- which the page states rather than rendering as
+	// "none": the absence of a record and a record of absence are different
+	// claims and only one of them is knowledge.
+	Skills *Skills `json:"skills,omitempty"`
+
 	// Summary is the runner's own arithmetic, borrowed so that the CLI's
 	// printed totals and the page's totals cannot disagree.
 	Summary runner.Summary `json:"summary"`
+}
+
+// Skills is the part of a run's agent configuration that its labels cannot
+// carry.
+//
+// The label columns name the agent, the model, the binary and the backend. The
+// skill set is not among them: it is the plugin directories plus the isolation
+// flags that decide whether they survive, so two runs that differ only in their
+// skills agree on every label and, before this existed, produced a comparison
+// with nothing to say about it.
+type Skills struct {
+	// Dirs are the plugin directories the run declared, sorted.
+	Dirs []string `json:"dirs"`
+	// Active is whether those directories reached the agent. False with a
+	// non-empty Dirs is the clean-room case: declared, then removed.
+	Active bool `json:"active"`
+	// RemovedBy names the flags that removed them, empty when they survived.
+	RemovedBy string `json:"removed_by,omitempty"`
+	// Text is the line the page shows, written here so that the browser does
+	// not have to re-derive which combinations are worth a warning.
+	Text string `json:"text"`
 }
 
 // Counts is the cell tally, kept separate so the header never has to reduce the
@@ -283,6 +320,25 @@ type BaselineView struct {
 	// Empty means the recording kept none -- which is every row written before
 	// schema v2, and any recording whose session ended without assistant text.
 	Output string `json:"output,omitempty"`
+
+	// AgentName, AgentModel and Source say who made the recording and which
+	// capture wrote it. All three empty means the row predates schema v3, when
+	// the run recorded nothing about the baseline's provenance -- not that the
+	// recording had no agent. DifferentAgent is the one thing about them the
+	// reader has to be told outright: a replay against a recording made by
+	// another agent (a collected Cursor session replayed by Claude Code, say)
+	// is a real comparison, but its delta is not the agent's effect.
+	AgentName      string `json:"agent_name,omitempty"`
+	AgentModel     string `json:"agent_model,omitempty"`
+	Source         string `json:"source,omitempty"`
+	DifferentAgent bool   `json:"different_agent,omitempty"`
+
+	// Notes is what the recording declared about itself -- a field it never
+	// captured, an estimate standing in for a measurement. It replaces the
+	// report's generic sentence about busy time rather than sitting beside it,
+	// because two caveat rows in the same card is how both stop being read.
+	// Empty falls back to that generic sentence.
+	Notes string `json:"notes,omitempty"`
 }
 
 // Grader is one grader verdict.

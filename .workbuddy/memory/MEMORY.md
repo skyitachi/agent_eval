@@ -40,6 +40,91 @@ HTML 报告。只有 Claude Code 一种 agent（`mock` 是测试替身），mode
 ground truth，判失败是造判决）。**墙钟 ≠ 忙碌时间**（实测 4416s vs 533s）→ 用 `Baseline.BusyMs`。
 按 `message.id` 去重（176 条 assistant 记录 / 63 个 id，不去重放大 3 倍）。
 
+**`--out` 已有数据集默认追加**，`--overwrite` 才替换（`PlanAppend`/`AppendDataset`，dry-run 预览）。
+去重键是 **`recordingKey` = `source/session_id#prompt_index`**，不是 id —— 于是「同会话换 `--split`
+再收」会把已收录的 prompt 判重复跳过，报的 skipped 名字是**没写进过数据集的生成 id**。
+id 被**别的录制**占用则改后缀 `-2`。既有 `tasks.jsonl`/`dataset.yaml` **逐字节保留**（鼓励手改），
+内联 `tasks:` 的 manifest 拒绝追加。顺序：先 baseline 后 task 行，旧行解析失败即报错不硬追加。
+
+**两个来源**：`--source claude`（默认，`~/.claude/projects`）与 `--source cursor`
+（`state.vscdb` 的 `cursorDiskKV`，**不是** `composerHeaders` —— 它是不完整索引）。`--cursor-db`
+只配 cursor、`--root` 只配 claude，给错直接 usage 报错。`--list` 先看有什么再收集。
+
+- **`SplitSession` ≠ 「整段会话」**。任务是「第一个 prompt + 回答它的那些轮」
+  （`turnSlice(s, 0)`）；只有**切片 == 整段会话**（也就是单 prompt 会话）时才用会话级
+  `Usage/BusyMs/DurationMs/CostUSD`，否则按切片求和并附「per-turn baseline inside a longer
+  session」注记（多 prompt 会话的整段轨迹在回答一个任务没问的问题，拿它比会让回放永远显得更便宜）。
+  **推论：e2e 里别假设「基线 = 会话总量」，除非那个夹具只有一个 prompt。**
+- 采集器自己的疑点走 `Session.BaselineNotes` → `dataset.Baseline.Notes`（"no cost recorded" /
+  "token total is a lower bound" / "assistant turns are counted per bubble"）。
+- manifest 头按来源写，别硬编码「Claude Code sessions」。
+
+### 一个任务覆盖会话的多少（`--split`）
+
+默认 **`SplitSession`**：每会话一个任务，prompt = **第一个** prompt，baseline = **回答它的那段切片**
+（`turnSlice` 停在下一个 prompt 处）。**多 prompt 会话的后几个 prompt 根本没被收集** —— 这是设计
+（整段轨迹在回答这个任务没问的问题，拿它对照会让回放显得更便宜），但**必须说出来**：baseline 注记
+（`buildItem` 里 `SplitSession && len(s.Prompts)>1`）+ CLI 的 `warnDroppedPrompts`。`SplitTurn` 才每
+prompt 一个任务。实例：cursor 会话 `1f2114cd` 80 msgs / 3 prompts → 默认 1 个任务（18 轮切片），
+`--split turn` 3 个（18/55/7 轮）。
+
+**警告的口径**：按 metadata 的 `session_id` 分组、比 `session_prompts` 与实收数，**统计用 `items` 而非
+`plan.Added`**（skip 掉的任务仍在数据集里，只数追加的会在每次重跑误报）。建议文案随 split 变
+（session → `--split turn`；turn → `--min-prompt-runes`）。
+
+**`session` 与 `prompt_index` 是一等任务字段**（`dataset.TaskSpec`，在 `Baseline` 之后），**不走
+`metadata`**：`metadata` 契约上「引擎从不解释」，而这两个值引擎必须读（分组 + 排序）。两个 split 都写。
+手写任务两个都可以不写 —— 没有 `session` = 自成一条链，这正是「不带 flag 时数据集行为不变」的机制。
+
+### `--chain-sessions`：把同一会话的轮次串成一条链
+
+`--split turn` + 默认规划 = 每条 prompt 各自一个空沙箱、按 `--concurrency` 排到的顺序跑。对「人在
+一直追问」的录制这是错的：第二条 prompt 问的是第一条写下的文件，在新目录里回放等于在问一个从没
+存在过的文件。`--chain-sessions` 让采集来的 `session`/`prompt_index` 真正发挥作用：
+
+- **规划**（`plan`）：先按 `{chain, sample}` 分组（`chainKey` = 开链式且有 `session` 时取
+  `pathName(session)`，否则取 `pathName(task.ID)`），保留**首次出现的组序**，组内 `sortChain`，再标
+  `first`/`last`。目录 = `root/<runID>/<chain>/s<sample>`。
+- **同一会话一个工作区、按 `prompt_index` 排序**。`sortChain` 只在**每一个** cell 都有 `PromptIndex`
+  时才排序，否则**退回数据集自身顺序**（半个键不是键：按它排会把没有索引的散到「零落在哪」）。
+- **物化/清理各一次**（`runCell`）：只有 `first` 物化，只有 `last` 删目录。链上后面的 cell 从前面留
+  下的东西起步，**因为中间没人把目录放回去**。k 个样本各是一条独立链（样本 1 不从样本 0 的残留起步）。
+- **物化失败要污染整条链**：`execute` 维护 `broken[chain]`，链上一旦有一个 cell 失败，后面所有 cell
+  记 `fail(...)` 而**不跑**（否则会写出「agent 答得不好」的行，而真相是工作区没建起来）。
+- **`Config.Validate()` 单独一个纯方法**（Run 和 CLI 都调）：链式 + `--concurrency > 1` → 报错。CLI 调
+  它才能把 flag 错误报成 **usage error（exit 2）**，而不是「开跑之后失败」。
+- **`--resume` 拒绝半条链**（`chainsIntact`，点名链名与 `N of its M`）：链式 cell 的前驱工作区已随它
+  那个 cell 消失，剩下的会从空目录起步；全录完的链可以整个跳过，全没录的可以整条跑，**只有分裂的那种
+  不可测量**。
+- **`pathName` 是安全边界**：session id 来自录制（实践上是 UUID），但任务文件是给人手改的，带分隔符
+  的名字会把工作区放到 run 目录之外。白名单 `[A-Za-z0-9._-]`，其余换 `-`，再 trim `-.`，空则 `task`。
+- **披露三件**：`runs.chain_sessions`（v5）→ 报告头部 chip（`runs.chips` 里 `k=` 旁边，`raw()`）→
+  `comparisonWarnings` 里「链式的与普通的不是同一种测量」。
+
+**变异验证（14 项，全部确认变红）**：丢 `sortChain`；`chainKey` 忽略 session；`pathName` 用原始 id；
+`Validate` 恒 nil；`first` 恒 false；`last` 恒 true；`chainsIntact` 永不拒绝；删 baseline 注记；删
+`warnDroppedPrompts` 调用处；`boolInt(r.ChainSessions)` 写死 false；`scanRun` 读回恒 false；
+`load.go` 的 `ChainSessions` 写死 false；`comparisonWarnings` 的链式分支删掉；app.js 的 chip 条件改
+`false`（这条要跑 Chrome 渲染测试才看得到，静态 grep HTML 只证明源码被装进去了）。
+
+### `--workspace-cwd`：把任务绑回录制目录
+
+默认回放是**空工作区**（转录没记下检出过哪些文件）→ 空工作区带一条注记点名 `s.Cwd`，`collect` 也
+把同样的话打到 stderr。`--workspace-cwd` 才真的绑：
+
+- 目录
+  是 git 仓库**且有提交** → `{type:git, repo:cwd, ref:s.GitBranch}` + 注记「记了分支、没记提交」。
+- 否则（非仓库 / 仓库无提交）→ `{type:files, assets:assets/<sanitized id>}` + **snapshot**：
+  其实是**录制结束后**的目录树（`snapshotTree`，跳过任何 `.git`，上限 `maxSnapshotBytes=256MiB`），
+  注记写「as it stands now」。
+- 目录不存在 → **报错并点名该目录**（不是悄悄给空任务）。
+- `--workspace-cwd` 与 `--workspace-repo`/`--assets` **互斥**（usage 层拒绝）。
+
+**空仓库陷阱**：对没有提交的仓库 `git clone` **成功但什么都不带** → 静默得到空工作区。所以
+`materializeGit` 在 checkout 后跑 `rev-parse --verify HEAD`，失败就**拒绝落地**并说清是「没有提交」
+还是「ref 不存在」两类（后者不怪仓库）。探针 `hasCommit` 同样用 `rev-parse --verify HEAD`（带
+sanitized env）。
+
 ## 设计约定（改代码前先读）
 
 1. **报告是「数据库的函数」**：渲染层只读持久化状态（`report/model.go`+`load.go` 把行投影成视图
@@ -66,7 +151,14 @@ ground truth，判失败是造判决）。**墙钟 ≠ 忙碌时间**（实测 4
 10. **测量值不重试**：timeout/非零退出/error result 都是**数据**。`retries` 只管进程起不来，默认 0。
 11. agent 默认 **clean room**（无 user hooks / auto-memory / 任务外 MCP / CLAUDE.md）。
 12. **位置参数可写在 flag 之后**：Go 的 `flag` 遇第一个非 flag 就停，`report --compare a b -o x` 会
-    把 `-o x` 当位置参数并报「got 4」；`positionals()` 从那个词起重新解析。
+    把 `-o x` 当位置参数并报「got 4」；`positionals()` 从那个词起重新解析。**但重新解析必须在
+    `openStore` 之前做**：曾经 `cmdReport` 先 `openStore(&common)`、到 `--compare` 分支里才
+    `positionals()`，于是 `report --compare a b --db X` 的 `--db X` **来得太晚** —— store 已经开在默认
+    路径上，两个 run 都被报成「not found in **aeval.db**」（错误信息点名的文件正是线索）。
+    `--db` 写在 `--compare` 前面的形状一直是好的，而**本文件里所有既有 e2e 都是那个形状**，所以没人
+    发现。现在 `trailing, code := positionals(fs, stderr)` 在 `openStore` 之前调一次，分支复用结果。
+    护栏 `TestCLIComparesTwoRunsHoweverTheFlagsAreOrdered`（两种顺序渲染出的载荷必须逐字段相同；
+    真的找错库时错误必须点名**调用者传的那个路径**而不是 `aeval.db`）。
 13. **工具打印的命令必须能跑**：`Next:` 提示漏 `--db` 就会给出必然失败的命令；`printSummary` 只在
     `--db` 非默认时补它、**按用户输入原样回显**，`hintArg` 给带空格的值加引号。**找不到记录必须点
     名文件**：`store.NotFoundError{Kind,ID,Path}` 保持 `errors.Is(err, ErrNotFound)` 同时打印
@@ -79,6 +171,35 @@ ground truth，判失败是造判决）。**墙钟 ≠ 忙碌时间**（实测 4
     → `store.BaselineComparison.Output` → `report.BaselineView.Output`）；v1 库升上来读作空串，
     语义是**「录制里没留下答案」**（omitempty，客户端写一句话而不是空框）。e2e：
     `TestCLIReadsADatabaseFromBeforeTheRecordedAnswer`（由「删掉 v2 加的东西」构造，不抄 DDL）。
+    **v3 = `attempts.baseline_agent_name/agent_model/source/notes`**：录制方的身份与它自己声明的缺口。
+    四列而非一个 JSON blob（各自独立被读，blob 会把「空还是坏」的问题推给每个读者）。**为什么非要落库**：
+    基线是**输入**，live beside dataset，渲染期**不读数据集** —— 不落库就说不出一句「录制来自 cursor /
+    本次是 claude-code」，跨 agent 回放会被读成同口径比较。空 = **「没记录过来源」≠「录制没有 agent」**。
+    单测构造仍走「从今天的 schema 删掉新加的四列 + version=2」；**v1 夹具要连 v3 的四列一起删**，
+    只删 `baseline_output` 得到的是「v2 再删一列」，不是 v1。
+    **v4 = `runs.agent_spec_json`**（整份 `agent.Spec` 的 JSON）。落它的理由：四个标签列（agent_kind/
+    model/bin/backend）**识别不出「只差 skills」的 run**，而 skill 集恰恰是 `plugin_dirs` + 那两个决定
+    目录生死的 isolation flag。空 = **「没记录配置」**（v1–v3 的行），与「配置里什么都没声明」分开表述；
+    `runs.AgentSpec()` 返回 `(spec, ok)`，`ok=false` 时报告 `RunInfo.Skills = nil`（页面写 `not recorded`）。
+    升级路径 `upgradeV3ToV4` 就是一句 `ADD COLUMN ... DEFAULT ''`；store 夹具 drop 掉这一列再
+    `UPDATE schema_meta SET value='3'`；**v1 夹具要连带把 v4 这列也削掉**（否则是「v3 再降一版」）。
+    **v5 = `runs.chain_sessions`**（这次 run 有没有把同一会话的任务串成一条链）。**为什么非要落库**：
+    attempt 行上**没有任何一列**能事后推出「这些 cell 是一条续写而不是独立采样」—— 链上第二个 cell
+    读到第一个 cell 留下的文件，但行只记结果。空/false = **v1–v4 的普通 run**，语义正确不是缺口。
+    `upgradeV4ToV5` 同理一句 `ADD COLUMN ... DEFAULT 0`；夹具把三份 v1/v2/v3 都补 drop 这一列。
+
+## skill 到底有没有开（报告必须能证明）
+
+- **声明 ≠ 加载**：`Spec.SkillsActive()` = 有 `plugin_dirs` **且** `!Bare && !DisableSlashCommands`
+  （`EffectiveIsolation()`：nil isolation 回落 `DefaultIsolation()`，而默认是
+  `{Bare:true, StrictMCPConfig:true, DisableSlashCommands:true}` → **普通 run 什么都不加载**）。
+  所以「声明了一个目录、flags 没动」= inert，报告要写 `N plugin dir(s), not loaded (--bare …)`。
+- `loadedSkills()` 只返回**活下来**的目录：两个 run 的声明只差 inert 项 → 是同一份 agent 配置，
+  报成差异反而把唯一那个真差异淹掉。
+- `comparisonWarnings` 同理点名 skills：一侧知道、另一侧不知道（老行）→ 报
+  「run X recorded no agent configuration … so whether the two runs loaded the same skills is unknown」，
+  **且要点名是哪一侧**（"one of these runs" 会让读者猜，而会猜错的那个方向正是「沉默的那侧没加载」）。
+  这条把旧记忆里「不为此打常驻警告」的盲区**关掉了**——不是打常驻警告，是**有差异才点名**。
 
 ## token 记账（最容易错的地方）
 
@@ -126,18 +247,33 @@ DSL **已删**（`internal/metric` 不存在）。
    尝试是否得出同一结论。录制没留答案时写一句话，不留空框。
 
 护栏：`tests/render_test.go`，**唯一需要浏览器的测试**（找不到 skip，`AGENTEVAL_CHROME` 可覆盖）。
-探针注入 → 点每个 tab → 读回 DOM，断言字节数下限、无 `.bad`、无 `[object `、diff 有
-`<span class="dl `、baseline 卡两个 delta 含录制总量、两栏答案都在。三处变异验过会红。
+探针注入 → **读运行头部**（`.card.runhead` 的 `textContent`，`out.header`）→ 点每个 tab → 读回 DOM，
+断言字节数下限、无 `.bad`、无 `[object `、diff 有 `<span class="dl `、baseline 卡两个 delta 含录制
+总量、两栏答案都在。四处变异验过会红。
+
+**为什么头部也要读回来**：chip 是 JS 运行时画的，**在 HTML 里 grep 到那个字符串只证明源码被装进去了**，
+证明不了它被画出来 —— 这正是 `[object HTMLDivElement]` 当年潜伏的方式（文件/载荷/退出码全对、套件
+全绿）。`TestReportHeaderSaysTheCellsWereChained` 跑一份链式数据集再浏览器渲染，断言头部含
+`chained in order`：把 app.js 那个 `if (r.chain_sessions)` 改成 `if (false)` → 红（已验证）。
+chip 用 `raw()`，所以顺便守住「节点被插值」这一类错。
 
 ## 测试与运行
 
 - `go test ./...` 全过（13 包）。e2e 在 `tests/e2e_test.go`，用真实二进制/子进程/SQLite/HTML 驱动。
-  覆盖率 attrib 91.8% / report 86.6% / store 82.6%，**runner 只有 8.9%** —— 编排行为靠 e2e，这是
-  诚实的现状（编排器的正确层级就是 e2e）。
+  覆盖率 attrib 91.8% / report 89.0% / store 82.5% / session 79.7% / **runner 29.2%**（链式规划
+  `chain_test.go` 把它从 8.9% 抬上来的）—— 编排行为仍主要靠 e2e，这是诚实的现状（编排器的正确层级
+  就是 e2e）。
+- **链式的可观察性只在 e2e 成立**：`tests/testdata/agents/chain.sh`（读 stdin 的 prompt，`*WRITE*`
+  写 `handoff.txt` 并答 `wrote handoff.txt`，`*READ*` 答 `found: $(cat handoff.txt)` 或 `missing`）
+  —— 「agent 看见了上一步的文件」是单元测试看不见的事。不链式 → 第二格答 `missing` 判负，链式 →
+  `found: the-first-turn-wrote-this` 判通过。
 - e2e 的 payload 结构**刻意不复用** `report.Data`（否则字段改名测试会点头），也**刻意不声明
   `generated`**。解 payload 找**第一个 `;</script>`**（后面紧跟内联 app.js）。
-- **pytest grader 需要带 pytest 的解释器**：`AGENTEVAL_PYTHON`。本机 managed python 3.13.12
-  **没有 pytest**，可用 `~/.workbuddy/binaries/python/envs/default/bin/python`（pytest 8.4.1）。
+- **pytest grader 需要带 pytest 的解释器**：`AGENTEVAL_PYTHON`。managed python 3.13.12 与系统 python
+  **都没有 pytest**。**本机专用 venv：`~/.workbuddy/binaries/python/envs/aeval-pytest/bin/python`**
+  （pytest 9.1.1；早先记的 `envs/default` **已不含 pytest**，那个 env 装了 pillow/pymupdf/pyobjc，
+  是 WorkBuddy 自己的工具环境，别往上装）。跑法：`AGENTEVAL_PYTHON=…/aeval-pytest/bin/python go test ./...`
+  —— 带上之后 test 包从 ~8s 变 ~60s，说明 pytest grader 真的在判分。
   `runCLI` **只在探测到带 pytest 时才导出**它（导出空值 → 回落 python3 → 报「没有 pytest」被误读
   成 agent 挂了）。**推论：任何断言「demo 三题全对」的 e2e 必须 `requirePytest(t)`**
   （`TestCLIMatrixAttributesASweep` 曾漏，demo 2/3 靠 pytest 判分）。
@@ -146,10 +282,20 @@ DSL **已删**（`internal/metric` 不存在）。
 - **无头 Chrome 里 CSS 动画永不推进**（`document.timeline` 走但动画 `currentTime` 恒 0），
   `.drawer` 的 160ms 淡入永远停在 `opacity:.4`，看起来像「半透明抽屉」—— 环境假象，**截图复核前
   先注入 `.drawer{animation:none}`**。
+- **沙箱内 `go test ./...` 必然红两条**：`tests` 包的 `TestReportDrawer*` 报
+  `Google Chrome: signal: trace/BPT trap`。根因是沙箱拒绝 Chrome 清理自己的临时 profile
+  （`~/Library/Application Support/Google/Chrome-headless/scoped_dir*/…`、`code_sign_clone/…`）。
+  **沙箱外**（`go test ./tests -run TestReportDrawer -count=1`）→ `ok`。别去查代码。
 - `--dump-dom` 输出**含注入脚本自身**，探针结果要 base64 回传，匹配字面量要运行时拼
   （`'[' + 'object '`），否则命中探针源码。
 - **本机 grep 空结果先怀疑表达式**：BSD grep 不支持 `\|`，ERE 也不支持 `\s`/`\d`/`\b`（会**静默返回
   空**）。一律 `-E` 并避开这些转义。
+- **变异测试（验断言真的会红）要用「不破坏编译」的形状**。曾把 `return fold(a)==fold(b)` 改成
+  `return a == b`，`fold` 立刻成了未使用变量 → **build failed**，看起来「红了」其实是编译错，
+  等于什么都没验。正确做法是让 `fold` 变恒等（`func(s string) string { return s }`）。
+  同理：删 `AgentName: b.AgentName` 这种**字段赋值**是安全的变异，删**唯一使用点**会把变量变成未使用。
+- **e2e 的 SKIP 要当没跑**（缺 pytest / 缺浏览器都会 skip）。`go test ./...` 的 `ok` 不代表
+  这两类测试执行过；断言 e2e 覆盖时先看 `-v` 里的 `--- SKIP`。
 
 ## gitignore 约定
 
@@ -166,9 +312,28 @@ DSL **已删**（`internal/metric` 不存在）。
   接上并补 e2e，或删掉。`DockerConfig.Network` **没有默认值** → 空值 = 不传 = docker 默认（联网）。
 - **`sandbox.Baseline.RestorePaths` 写了但没人用**（无调用方/测试/字段）：它正是「判分前还原测试
   文件」的原语，**比「没有」更危险**（看起来做完了）。要完成是接线，不是重新实现。
-- **跑过的配置没落库**：`Attempt.CommandLine` 无消费方，`runs` 表只有 agent_kind/model/bin/backend，
-  `config_json` 只有 `matrix` 会写 → **报告无法证明「skill 是开着的」**。修法是接线不是重写。
+- ~~**跑过的配置没落库**~~ **已接线（schema v4）**：`runs.agent_spec_json` 存整份 `agent.Spec`
+  （runner 在 `withDefaults` 里把 nil isolation 填成 `DefaultIsolation()` 后 `json.Marshal(cfg.Agent)`
+  落库）→ 报告 run 头部的 `skills` chip 与 `comparisonWarnings` 的点名。**旧盲区已关**：只差
+  `plugin_dirs` 的两条 run 现在会被点名，而不是比成一样。`Attempt.CommandLine` **仍无消费方**（未变）。
 - `llm_judge` 不在 e2e 覆盖内（e2e 必须离线）。
+- **cursor 把「文件引用块」塞进 user bubble 的正文**：`--split turn` 于是把机器注入的上下文当成
+  「prompt」的一部分（会话 `1f2114cd` 的 p0 正文里就带着一块机器写的引用）。**已报给用户、未修**——
+  修法是识别并剥离这类注入块，但剥离规则一旦写错就会把真人写的内容也删掉，不该顺手做。
+- **链式只覆盖 `run`，`matrix` 还没有这条路**：`--chain-sessions` 是 `run` 的 flag，sweep 出来的
+  每个 level 仍按普通方式规划（每任务一个空沙箱）。要做的话是接线同一套 `plan`，不是重写。
+- **带 pytest 的解释器**：本机 `~/.workbuddy/binaries/python/envs/aeval-pytest/bin/python`（pytest 9.1.1）
+  **有**；`.../envs/default/bin/python` **没有**。全量套件用
+  `AGENTEVAL_PYTHON=$HOME/.workbuddy/binaries/python/envs/aeval-pytest/bin/python go test ./...`。
+  这个 env 会被 WorkBuddy 复用/清理，**缺了症状是 e2e 静默 SKIP 而不是 FAIL——别把 SKIP 当通过**。
+- ~~`dataset.Baseline.Notes` 从不落库~~ **已接线（schema v3）**：`compareToBaseline` 带走
+  `AgentName/AgentModel/Source/Notes` → `store.BaselineComparison` 四列 → `report.BaselineView` →
+  app.js 的 `recordedBy()`/`crossAgentNote()`（录制自己的注记**替换**那行硬编码，不是并排——一卡两行
+  caveat = 两行都不被读）。`report --compare` 也补了 `comparisonWarnings`：比 AgentKind/Model/Bin/
+  Backend/DatasetHash，一处差异＝点名它是唯一变量，多处＝明说「没有哪个 delta 能归给单个因素」。
+  **零差异时不打任何话**（沉默会被读成「两边测的是同一件事」，但常驻警告更糟）。
+  **注意 `sameAgent` 要折叠命名**：capture 写 `claude-code`、runner 注册 `claude_code`，字面比会把
+  每一次「采集的 Claude Code 基线被自己回放」都标成跨 agent。空值＝「没记录」不算「不同」。
 
 ## 真实仓库评测
 

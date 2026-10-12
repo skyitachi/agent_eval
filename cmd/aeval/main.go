@@ -38,6 +38,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -106,7 +107,7 @@ func usage(w io.Writer) {
 
 usage: aeval <command> [flags]
 
-  collect   turn recorded Claude Code sessions into a dataset with baselines
+  collect   turn recorded agent sessions into a dataset with baselines
   validate  check a dataset without running anything
   run       run a dataset against one agent
   matrix    sweep one axis, or attribute a sweep that already ran
@@ -319,14 +320,185 @@ func (a agentFlags) spec() agent.Spec {
 	return spec
 }
 
+// warnUnboundReplays names the directories the collected tasks were recorded in
+// but will not replay in.
+//
+// A collected task starts from an empty workspace unless the caller bound one,
+// and that default is deliberate: a transcript records the branch a session ran
+// on and not the commit it started from, so the tree cannot be reconstructed
+// from the capture and inventing one would be a guess. What is not acceptable is
+// the silence -- the recording had a working directory, the replay has none, and
+// every task in that state goes on to be compared against a recording made
+// somewhere else.
+//
+// Each such baseline already carries the fact, so a report states it per task.
+// This is the same fact moved to the one moment it can still be acted on, where
+// the fix is a flag rather than a re-read.
+// warnDroppedPrompts reports sessions whose prompts did not all become tasks.
+//
+// Under --split session that is every session the human kept asking in: the task
+// is the opening request and the prompts after it are not collected at all.
+// Under --split turn it is the prompts --min-prompt-runes dropped as too short.
+// Both are quiet by construction -- nothing in the tasks says how many prompts
+// the recording held -- and the reading that must not survive is that the
+// dataset covers the whole session.
+//
+// The count is taken over everything this collection produced rather than over
+// what an append actually wrote. A task skipped as already collected is still
+// in the dataset, so counting only the appended ones would report the same
+// session as partly collected on every re-run.
+func warnDroppedPrompts(w io.Writer, items []session.Item, split session.Split) {
+	type tally struct {
+		id          string
+		total, kept int
+	}
+	bySession := map[string]*tally{}
+	var order []string
+	for _, it := range items {
+		id, _ := it.Task.Metadata["session_id"].(string)
+		if id == "" {
+			continue
+		}
+		t := bySession[id]
+		if t == nil {
+			t = &tally{id: id, total: metaInt(it.Task.Metadata["session_prompts"])}
+			bySession[id] = t
+			order = append(order, id)
+		}
+		t.kept++
+	}
+
+	var short []string
+	for _, id := range order {
+		t := bySession[id]
+		if t.total > t.kept {
+			short = append(short, fmt.Sprintf("%s (%d of %d)", shortID(t.id), t.kept, t.total))
+		}
+	}
+	if len(short) == 0 {
+		return
+	}
+	sort.Strings(short)
+	advice := "Re-run with --split turn to collect each prompt as its own task"
+	if split == session.SplitTurn {
+		advice = "Lower --min-prompt-runes so the dropped prompts are collected too"
+	}
+	fmt.Fprintf(w, "warning: %d session(s) hold more prompts than this dataset collected: %s.\n"+
+		"         %s.\n", len(short), strings.Join(short, ", "), advice)
+}
+
+// metaInt reads a count out of a task's metadata block, which is JSON-decoded
+// on the way in and an int in memory.
+func metaInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
+}
+
+func shortID(id string) string {
+	if len(id) > 8 {
+		return id[:8]
+	}
+	return id
+}
+
+func warnUnboundReplays(w io.Writer, items []session.Item) {
+	var dirs []string
+	n := 0
+	for _, it := range items {
+		if it.Task.Workspace.Type != dataset.WorkspaceEmpty {
+			continue
+		}
+		cwd, _ := it.Task.Metadata["cwd"].(string)
+		if cwd == "" {
+			continue
+		}
+		n++
+		if !slices.Contains(dirs, cwd) {
+			dirs = append(dirs, cwd)
+		}
+	}
+	if n == 0 {
+		return
+	}
+	sort.Strings(dirs)
+	shown, more := dirs, ""
+	if len(shown) > 2 {
+		more = fmt.Sprintf(" (and %d more)", len(shown)-2)
+		shown = shown[:2]
+	}
+	fmt.Fprintf(w, "warning: %d task(s) replay in an empty workspace, but their recordings ran in %s%s.\n"+
+		"         A transcript does not carry the files a session worked on, so those replays start\n"+
+		"         without them. Re-collect with --workspace-cwd to put each recording's directory back,\n"+
+		"         or pass --workspace-repo <repo> --ref <commit> to bind one repository to all of them.\n",
+		n, strings.Join(shown, ", "), more)
+}
+
+// warnUnresolvableCommands reports tasks whose prompt opens with a slash command
+// while the harness has hidden the user's skills.
+//
+// A prompt recorded on one agent carries that agent's invocation syntax, so a
+// task that needs a command can only be replayed by an agent that exposes it.
+// The clean-room defaults hide exactly those: --disable-slash-commands leaves the
+// CLI advertising no commands at all, and --bare on its own drops the user's
+// skills while keeping the built-ins. Either way the CLI answers "Unknown
+// command" locally, without calling the model, and the cell measures nothing.
+//
+// The run does catch that -- it is a harness error, not a measurement -- but only
+// after the attempt has been paid for, and for a replayed session that attempt is
+// the whole cost. This is the same warning moved to the only moment it can still
+// change anything.
+//
+// The wording claims only what the flags guarantee. Where --bare is on but
+// --disable-slash-commands is not, a built-in command would still resolve, so the
+// warning names the flags rather than asserting the command is unusable.
+func warnUnresolvableCommands(w io.Writer, ds *dataset.Dataset, spec agent.Spec) {
+	iso := spec.EffectiveIsolation()
+	if !iso.Bare && !iso.DisableSlashCommands {
+		return
+	}
+	tasks := 0
+	var names []string
+	for _, t := range ds.Tasks {
+		cmd, ok := agent.LeadingSlashCommand(t.ResolvedPrompt)
+		if !ok {
+			continue
+		}
+		tasks++
+		if !slices.Contains(names, cmd) {
+			names = append(names, cmd)
+		}
+	}
+	if tasks == 0 {
+		return
+	}
+	sort.Strings(names)
+	if len(names) > 3 {
+		names = append(names[:3:3], "...")
+	}
+	fmt.Fprintf(w, "warning: %d task(s) open with a slash command (%s), but this run does not load the user's\n"+
+		"         skills (bare=%t, disable-slash-commands=%t): a recorded command cannot resolve, and the\n"+
+		"         cell will measure nothing. Re-run with --bare=false --disable-slash-commands=false to load them.\n",
+		tasks, "/"+strings.Join(names, ", /"), iso.Bare, iso.DisableSlashCommands)
+}
+
 // summarizeAgent renders the harness configuration the way it will be recorded,
 // so a reader of the run list can tell two harnesses apart without opening a
 // report.
+//
+// skills is about the user's own skills, and both --bare and
+// --disable-slash-commands remove them, so reading it off one flag reports a
+// clean-room run as having them. Declaring plugin directories is reported
+// separately from that: a directory that the flags make inert is still a
+// declared one, and the count alone would read as "loaded".
 func summarizeAgent(s agent.Spec) string {
-	iso := agent.DefaultIsolation()
-	if s.Isolation != nil {
-		iso = *s.Isolation
-	}
+	iso := s.EffectiveIsolation()
 	var parts []string
 	parts = append(parts, "kind="+orDefault(s.Kind, "claude_code"))
 	if s.Bin != "" {
@@ -336,9 +508,13 @@ func summarizeAgent(s agent.Spec) string {
 		parts = append(parts, "model="+s.Model)
 	}
 	parts = append(parts, fmt.Sprintf("bare=%t", iso.Bare))
-	parts = append(parts, fmt.Sprintf("skills=%s", onOff(!iso.DisableSlashCommands)))
-	if len(s.PluginDirs) > 0 {
-		parts = append(parts, fmt.Sprintf("plugin_dirs=%d", len(s.PluginDirs)))
+	parts = append(parts, "skills="+onOff(!iso.Bare && !iso.DisableSlashCommands))
+	if n := len(s.PluginDirs); n > 0 {
+		state := "loaded"
+		if !s.SkillsActive() {
+			state = "inert"
+		}
+		parts = append(parts, fmt.Sprintf("plugin_dirs=%d (%s)", n, state))
 	}
 	if s.AppendSystemPrompt != "" {
 		parts = append(parts, "system_prompt=appended")
@@ -367,6 +543,10 @@ func orDefault(v, fallback string) string {
 func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
 	var (
+		source   = fs.String("source", "claude", "whose history to read: claude (Claude Code transcripts) or cursor")
+		cursorDB = fs.String("cursor-db", "", "Cursor state database (default: Cursor's own location for this platform)")
+		list     = fs.Bool("list", false, "list the recorded sessions and exit; needs no --out")
+
 		root     = fs.String("root", "", "directory holding Claude Code transcripts (default ~/.claude/projects)")
 		selector = fs.String("session", "", "a .jsonl path, a session id prefix, or the working directory to search")
 		cwd      = fs.String("cwd", "", "collect every session recorded for this working directory")
@@ -385,23 +565,47 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		wsRef    = fs.String("ref", "", "commit or ref to check out")
 		wsSubdir = fs.String("subdir", "", "subdirectory of the repository to work in")
 		wsAssets = fs.String("assets", "", "directory of files to copy into every workspace")
-		outputT  = fs.String("output-type", "", "deliverable contract: patch, files, stdout or none")
+		wsCwd    = fs.Bool("workspace-cwd", false,
+			"bind every task to the directory its own recording ran in, instead of one directory named up front")
+		outputT = fs.String("output-type", "", "deliverable contract: patch, files, stdout or none")
 
-		timeoutS = fs.Int("timeout", 0, "per-task budget in seconds; 0 derives it from the baseline")
-		maxTurns = fs.Int("max-turns", 0, "per-task turn budget; 0 derives it from the baseline")
-		idPrefix = fs.String("id-prefix", "", "prefix for generated task ids")
-		category = fs.String("category", "", "category applied to every task")
-		tags     = stringList{}
-		asJSON   = fs.Bool("json", false, "print the summary as JSON")
-		dryRun   = fs.Bool("dry-run", false, "parse the sessions and report what would be written, without writing")
+		timeoutS  = fs.Int("timeout", 0, "per-task budget in seconds; 0 derives it from the baseline")
+		maxTurns  = fs.Int("max-turns", 0, "per-task turn budget; 0 derives it from the baseline")
+		idPrefix  = fs.String("id-prefix", "", "prefix for generated task ids")
+		category  = fs.String("category", "", "category applied to every task")
+		tags      = stringList{}
+		asJSON    = fs.Bool("json", false, "print the summary as JSON")
+		dryRun    = fs.Bool("dry-run", false, "parse the sessions and report what would be written, without writing")
+		overwrite = fs.Bool("overwrite", false, "replace the dataset in --out instead of appending to it")
 	)
 	fs.Var(&tags, "tag", "tag applied to every task (repeatable)")
 	if ok, code := parse(fs, args, stderr); !ok {
 		return code
 	}
 
+	srcKind := strings.ToLower(strings.TrimSpace(*source))
+	switch srcKind {
+	case "claude", "cursor":
+	default:
+		return usageFail(stderr, "collect: --source must be \"claude\" or \"cursor\", got %q", *source)
+	}
+	if srcKind == "claude" && *cursorDB != "" {
+		return usageFail(stderr, "collect: --cursor-db only means something with --source cursor")
+	}
+	if srcKind == "cursor" && *root != "" {
+		return usageFail(stderr, "collect: --root only means something with --source claude")
+	}
+
+	if *list {
+		return cmdCollectList(srcKind, *cursorDB, *root, stdout, stderr)
+	}
+
 	if *out == "" && !*dryRun {
 		return usageFail(stderr, "collect: --out is required (or --dry-run to look without writing)")
+	}
+	if *wsCwd && (*wsRepo != "" || *wsAssets != "") {
+		return usageFail(stderr, "collect: --workspace-cwd binds each task to its own recording's directory, "+
+			"so it cannot be combined with --workspace-repo or --assets, which bind one directory to all of them")
 	}
 	splitMode := session.Split(*split)
 	if splitMode != session.SplitSession && splitMode != session.SplitTurn {
@@ -416,18 +620,30 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	sources, code := collectSources(*root, *selector, *cwd, *latest, stderr)
-	if code != exitOK {
-		return code
-	}
-
-	var sessions []*session.Session
-	for _, src := range sources {
-		s, err := session.ParseFile(src.Path)
-		if err != nil {
-			return fail(stderr, "collect: parse %s: %v", src.Path, err)
+	var (
+		sessions []*session.Session
+		names    []string
+	)
+	switch srcKind {
+	case "cursor":
+		var code int
+		sessions, names, code = collectCursorSessions(*cursorDB, *selector, *cwd, *latest, stderr)
+		if code != exitOK {
+			return code
 		}
-		sessions = append(sessions, s)
+	default:
+		sources, code := collectSources(*root, *selector, *cwd, *latest, stderr)
+		if code != exitOK {
+			return code
+		}
+		for _, src := range sources {
+			s, err := session.ParseFile(src.Path)
+			if err != nil {
+				return fail(stderr, "collect: parse %s: %v", src.Path, err)
+			}
+			sessions = append(sessions, s)
+			names = append(names, src.SessionID)
+		}
 	}
 
 	opts := session.Options{
@@ -439,6 +655,7 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		WorkspaceRef:    *wsRef,
 		WorkspaceSubdir: *wsSubdir,
 		WorkspaceAssets: absFlagPath(*wsAssets),
+		WorkspaceCwd:    *wsCwd,
 		OutputType:      dataset.OutputType(*outputT),
 		TimeoutS:        *timeoutS,
 		MaxTurns:        *maxTurns,
@@ -452,31 +669,107 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, "collect: %v", err)
 	}
 
+	// An existing dataset in --out is appended to unless --overwrite says to
+	// replace it. Re-collecting a working directory after a few more sessions
+	// is the common case, and replacing would drop every task collected before.
+	dir := ""
+	if *out != "" {
+		dir = absFlagPath(*out)
+	}
+	var plan session.AppendResult
+	if *overwrite || dir == "" {
+		plan = session.AppendResult{Fresh: true, Added: items}
+	} else {
+		plan, err = session.PlanAppend(dir, items)
+		if err != nil {
+			return fail(stderr, "collect: %v", err)
+		}
+	}
+
 	if *dryRun {
-		fmt.Fprintf(stdout, "would write %d task(s) from %d session(s)\n\n%s\n",
-			len(items), len(sources), session.Summarize(items))
+		if plan.Fresh {
+			fmt.Fprintf(stdout, "would write %d task(s) from %d session(s)\n\n%s\n",
+				len(items), len(sessions), session.Summarize(items))
+		} else {
+			fmt.Fprintf(stdout, "would append %d task(s) to %s from %d session(s)%s\n",
+				len(plan.Added), dir, len(sessions), appendDetail(plan))
+			if len(plan.Added) > 0 {
+				fmt.Fprintf(stdout, "\n%s\n", session.Summarize(plan.Added))
+			}
+		}
+		warnDroppedPrompts(stderr, items, splitMode)
 		return exitOK
 	}
 
-	dir := absFlagPath(*out)
 	dsName := *name
 	if dsName == "" {
 		dsName = filepath.Base(dir)
 	}
-	if err := session.WriteDataset(dir, dsName, *desc, items); err != nil {
-		return fail(stderr, "collect: write dataset: %v", err)
+	if plan.Fresh {
+		if err := session.WriteDataset(dir, dsName, *desc, items); err != nil {
+			return fail(stderr, "collect: write dataset: %v", err)
+		}
+	} else {
+		// --name and --description describe a new manifest. The one in --out
+		// is kept as it is, because it may have been edited since it was made.
+		if *name != "" || *desc != "" {
+			fmt.Fprintln(stderr, "collect: --name and --description are ignored when appending; the existing manifest is kept")
+		}
+		if plan, err = session.AppendDataset(dir, dsName, *desc, items); err != nil {
+			return fail(stderr, "collect: append to dataset: %v", err)
+		}
 	}
 
 	if *asJSON {
 		out := map[string]any{
-			"dir": dir, "name": dsName, "tasks": len(items),
-			"sources": sourceNames(sources),
+			"dir": dir, "name": dsName, "tasks": len(plan.Added),
+			"sources": names, "appended": !plan.Fresh,
+			"skipped": orEmpty(plan.Skipped), "renamed": plan.Renamed,
 		}
 		return emitJSON(stdout, stderr, out)
 	}
-	fmt.Fprintf(stdout, "wrote %d task(s) to %s\n\n%s\n", len(items), dir, session.Summarize(items))
+	if plan.Fresh {
+		fmt.Fprintf(stdout, "wrote %d task(s) to %s\n\n%s\n", len(items), dir, session.Summarize(items))
+	} else {
+		fmt.Fprintf(stdout, "appended %d task(s) to %s%s\n", len(plan.Added), dir, appendDetail(plan))
+		if len(plan.Added) > 0 {
+			fmt.Fprintf(stdout, "\n%s\n", session.Summarize(plan.Added))
+		}
+	}
+	warnDroppedPrompts(stderr, items, splitMode)
+	if !*wsCwd {
+		warnUnboundReplays(stderr, plan.Added)
+	} else {
+		fmt.Fprintln(stderr, "note: --workspace-cwd reproduces each recording's directory as it stands "+
+			"now, which is after that recording finished; any fix the recorded session made is already in it")
+	}
 	fmt.Fprintf(stdout, "\nNext: aeval validate --dataset %s\n", filepath.Join(dir, "dataset.yaml"))
 	return exitOK
+}
+
+// appendDetail says what an append left out and what it renamed, so that
+// "appended 0 task(s)" reads as "already there" rather than as a failure.
+func appendDetail(plan session.AppendResult) string {
+	var b strings.Builder
+	if n := len(plan.Skipped); n > 0 {
+		fmt.Fprintf(&b, "\nskipped %d already collected: %s", n, strings.Join(plan.Skipped, ", "))
+	}
+	if len(plan.Renamed) > 0 {
+		var pairs []string
+		for from, to := range plan.Renamed {
+			pairs = append(pairs, from+" -> "+to)
+		}
+		sort.Strings(pairs)
+		fmt.Fprintf(&b, "\nrenamed %d whose id was taken: %s", len(pairs), strings.Join(pairs, ", "))
+	}
+	return b.String()
+}
+
+func orEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }
 
 func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) ([]session.Source, int) {
@@ -522,12 +815,189 @@ func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) (
 	}
 }
 
-func sourceNames(srcs []session.Source) []string {
-	out := make([]string, 0, len(srcs))
-	for _, s := range srcs {
-		out = append(out, s.SessionID)
+// collectCursorSessions reads the conversations the flags name out of Cursor's
+// state database.
+//
+// It returns the ids alongside the sessions because the caller prints them, and
+// re-deriving them from a parsed session would be a second, subtly different
+// answer to the same question.
+func collectCursorSessions(dbPath, selector, cwd string, latest bool, stderr io.Writer) ([]*session.Session, []string, int) {
+	if strings.TrimSpace(dbPath) == "" {
+		dbPath = session.CursorDefaultDB()
 	}
-	return out
+	if strings.TrimSpace(dbPath) == "" {
+		fail(stderr, "collect: cannot locate the Cursor database on this platform; pass --cursor-db")
+		return nil, nil, exitUsage
+	}
+	dbPath = absFlagPath(dbPath)
+
+	var ids []string
+	switch {
+	case selector != "":
+		ch, err := session.ResolveCursor(dbPath, selector)
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, nil, exitError
+		}
+		ids = append(ids, ch.ID)
+	case cwd != "":
+		chats, err := session.CursorChatsForCwd(dbPath, absFlagPath(cwd))
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, nil, exitError
+		}
+		if len(chats) == 0 {
+			fail(stderr, "collect: no cursor conversations recorded for %s", cwd)
+			return nil, nil, exitError
+		}
+		for _, ch := range chats {
+			ids = append(ids, ch.ID)
+		}
+	case latest:
+		ch, err := session.LatestCursorChat(dbPath)
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, nil, exitError
+		}
+		ids = append(ids, ch.ID)
+	default:
+		fail(stderr,
+			"collect: name what to collect: --session <id>, --cwd <dir>, or --latest\n"+
+				"       cursor conversations are read from %s\n"+
+				"       --list shows what is in there", dbPath)
+		return nil, nil, exitUsage
+	}
+
+	sessions, err := session.ParseCursorChats(dbPath, ids)
+	if err != nil {
+		fail(stderr, "collect: %v", err)
+		return nil, nil, exitError
+	}
+
+	// Collect refuses a session with no human prompt, and it is right to: a
+	// capture with no request in it is not a task. A Cursor history is full of
+	// them -- drafts, aborted chats, sessions whose only message was attached
+	// context -- and letting them through would abort a whole collection on the
+	// first one. So they are dropped here, with a count.
+	kept := make([]*session.Session, 0, len(sessions))
+	keptIDs := make([]string, 0, len(ids))
+	var dropped int
+	for i, s := range sessions {
+		if len(s.Prompts) == 0 {
+			dropped++
+			continue
+		}
+		kept = append(kept, s)
+		keptIDs = append(keptIDs, ids[i])
+	}
+	if dropped > 0 {
+		fmt.Fprintf(stderr, "collect: skipped %d conversation(s) with no human prompt\n", dropped)
+	}
+	if len(kept) == 0 {
+		fail(stderr, "collect: none of the %d selected conversation(s) contains a human prompt", len(sessions))
+		return nil, nil, exitError
+	}
+	return kept, keptIDs, exitOK
+}
+
+// cmdCollectList prints what is available to collect, without collecting it.
+//
+// It exists because naming a session is otherwise guesswork: a Cursor
+// conversation is a uuid in a database, and a Claude Code transcript is a uuid
+// in a directory whose name is lossy.
+func cmdCollectList(srcKind, cursorDB, root string, stdout, stderr io.Writer) int {
+	switch srcKind {
+	case "cursor":
+		dbPath := cursorDB
+		if strings.TrimSpace(dbPath) == "" {
+			dbPath = session.CursorDefaultDB()
+		}
+		if strings.TrimSpace(dbPath) == "" {
+			return usageFail(stderr, "collect: cannot locate the Cursor database on this platform; pass --cursor-db")
+		}
+		dbPath = absFlagPath(dbPath)
+
+		chats, err := session.CursorChats(dbPath)
+		if err != nil {
+			return fail(stderr, "collect: %v", err)
+		}
+		fmt.Fprintf(stdout, "%d cursor conversation(s) in %s\n\n", len(chats), dbPath)
+		if len(chats) == 0 {
+			return exitOK
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "id\ttouched\tmode\tmsgs\tprompts\tname")
+		for _, ch := range chats {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%s\n",
+				ch.ID, shortWhen(ch.UpdatedAt), orDefault(ch.Mode, "-"),
+				ch.Bubbles, ch.Prompts, oneLine(ch.Name, 48))
+		}
+		tw.Flush()
+		fmt.Fprintf(stdout, "\ncollect one with: aeval collect --source cursor --session <id prefix> --out <dir>\n")
+		return exitOK
+
+	default:
+		if root == "" {
+			root = session.DefaultRoot()
+		}
+		sources, err := session.Sources(root)
+		if err != nil {
+			return fail(stderr, "collect: %v", err)
+		}
+		fmt.Fprintf(stdout, "%d claude code transcript(s) in %s\n\n", len(sources), root)
+		if len(sources) == 0 {
+			return exitOK
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "session\tmodified\tsize\tproject")
+		for _, src := range sources {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n",
+				src.SessionID, shortWhen(src.ModTime), humanBytes(src.Size), filepath.Base(src.ProjectDir))
+		}
+		tw.Flush()
+		fmt.Fprintf(stdout, "\ncollect one with: aeval collect --session <id prefix> --out <dir>\n")
+		return exitOK
+	}
+}
+
+// shortWhen renders a timestamp for a listing.
+//
+// The date and the time are joined with "T" rather than a space so that a row
+// is one token per column: these listings are read by people, but they are read
+// with `awk` and `cut` too, and a space inside a column value silently shifts
+// every field to its right.
+func shortWhen(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Local().Format("2006-01-02T15:04")
+}
+
+// oneLine flattens a title for a listing. A name carrying a newline would
+// otherwise break the column it is printed into.
+func oneLine(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if max < 2 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max-1]) + "…"
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // ---------------------------------------------------------------------------
@@ -598,13 +1068,15 @@ func issueStrings(issues []dataset.ValidationIssue) []string {
 func cmdRun(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var (
-		common   commonFlags
-		agents   agentFlags
-		dsPath   = fs.String("dataset", "", "dataset manifest to run (required)")
-		name     = fs.String("name", "", "run name (default: the dataset's name)")
-		notes    = fs.String("notes", "", "free-form note recorded on the run")
-		samples  = fs.Int("samples", 1, "how many times to run each task (pass@k)")
-		conc     = fs.Int("concurrency", 1, "cells to keep in flight")
+		common  commonFlags
+		agents  agentFlags
+		dsPath  = fs.String("dataset", "", "dataset manifest to run (required)")
+		name    = fs.String("name", "", "run name (default: the dataset's name)")
+		notes   = fs.String("notes", "", "free-form note recorded on the run")
+		samples = fs.Int("samples", 1, "how many times to run each task (pass@k)")
+		conc    = fs.Int("concurrency", 1, "cells to keep in flight")
+		chain   = fs.Bool("chain-sessions", false,
+			"give each recorded session's tasks one shared workspace and run them in order")
 		timeout  = fs.Duration("timeout", 10*time.Minute, "per-task budget when the task declares none")
 		turns    = fs.Int("max-turns", 0, "per-task turn budget when the task declares none")
 		thresh   = fs.Float64("threshold", runner.DefaultThreshold, "composite score a task must reach to pass")
@@ -655,13 +1127,27 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		ToolVersion:    version,
 		FailFast:       *failFast,
 		Resume:         *resume,
+		ChainSessions:  *chain,
+	}
+	// Asking the configuration rather than restating its rules: a flag mistake
+	// is a usage error, which is a different exit code from a run that started
+	// and failed.
+	if err := cfg.Validate(); err != nil {
+		return usageFail(stderr, "run: %v", err)
 	}
 	if !*quiet && !*asJSON {
 		cfg.Progress = progressLogger(stdout)
 	}
 
+	warnUnresolvableCommands(stderr, ds, cfg.Agent)
+
 	fmt.Fprintf(stdout, "running %d task(s) × %d sample(s) from %s\n", len(ds.Tasks), cfg.Samples, ds.Dir)
 	fmt.Fprintf(stdout, "harness %s\n\n", summarizeAgent(cfg.Agent))
+	if cfg.ChainSessions {
+		fmt.Fprintln(stdout, "chained: each session's tasks share one workspace and run in order, "+
+			"so the cells of a chain are a sequence rather than independent samples")
+		fmt.Fprintln(stdout)
+	}
 
 	res, err := runner.Run(ctx, ds, cfg)
 	if err != nil {
@@ -1131,6 +1617,17 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		return code
 	}
 
+	// Recover the flags written after a positional argument *before* opening the
+	// store, not inside the branch that uses them. Go's flag package stops at
+	// the first non-flag word, so the natural spelling
+	// `report --compare a b --db my.db` leaves --db unparsed; recovering it
+	// after openStore would set it too late, and the store would already be open
+	// at the default path -- every run then reported as missing from aeval.db.
+	trailing, code := positionals(fs, stderr)
+	if code != exitOK {
+		return code
+	}
+
 	ctx := context.Background()
 	st, err := openStore(&common)
 	if err != nil {
@@ -1182,10 +1679,7 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		return exitOK
 
 	case *cmp:
-		ids, code := positionals(fs, stderr)
-		if code != exitOK {
-			return code
-		}
+		ids := trailing
 		if len(ids) != 2 {
 			return usageFail(stderr, "report: --compare needs exactly two run ids, got %d", len(ids))
 		}
@@ -1202,14 +1696,8 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 	}
 
 	id := *runID
-	if id == "" {
-		rest, code := positionals(fs, stderr)
-		if code != exitOK {
-			return code
-		}
-		if len(rest) == 1 {
-			id = rest[0]
-		}
+	if id == "" && len(trailing) == 1 {
+		id = trailing[0]
 	}
 	if id == "" {
 		return usageFail(stderr, "report: give --run <id>, --compare <a> <b>, --sweep <id> or --index")

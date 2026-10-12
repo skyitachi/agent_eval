@@ -73,6 +73,21 @@ type Config struct {
 	// Concurrency is the number of cells in flight. Default 1.
 	Concurrency int
 
+	// ChainSessions gives every task collected from one recording one shared
+	// workspace and runs them in the order they were asked.
+	//
+	// A turn-split collection makes each prompt its own task, and the later
+	// prompts refer to what the earlier ones produced -- so replaying them in
+	// separate, freshly materialised workspaces asks the agent to answer a
+	// follow-up about files that were never there. This is the flag that puts
+	// the sequence back together.
+	//
+	// It is off by default because it changes what the cells mean: a chained
+	// cell starts from its predecessor's state, so the cells of one chain are a
+	// sequence rather than independent samples, and the run row records that so
+	// the report can say it.
+	ChainSessions bool
+
 	// WorkRoot is where per-cell workspaces are created. Default: a
 	// "workspaces" directory beside the database.
 	WorkRoot string
@@ -192,6 +207,9 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 		return nil, errors.New("runner: the dataset has no tasks")
 	}
 	cfg = withDefaults(cfg)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 
 	drive, err := agent.New(cfg.Agent.Kind)
 	if err != nil {
@@ -212,12 +230,26 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 		Backend:     backendLocal,
 		Samples:     cfg.Samples,
 		Concurrency: cfg.Concurrency,
-		FactorAxis:  cfg.FactorAxis,
-		FactorLevel: cfg.FactorLevel,
-		SweepID:     cfg.SweepID,
-		Notes:       cfg.Notes,
-		ToolVersion: cfg.ToolVersion,
-		ConfigJSON:  cfg.ConfigJSON,
+		// Recorded because it changes how the cells below read: a chained cell
+		// starts from what its predecessor left, so a page that shows them as
+		// independent samples is describing a sequence as a set.
+		ChainSessions: cfg.ChainSessions,
+		FactorAxis:    cfg.FactorAxis,
+		FactorLevel:   cfg.FactorLevel,
+		SweepID:       cfg.SweepID,
+		Notes:         cfg.Notes,
+		ToolVersion:   cfg.ToolVersion,
+		ConfigJSON:    cfg.ConfigJSON,
+	}
+	// The whole configuration, not just the labels above. The skill set is
+	// plugin_dirs plus the isolation flags that decide whether it survives, and
+	// a comparison keyed on the labels alone cannot see it.
+	//
+	// The run-level spec is the right one to record even though each cell gets
+	// a derived copy: specFor only fills in the per-task budget and prompt, so
+	// every cell of a run drives the same agent configuration.
+	if raw, err := json.Marshal(cfg.Agent); err == nil {
+		run.AgentSpecJSON = string(raw)
 	}
 	if run.Name == "" {
 		run.Name = ds.Manifest.Name
@@ -226,16 +258,23 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 		return nil, err
 	}
 
-	cells, err := plan(ds, cfg)
+	planned, err := plan(ds, cfg)
 	if err != nil {
 		_ = cfg.Store.FinishRun(context.WithoutCancel(ctx), run.ID, store.RunFailed, err.Error())
 		return nil, err
 	}
+	cells := planned
 	if cfg.Resume {
 		cells, err = dropDone(ctx, cfg.Store, run.ID, cells)
 		if err != nil {
 			_ = cfg.Store.FinishRun(context.WithoutCancel(ctx), run.ID, store.RunFailed, err.Error())
 			return nil, err
+		}
+		if cfg.ChainSessions {
+			if err := chainsIntact(planned, cells); err != nil {
+				_ = cfg.Store.FinishRun(context.WithoutCancel(ctx), run.ID, store.RunFailed, err.Error())
+				return nil, err
+			}
 		}
 	}
 
@@ -315,6 +354,23 @@ func Summarize(attempts []store.Attempt, tasks int) Summary {
 	return s
 }
 
+// Validate reports a configuration that would measure something other than what
+// it says.
+//
+// Run calls it, and so does the command line -- not to save the call, but so
+// that a flag mistake is reported as a usage error rather than as a run that
+// started and failed. The check lives here because the invariant is this
+// package's: chained cells share a directory, and two of them in flight at once
+// would write over each other with no way for the row to say so.
+func (c Config) Validate() error {
+	if c.ChainSessions && c.Concurrency > 1 {
+		return fmt.Errorf("chaining a session's tasks gives them one workspace and runs them in order, "+
+			"so it cannot keep %d cells in flight at once", c.Concurrency)
+	}
+	return nil
+}
+
+// withDefaults fills in what a Config may leave out.
 func withDefaults(cfg Config) Config {
 	if cfg.Agent.Kind == "" {
 		cfg.Agent.Kind = "claude_code"
@@ -337,6 +393,16 @@ func withDefaults(cfg Config) Config {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Minute
 	}
+	// Resolve the isolation pointer here so that every copy of the spec -- the
+	// one the cells drive and the one written to the database -- says what it
+	// means. A nil Isolation already means the clean-room preset everywhere it
+	// is acted on; leaving it nil in the recorded copy would move that
+	// derivation into every reader, and a reader that skips it reports a
+	// clean-room run as one that accepted the host's configuration.
+	if cfg.Agent.Isolation == nil {
+		iso := agent.DefaultIsolation()
+		cfg.Agent.Isolation = &iso
+	}
 	if cfg.WorkRoot == "" {
 		dir := "."
 		if cfg.Store != nil && cfg.Store.Path() != "" && cfg.Store.Path() != ":memory:" {
@@ -355,6 +421,53 @@ type cell struct {
 	task   dataset.TaskSpec
 	sample int
 	dir    string
+	// chain names the sequence this cell belongs to: one session at one
+	// sample, or a lone task's own name when it belongs to no session.
+	chain string
+	// first and last mark the ends of a chain. Only the first materialises the
+	// workspace and only the last removes it, and that is the whole mechanism:
+	// a chained cell starts from what its predecessor left because nobody put
+	// the directory back in between.
+	first bool
+	last  bool
+}
+
+// chainKey names the sequence a cell belongs to.
+//
+// With --chain-sessions on, everything collected from one session is one
+// sequence, so its tasks share a workspace and run in the order they were
+// asked. A task that names no session -- a hand-written one, or one collected
+// before the field existed -- is its own sequence, which is what keeps the flag
+// from changing an ordinary dataset at all.
+func chainKey(t dataset.TaskSpec, chaining bool) string {
+	if chaining && strings.TrimSpace(t.Session) != "" {
+		return pathName(t.Session)
+	}
+	return pathName(t.ID)
+}
+
+// pathName makes a string safe to use as one path component.
+//
+// Session ids come from a recording, so they are UUIDs in practice -- but a
+// task file is editable by hand and a name with a separator in it would put the
+// workspace somewhere other than where the plan says, or escape the work root
+// altogether.
+func pathName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-.")
+	if out == "" {
+		return "task"
+	}
+	return out
 }
 
 func plan(ds *dataset.Dataset, cfg Config) ([]cell, error) {
@@ -362,16 +475,62 @@ func plan(ds *dataset.Dataset, cfg Config) ([]cell, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cells []cell
+	// Group before ordering, so that a chained session replays its prompts in
+	// the order they were asked rather than in whatever order the tasks file
+	// happens to list them. Without chaining every group holds one cell and this
+	// reduces to the task-major, sample-minor order it has always been.
+	type groupKey struct {
+		chain  string
+		sample int
+	}
+	var order []groupKey
+	groups := map[groupKey][]cell{}
 	for _, t := range ds.Tasks {
+		key := chainKey(t, cfg.ChainSessions)
 		for s := 0; s < cfg.Samples; s++ {
+			gk := groupKey{chain: key, sample: s}
+			if _, seen := groups[gk]; !seen {
+				order = append(order, gk)
+			}
 			// A subdirectory per run, so two concurrent runs over one dataset
 			// do not share a workspace and silently observe each other's files.
-			dir := filepath.Join(root, cfg.RunID, t.ID, fmt.Sprintf("s%d", s))
-			cells = append(cells, cell{task: t, sample: s, dir: dir})
+			dir := filepath.Join(root, cfg.RunID, key, fmt.Sprintf("s%d", s))
+			groups[gk] = append(groups[gk], cell{task: t, sample: s, dir: dir, chain: key})
 		}
 	}
+
+	var cells []cell
+	for _, gk := range order {
+		g := groups[gk]
+		sortChain(g)
+		for i := range g {
+			g[i].first = i == 0
+			g[i].last = i == len(g)-1
+		}
+		cells = append(cells, g...)
+	}
 	return cells, nil
+}
+
+// sortChain puts one session's prompts in the order they were asked.
+//
+// PromptIndex is the recorded order and it is what the chain is replayed in.
+// A group where any cell is missing it keeps the dataset's own order rather
+// than guessing: sorting by a half-known key would put the unknown ones
+// wherever the missing value happened to land, which is worse than leaving the
+// file's order alone.
+func sortChain(g []cell) {
+	if len(g) < 2 {
+		return
+	}
+	for _, c := range g {
+		if c.task.PromptIndex == nil {
+			return
+		}
+	}
+	sort.SliceStable(g, func(i, j int) bool {
+		return *g[i].task.PromptIndex < *g[j].task.PromptIndex
+	})
 }
 
 func dropDone(ctx context.Context, st *store.Store, runID string, cells []cell) ([]cell, error) {
@@ -393,6 +552,55 @@ func dropDone(ctx context.Context, st *store.Store, runID string, cells []cell) 
 	return out, nil
 }
 
+// chainsIntact reports a chain that is only half recorded.
+//
+// A chained cell starts from the workspace its predecessor left, and the
+// predecessor's workspace went away with its cell -- so a resume that skips the
+// predecessor starts the successor from nothing, and the row it writes says
+// nothing about that. Refusing is the honest answer: the numbers would be about
+// the harness's bookkeeping rather than about the agent, and a report cannot
+// tell the two apart after the fact.
+//
+// A chain that is entirely recorded is fine to skip, and one that is entirely
+// missing is fine to run -- it is only the split that is unmeasurable.
+func chainsIntact(planned, remaining []cell) error {
+	present := make(map[string]bool, len(remaining))
+	for _, c := range remaining {
+		present[fmt.Sprintf("%s#%d", c.task.ID, c.sample)] = true
+	}
+	type chain struct {
+		name        string
+		total, left int
+	}
+	var order []string
+	chains := map[string]*chain{}
+	for _, c := range planned {
+		key := fmt.Sprintf("%s#%d", c.chain, c.sample)
+		ch := chains[key]
+		if ch == nil {
+			ch = &chain{name: key}
+			chains[key] = ch
+			order = append(order, key)
+		}
+		ch.total++
+		if present[fmt.Sprintf("%s#%d", c.task.ID, c.sample)] {
+			ch.left++
+		}
+	}
+	for _, key := range order {
+		ch := chains[key]
+		if ch.left == 0 || ch.left == ch.total {
+			continue
+		}
+		return fmt.Errorf("chain %s is half recorded: %d of its %d task(s) still have to run and the "+
+			"rest already have a row. A chained task starts from the workspace its predecessor left, "+
+			"and that workspace went away with the cell, so these would each run against nothing. "+
+			"Re-run the chain from its first task instead, under a new run id",
+			ch.name, ch.left, ch.total)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 // ---------------------------------------------------------------------------
@@ -409,6 +617,10 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		saved    []store.Attempt
 		done     int
 		firstErr error
+		// broken names the chains whose workspace was never established, and
+		// why. A later cell of such a chain must not be run: it would start
+		// from nothing and be recorded as a result.
+		broken = map[string]string{}
 	)
 	queue := make(chan cell)
 	var wg sync.WaitGroup
@@ -421,11 +633,32 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 				if runCtx.Err() != nil {
 					return
 				}
-				cellCtx, cellCancel := context.WithCancel(runCtx)
-				attempt := runCell(cellCtx, ds, cfg, drive, c)
-				cellCancel()
+				mu.Lock()
+				reason := broken[c.chain]
+				mu.Unlock()
+
+				var attempt store.Attempt
+				var broke string
+				if reason != "" {
+					// Recorded rather than skipped, so the cell shows up in the
+					// report as the harness error it is. Dropping it would make
+					// the chain look shorter than the dataset says, and the
+					// reader would have no way to tell that from a chain the
+					// dataset never had.
+					attempt = fail(store.Attempt{
+						RunID: cfg.RunID, TaskID: c.task.ID, Sample: c.sample,
+						Category: c.task.Category, Tags: c.task.Tags,
+					}, fmt.Errorf("chain %s never got a workspace: %s", c.chain, reason))
+				} else {
+					cellCtx, cellCancel := context.WithCancel(runCtx)
+					attempt, broke = runCell(cellCtx, ds, cfg, drive, c)
+					cellCancel()
+				}
 
 				mu.Lock()
+				if broke != "" {
+					broken[c.chain] = broke
+				}
 				if err := cfg.Store.SaveAttempt(runCtx, attempt); err != nil && firstErr == nil {
 					firstErr = err
 				}
@@ -474,7 +707,14 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 
 // runCell performs one attempt: build the workspace, run the agent, grade what
 // is left, and compare against the recorded baseline when the task has one.
-func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) store.Attempt {
+//
+// The second result names why the chain's workspace was never established, when
+// that is what happened; it is empty for every other failure. The distinction is
+// the difference between data about the agent and data about the harness: an
+// agent that crashed or timed out tells you something, while a workspace that
+// was never built leaves the rest of the chain with nothing to start from, and
+// the cells after it would be measuring that absence rather than the agent.
+func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) (store.Attempt, string) {
 	t := c.task
 	att := store.Attempt{
 		RunID:    cfg.RunID,
@@ -484,31 +724,45 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		Tags:     t.Tags,
 		Status:   store.CellOK,
 	}
+	var broke string
 
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err))
+		return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err)), err.Error()
 	}
 	sb, err := newSandbox(c.dir, t)
 	if err != nil {
-		return fail(att, err)
+		return fail(att, err), err.Error()
 	}
 
 	started := time.Now()
 	defer func() {
-		if !cfg.KeepWorkspaces {
-			_ = sb.Close(context.WithoutCancel(ctx))
+		_ = sb.Close(context.WithoutCancel(ctx))
+		if cfg.KeepWorkspaces {
+			return
+		}
+		// The workspace outlives the cell inside a chain: the next task starts
+		// from what this one left, which is the whole point. Only a chain's last
+		// cell -- and so every cell of a chain of one -- takes it away, and so
+		// does a cell that broke the chain, since nothing will come for it.
+		if c.last || broke != "" {
 			_ = sandbox.RemoveDir(c.dir)
-		} else {
-			_ = sb.Close(context.WithoutCancel(ctx))
 		}
 	}()
 
-	if err := sandbox.Materialize(ctx, sb, t.Workspace, ds.Dir); err != nil {
-		return fail(att, fmt.Errorf("materialize: %w", err))
+	// One materialisation per chain. Rebuilding it for every task would put the
+	// workspace back exactly as the recording started and throw away what the
+	// earlier task in the chain did -- which is the work the later prompt is
+	// asking about.
+	if c.first {
+		if err := sandbox.Materialize(ctx, sb, t.Workspace, ds.Dir); err != nil {
+			broke = err.Error()
+			return fail(att, fmt.Errorf("materialize: %w", err)), broke
+		}
 	}
 	baseline, err := sandbox.CurrentBaseline(ctx, sb)
 	if err != nil {
-		return fail(att, fmt.Errorf("baseline: %w", err))
+		broke = err.Error()
+		return fail(att, fmt.Errorf("baseline: %w", err)), broke
 	}
 
 	// The agent's own budget, with the cell given room beyond it for setup,
@@ -525,10 +779,10 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	cancel()
 
 	if agentErr != nil {
-		return fail(att, fmt.Errorf("agent: %w", agentErr))
+		return fail(att, fmt.Errorf("agent: %w", agentErr)), broke
 	}
 	if attempt == nil {
-		return fail(att, errors.New("agent returned no attempt"))
+		return fail(att, errors.New("agent returned no attempt")), broke
 	}
 	att.DurationMs = time.Since(started).Milliseconds()
 	att.StopReason = attempt.StopReason()
@@ -585,7 +839,7 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	att.Answer = attempt.FinalText()
 	att.Baseline = compareToBaseline(t, att.DurationMs)
 	att.WorkspaceDir = c.dir
-	return att
+	return att, broke
 }
 
 // applyUsage copies the agent's accounting into the row. The token classes are
@@ -719,6 +973,13 @@ func compareToBaseline(t dataset.TaskSpec, durationMs int64) store.BaselineCompa
 		Cost:    b.CostUSD,
 		Turns:   assistant,
 		Output:  b.FinalOutput,
+		// Who made the recording, and what it says about itself. The report
+		// has no other way to learn either: a baseline is an input that lives
+		// beside the dataset, and the dataset is not consulted at render time.
+		AgentName:  b.AgentName,
+		AgentModel: b.AgentModel,
+		Source:     b.Source,
+		Notes:      b.Notes,
 	}
 }
 

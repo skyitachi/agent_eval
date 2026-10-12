@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/grader"
 	"github.com/skyitachi/agenteval/internal/runner"
@@ -43,6 +44,21 @@ type runOpts struct {
 	sweep             string
 	config            string
 	notes             string
+	// agent, bin and backend default to the ordinary local Claude Code cell.
+	// They exist so a comparison test can make two runs differ in exactly one
+	// of the things a run row records.
+	agent   string
+	bin     string
+	backend string
+	// spec, when set, is the agent configuration recorded on the run. Nil
+	// leaves it unrecorded, which is how every row written before schema v4
+	// reads -- and reading that as "configured nothing" is the mistake the
+	// report has to avoid.
+	spec *agent.Spec
+	// chained is whether the run gave each session's tasks one workspace and
+	// ran them in order. False is also how every row written before schema v5
+	// reads, and there that is the answer rather than a gap.
+	chained bool
 }
 
 func addRun(t *testing.T, st *store.Store, o runOpts) {
@@ -56,15 +72,30 @@ func addRun(t *testing.T, st *store.Store, o runOpts) {
 	if o.samples == 0 {
 		o.samples = 1
 	}
+	if o.agent == "" {
+		o.agent = "claude_code"
+	}
+	if o.backend == "" {
+		o.backend = "local"
+	}
+	var specJSON string
+	if o.spec != nil {
+		raw, err := json.Marshal(*o.spec)
+		if err != nil {
+			t.Fatalf("marshal the fixture's agent spec: %v", err)
+		}
+		specJSON = string(raw)
+	}
 	ctx := context.Background()
 	started := time.Date(2026, 3, 1, 10, 0, 0, 0, time.UTC)
 	err := st.CreateRun(ctx, store.Run{
 		ID: o.id, Name: o.name, Status: store.RunRunning, StartedAt: started,
 		DatasetName: o.dataset, DatasetHash: o.hash,
-		AgentKind: "claude_code", AgentModel: o.model, Backend: "local",
+		AgentKind: o.agent, AgentModel: o.model, AgentBin: o.bin, Backend: o.backend,
 		Samples: o.samples, Concurrency: 1,
 		FactorAxis: o.factor[0], FactorLevel: o.factor[1], SweepID: o.sweep,
-		Notes: o.notes, ConfigJSON: o.config,
+		Notes: o.notes, ConfigJSON: o.config, AgentSpecJSON: specJSON,
+		ChainSessions: o.chained,
 	})
 	if err != nil {
 		t.Fatalf("create run %s: %v", o.id, err)
@@ -627,6 +658,301 @@ func TestCompareReportsUnchangedCellsHonestly(t *testing.T) {
 	}
 	if d.Compare.Summary.BothPass != 1 || d.Compare.Summary.BothFail != 1 {
 		t.Errorf("summary = %+v", d.Compare.Summary)
+	}
+}
+
+// TestCompareSaysWhatItsDeltasBundle covers the one thing a comparison can say
+// about attribution: what the two runs differ in besides the numbers.
+//
+// The command cannot refuse a comparison -- "what changed between these two?"
+// is a fair question about any pair -- so silence would read as "these two
+// numbers measured the same thing", which is the one reading that cannot hold
+// when the two runs differ in two recorded things at once.
+func TestCompareSaysWhatItsDeltasBundle(t *testing.T) {
+	cases := []struct {
+		name  string
+		left  runOpts
+		right runOpts
+		want  []string // substrings that must appear; empty means no warnings
+	}{
+		{
+			name:  "two runs that differ in nothing recorded are not annotated",
+			left:  runOpts{id: "a", model: "m"},
+			right: runOpts{id: "b", model: "m"},
+		},
+		{
+			name:  "one recorded difference is named as the single cause",
+			left:  runOpts{id: "a", model: "m1"},
+			right: runOpts{id: "b", model: "m2"},
+			want:  []string{"differ in the model (m1 vs m2)", "that one difference and nothing else"},
+		},
+		{
+			// The case the whole thing exists for: an agent swap and a model
+			// swap at once. Every delta below is a bundle.
+			name:  "two recorded differences refuse the attribution",
+			left:  runOpts{id: "a", model: "m1", agent: "claude_code"},
+			right: runOpts{id: "b", model: "m2", agent: "mock"},
+			want: []string{
+				"differ in more than one thing",
+				"the agent (claude_code vs mock)",
+				"the model (m1 vs m2)",
+				"so no delta below can be attributed to any single one",
+			},
+		},
+		{
+			name:  "the agent binary is one of the recorded things",
+			left:  runOpts{id: "a", model: "m", bin: "/bin/good.sh"},
+			right: runOpts{id: "b", model: "m", bin: "/bin/bad.sh"},
+			want:  []string{"differ in the agent binary (/bin/good.sh vs /bin/bad.sh)"},
+		},
+		{
+			name:  "the sandbox backend is one of them too",
+			left:  runOpts{id: "a", model: "m", backend: "local"},
+			right: runOpts{id: "b", model: "m", backend: "docker"},
+			want:  []string{"differ in the sandbox backend (local vs docker)"},
+		},
+		{
+			// A different dataset is not a difference of degree: the cells
+			// paired below are different questions.
+			name:  "a different dataset is its own warning",
+			left:  runOpts{id: "a", model: "m", hash: "hash-1"},
+			right: runOpts{id: "b", model: "m", hash: "hash-2"},
+			want:  []string{"did not run the same dataset content"},
+		},
+		{
+			// The gap this exists to close: the skill set is not one of the
+			// label columns, so this pair agreed on everything the row used to
+			// record and the page had nothing to say about it.
+			name: "a skill difference is a recorded difference",
+			left: runOpts{id: "a", model: "m", spec: &agent.Spec{
+				Model: "m", PluginDirs: []string{"/skills/a"},
+				Isolation: &agent.Isolation{}}},
+			right: runOpts{id: "b", model: "m", spec: &agent.Spec{
+				Model: "m", Isolation: &agent.Isolation{}}},
+			want: []string{
+				"differ in the skills loaded (/skills/a vs none)",
+				"that one difference and nothing else",
+			},
+		},
+		{
+			// Declaring a directory is not loading it. The clean-room flags
+			// remove the agent's skills, so this pair drove the same
+			// configuration and reporting a difference would be wrong.
+			name: "a directory the flags removed is not a skill the run had",
+			left: runOpts{id: "a", model: "m", spec: &agent.Spec{
+				Model: "m", PluginDirs: []string{"/skills/a"},
+				Isolation: &agent.Isolation{Bare: true}}},
+			right: runOpts{id: "b", model: "m", spec: &agent.Spec{
+				Model: "m", Isolation: &agent.Isolation{}}},
+		},
+		{
+			// Two runs that declared the same directories but only one of
+			// which let them through are a skill difference, whatever the
+			// declarations look like.
+			name: "the same declaration with different flags is a difference",
+			left: runOpts{id: "a", model: "m", spec: &agent.Spec{
+				Model: "m", PluginDirs: []string{"/skills/a"},
+				Isolation: &agent.Isolation{}}},
+			right: runOpts{id: "b", model: "m", spec: &agent.Spec{
+				Model: "m", PluginDirs: []string{"/skills/a"},
+				Isolation: &agent.Isolation{Bare: true}}},
+			want: []string{"differ in the skills loaded (/skills/a vs none)"},
+		},
+		{
+			// Only one side can answer the question, so the comparison cannot
+			// answer it either -- and it has to name which side, because the
+			// guess a reader makes about a silent run is "it loaded nothing".
+			name: "a run with no recorded configuration is named as unknown",
+			left: runOpts{id: "a", name: "old", model: "m"},
+			right: runOpts{id: "b", model: "m", spec: &agent.Spec{
+				Model: "m", Isolation: &agent.Isolation{}}},
+			want: []string{"run old recorded no agent configuration",
+				"whether the two runs loaded the same skills is unknown"},
+		},
+		{
+			// The two runs agree on every label and still measured different
+			// questions: one replayed each session's tasks in a fresh
+			// workspace, the other carried the state forward. Nothing else on
+			// the page says so, and a reader who takes the paired deltas for a
+			// like-for-like comparison has been misled by silence.
+			name:  "a chained replay and a plain one are not the same measurement",
+			left:  runOpts{id: "a", model: "m"},
+			right: runOpts{id: "b", model: "m", chained: true},
+			want: []string{
+				"whether a session's tasks were chained into one workspace (not chained vs chained)",
+				"that one difference and nothing else",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStore(t)
+			addRun(t, st, tc.left)
+			addRun(t, st, tc.right)
+			d, err := LoadComparison(context.Background(), st, tc.left.id, tc.right.id, Options{})
+			if err != nil {
+				t.Fatalf("LoadComparison: %v", err)
+			}
+			if len(tc.want) == 0 {
+				if len(d.Warnings) != 0 {
+					t.Fatalf("warnings = %v, want none", d.Warnings)
+				}
+				return
+			}
+			got := strings.Join(d.Warnings, "\n")
+			for _, w := range tc.want {
+				if !strings.Contains(got, w) {
+					t.Errorf("warnings should mention %q, got:\n%s", w, got)
+				}
+			}
+		})
+	}
+}
+
+// TestTheRunHeaderCanProveWhichSkillsWereLoaded covers the claim the page has to
+// be able to make or withhold.
+//
+// Four states, and the point is that they are four: a run that loaded the
+// user's skills, a run that declared them and had them removed by the
+// clean-room flags, a run that declared none, and a run that predates the
+// harness recording any of it. Collapsing any two of them -- and in particular
+// reading the last as the third -- is a page asserting a configuration it was
+// never told.
+func TestTheRunHeaderCanProveWhichSkillsWereLoaded(t *testing.T) {
+	cases := []struct {
+		name string
+		spec *agent.Spec
+		want *Skills
+	}{
+		{
+			name: "skills loaded",
+			spec: &agent.Spec{PluginDirs: []string{"/b", "/a"}, Isolation: &agent.Isolation{}},
+			want: &Skills{Dirs: []string{"/a", "/b"}, Active: true, Text: "2 plugin dir(s)"},
+		},
+		{
+			name: "declared and removed by the clean-room flags",
+			spec: &agent.Spec{PluginDirs: []string{"/a"}, Isolation: &agent.Isolation{Bare: true}},
+			want: &Skills{Dirs: []string{"/a"}, RemovedBy: "--bare removed them",
+				Text: "1 plugin dir(s), not loaded (--bare removed them)"},
+		},
+		{
+			name: "none declared",
+			spec: &agent.Spec{Isolation: &agent.Isolation{}},
+			want: &Skills{Dirs: []string{}, Text: "none declared"},
+		},
+		{
+			name: "no configuration recorded at all",
+			spec: nil,
+			want: nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newStore(t)
+			addRun(t, st, runOpts{id: "r1", dataset: "d", spec: tc.spec})
+			d, err := Load(context.Background(), st, "r1", Options{})
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			got := d.Run.Skills
+			switch {
+			case tc.want == nil && got != nil:
+				t.Fatalf("skills = %+v, want nothing: an unrecorded configuration must not be "+
+					"reported as one that declared no skills", got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("skills = nil, want %+v", tc.want)
+			}
+			if tc.want == nil {
+				return
+			}
+			if got.Text != tc.want.Text || got.Active != tc.want.Active ||
+				got.RemovedBy != tc.want.RemovedBy ||
+				strings.Join(got.Dirs, ",") != strings.Join(tc.want.Dirs, ",") {
+				t.Errorf("skills = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTheRunHeaderSaysWhetherTheCellsWereChained covers the fact that changes
+// what the cell list means.
+//
+// A chained run reports the same k and the same rows as an unchained one; what
+// differs is that each cell started from the state its predecessor left. A page
+// that renders the two identically invites the reader to average a sequence as
+// though it were a set of repeats, which is the one reading that is certainly
+// wrong.
+func TestTheRunHeaderSaysWhetherTheCellsWereChained(t *testing.T) {
+	for _, chained := range []bool{true, false} {
+		st := newStore(t)
+		addRun(t, st, runOpts{id: "r1", dataset: "d", chained: chained})
+		d, err := Load(context.Background(), st, "r1", Options{})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if d.Run.ChainSessions != chained {
+			t.Errorf("chain_sessions = %v, want %v", d.Run.ChainSessions, chained)
+		}
+	}
+}
+
+// TestTheRecordingSaysWhoMadeItAndWhetherThatIsThisAgent covers the baseline
+// card's provenance. A collected Cursor session replayed by Claude Code is a
+// real comparison -- it is what replaying a recording means -- but its delta is
+// the difference between two agents rather than the effect of one, and the card
+// is the only place that can be said.
+func TestTheRecordingSaysWhoMadeItAndWhetherThatIsThisAgent(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "a", name: "replay", model: "sonnet"})
+	addCell(t, st, "a", cellOpts{task: "t", graded: true, passed: true, base: &store.BaselineComparison{
+		Present: true, ID: "sess-1", Tokens: 3000, Ms: 60000, Turns: 4,
+		AgentName: "cursor", AgentModel: "grok-4.5",
+		Source: "cursor-composer", Notes: "records no cost",
+	}})
+
+	b := taskByID(t, mustLoad(t, st, "a", Options{}), "t").Baseline
+	if b == nil {
+		t.Fatal("the cell lost its baseline")
+	}
+	if b.AgentName != "cursor" || b.AgentModel != "grok-4.5" || b.Source != "cursor-composer" {
+		t.Errorf("the card does not name the recording: %+v", b)
+	}
+	// The caveats travel with the numbers they qualify, which is the whole
+	// reason they are stored rather than left in the dataset.
+	if b.Notes != "records no cost" {
+		t.Errorf("notes = %q, want the recording's own caveat", b.Notes)
+	}
+	if !b.DifferentAgent {
+		t.Error("a Cursor recording replayed by a claude_code run is a cross-agent comparison")
+	}
+}
+
+// TestABaselineFromTheSameAgentIsNotCalledCrossAgent pins the folding, which is
+// what keeps the cross-agent notice from firing on the ordinary case.
+//
+// The two names come from different layers and are spelled differently: a
+// capture writes the producer's name ("claude-code"), while a run registers the
+// implementation it drives ("claude_code"). A warning that fires on every
+// collected-and-replayed Claude Code baseline is how the one real warning stops
+// being read.
+func TestABaselineFromTheSameAgentIsNotCalledCrossAgent(t *testing.T) {
+	for _, tc := range []struct {
+		recorded string
+		differ   bool
+	}{
+		{"claude-code", false},
+		{"claude_code", false},
+		{"Claude Code", false},
+		{"cursor", true},
+		{"mock", true},
+		// No record is not evidence of a different agent: the report says the
+		// absence separately, and a notice here would be inventing one.
+		{"", false},
+	} {
+		if got := !sameAgent(tc.recorded, "claude_code"); got != tc.differ {
+			t.Errorf("a recording from %q compared against claude_code: cross-agent = %v, want %v",
+				tc.recorded, got, tc.differ)
+		}
 	}
 }
 
