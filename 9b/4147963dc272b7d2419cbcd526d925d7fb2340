@@ -1,0 +1,77 @@
+cmd/aeval/main.go
+  s_7bc19e1c740b1e::t_8d2bee31e73ebe 572-576
+  s_7bc19e1c740b1e::t_0e2c6d4ee7fb4c 577-579
+  s_7bc19e1c740b1e::t_04de721fb7faf8 672-688,690-700,708-720,725-727,731-745,750-772
+README.zh-CN.md
+  s_7bc19e1c740b1e::t_7b487fd2aca52f 257-314
+.workbuddy/memory/2026-10-12.md
+  s_7bc19e1c740b1e::t_5f46a57134eeb6 93-135
+README.md
+  s_7bc19e1c740b1e::t_a16d2e4310a1b3 349-356
+internal/session/collect.go
+  s_7bc19e1c740b1e::t_3178ccf8a09c25 190-214,226-227
+  s_7bc19e1c740b1e::t_627bc3736c72a7 682-708
+  s_7bc19e1c740b1e::t_20c8ca4e8dbaed 586-595
+  s_7bc19e1c740b1e::t_6f49df1f747b84 5
+  s_7bc19e1c740b1e::t_327f87f318498e 825-1058,1069,1074-1102,1104-1105,1107-1108,1122-1123
+  s_7bc19e1c740b1e::t_2b05fbbefda434 215-225
+  s_7bc19e1c740b1e::t_b93a8d8d01524e 672-681
+  s_7bc19e1c740b1e::t_7e0f69c572a47f 149-157,167
+  s_7bc19e1c740b1e::t_bb181690aa8338 797-808
+  s_7bc19e1c740b1e::t_9bd529814af5a9 163
+tests/e2e_test.go
+  s_7bc19e1c740b1e::t_be90de082f876d 894-897,903,910-913
+  s_7bc19e1c740b1e::t_93a21084341752 923-975
+  s_7bc19e1c740b1e::t_16762bd7fae686 1378
+  s_7bc19e1c740b1e::t_a7030ea72e4d9e 1108-1109
+  s_7bc19e1c740b1e::t_92a03e2bd5dbfd 1187-1188,1190-1191,1409-1411,1415,1452-1454,1457,1462-1465
+  s_7bc19e1c740b1e::t_f66ca41d8a5f03 976-1107,1110-1186,1189,1192-1377,1384-1408,1412-1413,1416-1451,1455-1456,1458-1461,1466-1521
+internal/session/collect_test.go
+  s_7bc19e1c740b1e::t_b9eb542b61d2ac 107-109,116-129
+  s_7bc19e1c740b1e::t_aa2613a86fdcd3 339-344,346-347
+  s_7bc19e1c740b1e::t_32211e9a864170 159-162,167-168,176-177
+  s_7bc19e1c740b1e::t_2b514eccf607d6 351-356,367-379,381-382
+  s_7bc19e1c740b1e::t_5ce312c4650359 250-254
+  s_7bc19e1c740b1e::t_9041429d378347 552-680
+  s_7bc19e1c740b1e::t_498c8f4987f86e 212-214,223-224
+  s_7bc19e1c740b1e::t_7825af0093ec3a 5
+internal/session/parse.go
+  s_7bc19e1c740b1e::t_ea4f576d9fafde 427
+  s_7bc19e1c740b1e::t_301732eec58373 173-174
+  s_7bc19e1c740b1e::t_5875c5a6a33ba7 456-465,474-480
+  s_7bc19e1c740b1e::t_fb64b91354ab95 115-116,118-121
+  s_7bc19e1c740b1e::t_c52815f5a30fa7 54-57
+  s_7bc19e1c740b1e::t_2b51bff9eaf483 538,540-541,543-544,546-548,551-558,561
+  s_7bc19e1c740b1e::t_610b1481bc3acc 601-614,622,634-636,638-675
+  s_7bc19e1c740b1e::t_de1fd642502dbf 414
+  s_7bc19e1c740b1e::t_7fa31c14776eea 206-219
+  s_7bc19e1c740b1e::t_d24ebc5e138faf 417-418,425-426
+  s_7bc19e1c740b1e::t_1767d43cb89055 503-527
+  s_7bc19e1c740b1e::t_b18b5885542890 615-621
+  s_7bc19e1c740b1e::t_aceb22051d0e3c 625-631,637
+  s_7bc19e1c740b1e::t_cc31ac9d0a8822 117,122-124
+internal/session/cursor.go
+  s_7bc19e1c740b1e::t_35a7f20eb34e79 737-749
+internal/session/parse_test.go
+  s_7bc19e1c740b1e::t_e2439ac421d29b 168-172,174-175,177-178,180-181
+  s_7bc19e1c740b1e::t_347f8196cd6126 210-214,218-225
+  s_7bc19e1c740b1e::t_94da8b16ea832e 26-28,30-31,33-34,39-40,44-52,57-84
+  s_7bc19e1c740b1e::t_d6af10255ab6d5 269-294
+  s_7bc19e1c740b1e::t_73a5847ee1a53f 295-343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.49-trip",
+  "base_commit_sha": "9b4147963dc272b7d2419cbcd526d925d7fb2340",
+  "prompts": {},
+  "sessions": {
+    "s_7bc19e1c740b1e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ce5399f-b2ed-456e-9620-9fb6a4cb703e",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "yaosp <yaosp@trip.com>"
+    }
+  }
+}
