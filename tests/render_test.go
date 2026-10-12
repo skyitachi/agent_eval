@@ -75,6 +75,10 @@ func findBrowser() string {
 //     matches an element and also matches the same string once it has been
 //     escaped into visible text, which is the difference being tested, so the
 //     diff count looks for the opening tag.
+//   - the table's markup count is the exception: it reads the table's own text
+//     rather than the document's, because the document carries this script and
+//     its source is made of the very tags being counted. A table cell holds
+//     ids, counts, statuses and durations, and has no business containing one.
 //
 // Tab clicks re-query the button by name each time: a click re-renders the
 // drawer, so a button captured beforehand is detached afterwards.
@@ -86,7 +90,7 @@ setTimeout(function () {
     document.documentElement.appendChild(pre);
   }
   var names = ['overview', 'trajectory', 'diff', 'graders', 'tools', 'raw'];
-  var out = { tabs: [] };
+  var out = { tabs: [], toolsCell: '', toolsBadges: 0, tableText: '', tableMarkup: 0, sortedHead: '', sortedMarkup: 0 };
   var rows = document.querySelectorAll('#main tbody tr');
   out.cells = rows.length;
   var body = null;
@@ -98,6 +102,20 @@ setTimeout(function () {
   out.strips = body ? body.querySelectorAll('.tabs').length : 0;
   var head = document.querySelector('.card.runhead');
   out.header = head ? head.textContent : '';
+  var table = document.querySelector('#main table');
+  if (table) {
+    var heads = Array.prototype.map.call(table.querySelectorAll('thead th'), function (th) {
+      return th.textContent.trim().toLowerCase();
+    });
+    var col = -1;
+    heads.forEach(function (h, i) { if (h.indexOf('tools') === 0) col = i; });
+    var first = table.querySelector('tbody tr');
+    var cell = (col >= 0 && first) ? first.children[col] : null;
+    out.toolsCell = cell ? cell.textContent : '';
+    out.toolsBadges = cell ? cell.querySelectorAll('.v.fail').length : 0;
+    out.tableText = table.textContent;
+    out.tableMarkup = (out.tableText.match(/<[a-z/]/g) || []).length;
+  }
   names.forEach(function (name) {
     var tab = { name: name, present: false };
     var button = body ? document.querySelector('.drawer-body [data-tab="' + name + '"]') : null;
@@ -123,6 +141,17 @@ setTimeout(function () {
     }
     out.tabs.push(tab);
   });
+  // Sorting is the only thing that makes a column header draw its arrow, so the
+  // header has to be read twice: as it loads, and after a click. Done last,
+  // because a click re-renders the whole page and would detach the drawer the
+  // tabs above were read from.
+  var sortTh = document.querySelector('#main thead th[data-key]:not([data-key=""])');
+  if (sortTh) {
+    sortTh.click();
+    var thead = document.querySelector('#main thead');
+    out.sortedHead = thead ? thead.textContent : '';
+    out.sortedMarkup = (out.sortedHead.match(/<[a-z/]/g) || []).length;
+  }
   done(out);
 }, 700);
 </script>
@@ -147,11 +176,17 @@ type renderTab struct {
 }
 
 type renderResult struct {
-	Cells      int         `json:"cells"`
-	DrawerOpen bool        `json:"drawerOpen"`
-	Strips     int         `json:"strips"`
-	Header     string      `json:"header"`
-	Tabs       []renderTab `json:"tabs"`
+	Cells        int         `json:"cells"`
+	DrawerOpen   bool        `json:"drawerOpen"`
+	Strips       int         `json:"strips"`
+	Header       string      `json:"header"`
+	ToolsCell    string      `json:"toolsCell"`
+	ToolsBadges  int         `json:"toolsBadges"`
+	TableText    string      `json:"tableText"`
+	TableMarkup  int         `json:"tableMarkup"`
+	SortedHead   string      `json:"sortedHead"`
+	SortedMarkup int         `json:"sortedMarkup"`
+	Tabs         []renderTab `json:"tabs"`
 }
 
 // browserRender loads a report in a browser and returns what the client drew.
@@ -270,6 +305,120 @@ func TestReportDrawerRendersEveryTab(t *testing.T) {
 	}
 	if res.Tabs[2].DiffLines == 0 {
 		t.Error("the diff tab drew no diff lines")
+	}
+}
+
+// TestReportTaskTableShowsValuesNotMarkup covers the two places in the task
+// table that compose markup instead of interpolating a value.
+//
+// Both had the same shape and neither was visible in the artifact. The Tools
+// column read `6<span class="v fail" title="2 tool error(s)">!</span>`, and a
+// sorted column header read `Task <span class="arrow">▲</span>` -- because a
+// tpl() result is a plain string, so interpolating one into another template
+// escapes it a second time and the page prints the markup it was building.
+// This file's header warns about the opposite mistake: a value that should have
+// been wrapped, printed as "[object HTMLDivElement]". This is what happens when
+// the wrapping is missing instead, and it is invisible for the same reason --
+// the file was correct, the payload was correct (the cell carried 2 tool calls
+// and 1 tool error), the exit code was 0, and "[object " never appears. A badge
+// and the text of a badge are the same bytes in the artifact and different
+// things only after a browser has parsed them; the header arrow is worse still,
+// because it does not exist at all until a reader clicks a column to sort.
+//
+// The fixture is the only one in the suite that calls a tool: a cell with no
+// failed call leaves this column reading "-", so the cell that broke would
+// never have been exercised.
+func TestReportTaskTableShowsValuesNotMarkup(t *testing.T) {
+	requireBrowser(t)
+	work := t.TempDir()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	report := filepath.Join(work, "tools.html")
+
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--bin", filepath.Join(agents, "tool-errors.sh"),
+		"--name", "tools",
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"),
+		"--report", report,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	res := browserRender(t, report)
+	if res.Cells == 0 {
+		t.Fatal("the run drew no cells, so there is no table to read")
+	}
+	// The count, then the badge's own glyph: two calls in the fixture's stream,
+	// one of which failed.
+	if res.ToolsCell != "2!" {
+		t.Errorf("the tools cell reads %q, want the call count followed by the error badge",
+			res.ToolsCell)
+	}
+	// And the badge is an element, not a copied-out tag.
+	if res.ToolsBadges != 1 {
+		t.Errorf("the cell drew %d tool-error badge(s), want 1\n%s", res.ToolsBadges, res.TableText)
+	}
+	// The general claim the one cell is an instance of. A cell holds ids,
+	// counts, statuses and durations, so a tag-shaped "<" among them can only
+	// be a value that was escaped twice.
+	if res.TableMarkup > 0 {
+		t.Errorf("the table prints its own markup as text (%d tag-shaped sequences)\n%s",
+			res.TableMarkup, res.TableText)
+	}
+	// The same claim about the header, read in the state where it draws an
+	// arrow at all.
+	if res.SortedMarkup > 0 {
+		t.Errorf("the sorted header prints its own markup as text (%d tag-shaped sequences)\n%s",
+			res.SortedMarkup, res.SortedHead)
+	}
+	// The positive half, without which the count above would also pass on a
+	// header that drew nothing: the arrow is there, as a glyph, on the clicked
+	// column.
+	if !strings.Contains(res.SortedHead, "▲") && !strings.Contains(res.SortedHead, "▼") {
+		t.Errorf("the sorted header drew no sort arrow\n%s", res.SortedHead)
+	}
+}
+
+// TestReportHeaderNamesTheModelTheStreamNamed covers the chip a reader looks
+// for and used not to find.
+//
+// The model was rendered only when the label column was set, so on every run
+// that did not pass --model the header carried no model at all -- and "no model
+// was requested", "the CLI's default was used" and "nobody recorded it" all
+// looked like the same empty space. The chip is drawn by the client, so finding
+// the text in the file would only prove the source shipped; this drives a run
+// whose fixture's stream names a model and reads the page back.
+func TestReportHeaderNamesTheModelTheStreamNamed(t *testing.T) {
+	requireBrowser(t)
+	work := t.TempDir()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	report := filepath.Join(work, "model.html")
+
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--bin", filepath.Join(agents, "chain.sh"),
+		"--name", "model",
+		"--db", filepath.Join(work, "runs.db"),
+		"--work-root", filepath.Join(work, "work"),
+		"--report", report,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	res := browserRender(t, report)
+	if res.Cells == 0 {
+		t.Fatal("the run drew no cells, so there is no page to read")
+	}
+	// No --model was passed, so the label is empty and the stream is the only
+	// source -- which is exactly the case that used to render as nothing.
+	if !strings.Contains(res.Header, "default (the CLI chose it): stand-in") {
+		t.Errorf("the header does not say which model served the run\n%s", res.Header)
+	}
+	if strings.Contains(res.Header, "[object ") {
+		t.Errorf("the header shows a stringified object instead of its chips\n%s", res.Header)
 	}
 }
 

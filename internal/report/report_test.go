@@ -125,6 +125,14 @@ type cellOpts struct {
 	events   []trace.Event
 	calls    []trace.ToolCall
 	base     *store.BaselineComparison
+	// observed is the model this cell's stream says served it, recorded where a
+	// real stream records it: as the per-model accounting on the result event.
+	// Empty means the stream named no model, which is what a fixture that emits
+	// no stream at all looks like.
+	observed string
+	// announced is the model the stream named at init instead. It is set only
+	// by the tests that are about the two sources disagreeing.
+	announced string
 }
 
 func addCell(t *testing.T, st *store.Store, runID string, o cellOpts) {
@@ -144,8 +152,12 @@ func addCell(t *testing.T, st *store.Store, runID string, o cellOpts) {
 	if o.base != nil {
 		a.Baseline = *o.base
 	}
-	if len(o.events) > 0 || len(o.calls) > 0 {
-		raw, err := json.Marshal(trace.Trace{Events: o.events, ToolCalls: o.calls})
+	if len(o.events) > 0 || len(o.calls) > 0 || o.observed != "" || o.announced != "" {
+		tr := trace.Trace{Events: o.events, ToolCalls: o.calls, Model: o.announced}
+		if o.observed != "" {
+			tr.Result.ModelUsage = map[string]trace.ModelUsage{o.observed: {InputTokens: 10}}
+		}
+		raw, err := json.Marshal(tr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -871,6 +883,229 @@ func TestTheRunHeaderCanProveWhichSkillsWereLoaded(t *testing.T) {
 				t.Errorf("skills = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTheHeaderSaysWhichModelRan covers the four states the record can be in.
+//
+// The label column holds what the command line asked for, and it is empty on
+// every run that did not pass --model. Rendering nothing in that case is what
+// this replaced: "no model was requested", "the CLI's default was used" and
+// "nobody recorded it" are three different facts that all looked like an empty
+// space on the page.
+func TestTheHeaderSaysWhichModelRan(t *testing.T) {
+	cases := []struct {
+		name     string
+		declared string
+		observed string
+		want     string
+		subst    bool
+	}{
+		{
+			name: "a model was asked for and answered",
+			// The stream names the resolved model, not the alias, and that must
+			// not read as a substitution.
+			declared: "sonnet", observed: "claude-sonnet-4-5-20250929",
+			want: "sonnet (claude-sonnet-4-5-20250929)",
+		},
+		{
+			name:     "nothing was asked for, so the CLI chose",
+			declared: "", observed: "claude-opus-4-7",
+			want: "default (the CLI chose it): claude-opus-4-7",
+		},
+		{
+			name:     "asked for one model and served another",
+			declared: "claude-opus-4-7", observed: "claude-haiku-4",
+			want:  "claude-opus-4-7, but the stream billed claude-haiku-4",
+			subst: true,
+		},
+		{
+			name:     "asked for a model and the stream named none",
+			declared: "sonnet", observed: "",
+			want: "sonnet (the stream named no model)",
+		},
+		{
+			name:     "nothing is known at all",
+			declared: "", observed: "",
+			want: "not recorded",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := newStore(t)
+			addRun(t, st, runOpts{id: "r1", dataset: "d", model: c.declared})
+			addCell(t, st, "r1", cellOpts{task: "t", graded: true, passed: true, observed: c.observed})
+
+			d := mustLoad(t, st, "r1", Options{})
+			m := d.Run.Model
+			if m == nil {
+				t.Fatal("the run has no model view, so the page cannot state one")
+			}
+			if m.Text != c.want {
+				t.Errorf("text = %q, want %q", m.Text, c.want)
+			}
+			if m.Substitute != c.subst {
+				t.Errorf("substitute = %v, want %v", m.Substitute, c.subst)
+			}
+			if m.Declared != c.declared {
+				t.Errorf("declared = %q, want %q", m.Declared, c.declared)
+			}
+			// The declared label is still on the payload: the comparison reads
+			// it, and it is the one field a consumer already knows.
+			if d.Run.AgentModel != c.declared {
+				t.Errorf("agent_model = %q, want the declared value kept", d.Run.AgentModel)
+			}
+		})
+	}
+}
+
+// TestEveryCellSaysWhichModelServedIt: a run is not necessarily one model. A
+// fallback mid-run is served by one cell's stream, and the run header can only
+// say that it happened somewhere -- so the cell has to carry its own answer, and
+// carry it in the same words whether or not it has one.
+func TestEveryCellSaysWhichModelServedIt(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "r1", dataset: "d", model: "sonnet"})
+	addCell(t, st, "r1", cellOpts{task: "matched", graded: true, passed: true,
+		observed: "claude-sonnet-4-5-20250929"})
+	addCell(t, st, "r1", cellOpts{task: "fell-back", graded: true, passed: true,
+		observed: "claude-haiku-4"})
+	addCell(t, st, "r1", cellOpts{task: "silent", graded: true, passed: true})
+
+	d := mustLoad(t, st, "r1", Options{})
+	if got := taskByID(t, d, "matched").Model; got != "claude-sonnet-4-5-20250929" {
+		t.Errorf("the alias resolved to %q, want the resolved name alone: asking for sonnet is not a difference", got)
+	}
+	if got := taskByID(t, d, "fell-back").Model; got != "claude-haiku-4 (asked for sonnet)" {
+		t.Errorf("model = %q, want the cell to name what it was served and what was asked for", got)
+	}
+	if got := taskByID(t, d, "silent").Model; got != "not named by the stream" {
+		t.Errorf("model = %q, want the absence stated rather than left blank", got)
+	}
+
+	// The header sees both names, because it is the run-level claim, and a
+	// reader who only read the header would otherwise take "sonnet" for the
+	// whole run.
+	m := d.Run.Model
+	if len(m.Observed) != 2 || m.Observed[0] != "claude-haiku-4" || m.Observed[1] != "claude-sonnet-4-5-20250929" {
+		t.Errorf("observed = %v, want both models the streams named, sorted", m.Observed)
+	}
+	if !m.Substitute {
+		t.Error("one cell was served a model other than the one asked for, which the header has to say")
+	}
+}
+
+// TestTheHeaderReadsTheModelFromEveryCellNotTheFirstOne: a run whose model
+// changed partway is the case this exists for, and taking the first cell's word
+// for it would hide exactly that.
+func TestTheHeaderReadsTheModelFromEveryCellNotTheFirstOne(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "r1", dataset: "d"})
+	addCell(t, st, "r1", cellOpts{task: "a", graded: true, passed: true, observed: "claude-opus-4-7"})
+	addCell(t, st, "r1", cellOpts{task: "b", graded: true, passed: true, observed: "claude-haiku-4"})
+
+	d := mustLoad(t, st, "r1", Options{})
+	if got := d.Run.Model.Observed; len(got) != 2 {
+		t.Errorf("observed = %v, want both, because the run is what changed", got)
+	}
+	if !strings.Contains(d.Run.Model.Text, "claude-opus-4-7") ||
+		!strings.Contains(d.Run.Model.Text, "claude-haiku-4") {
+		t.Errorf("text = %q, want both models named", d.Run.Model.Text)
+	}
+}
+
+// TestTwoRunsServedDifferentModelsIsNotSilence covers the arm the columns
+// cannot reach, and the one the label column was quietly standing in for.
+//
+// runs.agent_model holds what the command line asked for, so it is empty on
+// every run that did not pass --model. Two such runs whose streams named
+// different models agreed on every column the comparison looked at, and the
+// page presented the pair as like-for-like with nothing saying otherwise.
+func TestTwoRunsServedDifferentModelsIsNotSilence(t *testing.T) {
+	compare := func(t *testing.T, left, right cellOpts) []string {
+		t.Helper()
+		st := newStore(t)
+		addRun(t, st, runOpts{id: "a", dataset: "d"})
+		addRun(t, st, runOpts{id: "b", dataset: "d"})
+		left.task, right.task = "t", "t"
+		addCell(t, st, "a", left)
+		addCell(t, st, "b", right)
+		d, err := LoadComparison(context.Background(), st, "a", "b", Options{})
+		if err != nil {
+			t.Fatalf("LoadComparison: %v", err)
+		}
+		return d.Warnings
+	}
+
+	// Neither asked for a model, and the streams name two different ones. This
+	// is a real difference in what the numbers below measure.
+	got := strings.Join(compare(t,
+		cellOpts{observed: "claude-opus-4-7"},
+		cellOpts{observed: "claude-haiku-4"},
+	), "\n")
+	for _, want := range []string{
+		"which model served the requests (claude-opus-4-7 vs claude-haiku-4)",
+		"that one difference and nothing else",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the comparison should say %q, got:\n%s", want, got)
+		}
+	}
+
+	// The same model on both sides is not a difference, and an empty list here
+	// is the claim that the pair really did measure the same thing.
+	if w := compare(t,
+		cellOpts{observed: "claude-sonnet-4-5"},
+		cellOpts{observed: "claude-sonnet-4-5"},
+	); len(w) != 0 {
+		t.Errorf("warnings = %v, want none: the two runs were served the same model", w)
+	}
+
+	// An alias on one side and the resolved name on the other is the same
+	// model, and calling it a difference would put a false warning on an
+	// ordinary pair -- which is how a warning stops being read.
+	if w := compare(t,
+		cellOpts{observed: "sonnet"},
+		cellOpts{observed: "claude-sonnet-4-5"},
+	); len(w) != 0 {
+		t.Errorf("warnings = %v, want none: an alias is not a different model", w)
+	}
+
+	// One side's stream named nothing, with neither run having asked for a
+	// model. The pair is not known to be comparable, and the reader's guess
+	// about the silent side is the one that has to be corrected by name.
+	got = strings.Join(compare(t,
+		cellOpts{observed: "claude-opus-4-7"},
+		cellOpts{},
+	), "\n")
+	if !strings.Contains(got, "named no model in its stream") {
+		t.Errorf("a pair whose models cannot both be read should say so, got:\n%s", got)
+	}
+	if !strings.Contains(got, "run b") {
+		t.Errorf("the silent side must be named, not left as \"one of these runs\", got:\n%s", got)
+	}
+}
+
+// TestASubstitutedModelIsNotAlsoCalledARecordedDifference: when the two runs
+// declared different models the sentence above already covers the model, and a
+// second one about the same column is how both stop being read.
+func TestASubstitutedModelIsNotAlsoCalledARecordedDifference(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "a", dataset: "d", model: "m1"})
+	addRun(t, st, runOpts{id: "b", dataset: "d", model: "m2"})
+	addCell(t, st, "a", cellOpts{task: "t", graded: true, passed: true, observed: "m1"})
+	addCell(t, st, "b", cellOpts{task: "t", graded: true, passed: true, observed: "m2"})
+
+	d, err := LoadComparison(context.Background(), st, "a", "b", Options{})
+	if err != nil {
+		t.Fatalf("LoadComparison: %v", err)
+	}
+	got := strings.Join(d.Warnings, "\n")
+	if !strings.Contains(got, "differ in the model (m1 vs m2)") {
+		t.Errorf("the declared difference must still be named, got:\n%s", got)
+	}
+	if strings.Contains(got, "which model served the requests") {
+		t.Errorf("the model should be named once, not twice, got:\n%s", got)
 	}
 }
 

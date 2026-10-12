@@ -16,6 +16,8 @@ package trace
 
 import (
 	"encoding/json"
+	"sort"
+	"strings"
 	"time"
 )
 
@@ -289,6 +291,60 @@ func (t *Trace) Turns() int {
 		return t.TurnCount
 	}
 	return t.Result.NumTurns
+}
+
+// Models names the models that served this attempt, sorted, and is empty when
+// the stream never said.
+//
+// The per-model accounting is preferred over Model, and the difference is the
+// whole point of having both: Model is what the CLI announced at init, before
+// any request was made, while the keys of ModelUsage are the models the
+// endpoint actually billed tokens to. A run that asked for one model and was
+// served another -- a fallback, or a gateway substituting its own -- shows up
+// as a second key and nowhere else. Model is the fallback for the streams that
+// carry no per-model totals, which is what an older CLI emits.
+//
+// Sorted rather than in map order, because a report has to be a function of the
+// record it renders.
+func (t *Trace) Models() []string {
+	if len(t.Result.ModelUsage) == 0 {
+		if t.Model == "" {
+			return nil
+		}
+		return []string{t.Model}
+	}
+	out := make([]string, 0, len(t.Result.ModelUsage))
+	for name := range t.Result.ModelUsage {
+		// A key of "" is the endpoint declining to name a model, which is not
+		// a model called nothing.
+		if strings.TrimSpace(name) != "" {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SameModel reports whether two model names refer to the same model.
+//
+// Equality is not the test. `--model sonnet` is answered by a stream that names
+// `claude-sonnet-4-5-20250929`, and every gateway has its own spelling on top
+// of that, so comparing the two strings directly would report a substitution on
+// an ordinary run -- which is the failure mode that makes a warning useless.
+// One name containing the other is the most that can be asserted from strings
+// alone, in either direction, case-insensitively.
+func SameModel(a, b string) bool {
+	x, y := strings.ToLower(strings.TrimSpace(a)), strings.ToLower(strings.TrimSpace(b))
+	switch {
+	case x == "" || y == "":
+		// Nothing to compare. Saying "same" here would be a claim; saying
+		// "different" would be a different claim, equally unfounded.
+		return false
+	case x == y:
+		return true
+	default:
+		return strings.Contains(x, y) || strings.Contains(y, x)
+	}
 }
 
 // ToolCounts returns per-tool invocation counts.

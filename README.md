@@ -419,6 +419,37 @@ the four label columns — agent, model, binary, backend — cannot identify a r
 that differs only in its skills. Rows written before v4 answer this question
 with silence, and the page keeps silence apart from "none".
 
+The header also names the model, and it says more than the label can. `--model`
+is optional, so the label is empty on every run that did not pass it — and an
+empty label used to render as no model chip at all, which made three different
+facts look the same: no model was requested, the CLI's default was used, or
+nobody recorded it. The stream settles it: its init event announces what the CLI
+is about to use, and its per-model accounting is keyed by what was actually
+billed. The page reads the second and falls back to the first, and states which
+of the four cases it is in:
+
+| the record says | the header says |
+| --- | --- |
+| nothing, either way | `model not recorded` |
+| only `--model sonnet` | `model sonnet (the stream named no model)` |
+| only the stream named one | `model default (the CLI chose it): claude-opus-4-7` |
+| both, and they differ | `model sonnet, but the stream billed claude-haiku-4` |
+
+The third row is the ordinary shape of a real run, and the fourth is the one
+worth colouring: every number below it then measures a model the run did not
+choose. An alias is not a substitution — `--model sonnet` is answered by a
+stream naming `claude-sonnet-4-5-20250929`, and comparing those two strings
+directly would warn on every ordinary run, which is how a warning stops being
+read, so one name containing the other counts as agreement. Each cell carries
+its own answer too, because a run is not necessarily one model: a fallback
+mid-run shows up on a single cell's stream and nowhere else. And when two runs
+declared the same thing — or nothing at all — and were served differently, the
+comparison names that rather than letting equal labels stand in for an equal
+measurement.
+
+None of this needed a new column: the trajectory was already stored per attempt,
+so runs recorded before the header said any of it are answered here too.
+
 ## Package layout
 
 ```

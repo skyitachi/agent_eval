@@ -188,6 +188,32 @@ sanitized env）。
     读到第一个 cell 留下的文件，但行只记结果。空/false = **v1–v4 的普通 run**，语义正确不是缺口。
     `upgradeV4ToV5` 同理一句 `ADD COLUMN ... DEFAULT 0`；夹具把三份 v1/v2/v3 都补 drop 这一列。
 
+## 「用的是哪个模型」（报告必须说得比标签多）
+
+- **两个来源，两种主张**：`runs.agent_model` 是**命令行要什么**（`--model`，可选 → **没传就是空**）；
+  `attempts.trace_json` 里 init 的 `model` 是 CLI **宣告**打算用什么（在任何请求之前），
+  `result.modelUsage` 的**键**才是**真正计了费**的模型。`trace.Trace.Models()` **优先后者**、空则回落
+  前者，并**排序**（报告必须是记录的函数）；空 key 不是模型。
+- **这不需要新列**：trace 本来就按 attempt 落库 → 在这之前录下的 run 也答得出来。`report/load.go`
+  的 `tasks()` **本来就把 trace 解成 `trace.Trace` 了**，只是以前只取 tools/events。
+- **旧缺口是「空标签的沉默」**：chip 以前只在 `agent_model` 非空时画 → 没传 `--model` 的 run 头部
+  **根本没有模型**，读者分不清「没指定」「用了 CLI 默认」「没人记录」。现在**永远画**，四态文案在
+  Go 里写（照 `Skills.Text` 的先例）：`not recorded` / `X (the stream named no model)` /
+  `default (the CLI chose it): X`（**真实 run 最常见的一档**）/ `X, but the stream billed Y`（标红）。
+- **别名不是替换**：`trace.SameModel` = 小写后**互相包含**。`--model sonnet` 会被自称
+  `claude-sonnet-4-5-20250929` 的流回答，直接比字符串会让**每次普通 run 都报警**，而每次都报的警告
+  = 没人读。两边都空 = **不是**同一模型（两个方向都是编的）。
+- **每个格子各报**（`Task.Model`，文案永远非空）：一次 run 未必只有一个模型，中途回落只出现在某条
+  格的流里。头部的 `Observed` **收全部格子**的名字 —— 只取第一个有答案的格子会把「跑一半换了模型」
+  恰好藏起来。格子上的 `(asked for X)` 是读者找到**是哪一格**的唯一线索。
+- **比较也要比实际值**：声明的模型相同（或**都空**）而流里报的不同 → 点名「which model served the
+  requests」。**声明不同时不打这句**（同一列两句 = 两句都不被读）。只有一侧流报了模型、且两边都
+  没声明 → 另说一句「未知」并**点名沉默的那一侧**（照 skills 先例：读者对沉默的错猜正是「那侧什么
+  都没声明」）。
+- **`mock` 答不了这个问题**：`synthesizeStream` **自己合成流并照抄被告知的模型**（空则写 `"mock"`），
+  夹具的 stdout 只被当答案文本。所以断言「页面上的模型 = 流里报的模型」的 e2e **必须走默认
+  `claude_code` 路径**（`--bin <夹具>`，夹具只读 stdin、忽略 argv）。
+
 ## skill 到底有没有开（报告必须能证明）
 
 - **声明 ≠ 加载**：`Spec.SkillsActive()` = 有 `plugin_dirs` **且** `!Bare && !DisableSlashCommands`
@@ -239,6 +265,11 @@ DSL **已删**（`internal/metric` 不存在）。
 同类错踩三次，规则写进了文件头注释：
 
 1. 插进模板的值必须已转义或包 `raw()`；裸 `tpl` 结果再插值 → **二次转义**（diff 视图犯过）。
+   **已犯四次，最近两次都在任务表格里**：`Tools` 列（`int(n) + raw(badge)` → 整格被转义，页面印出
+   `6<span class="v fail" title="2 tool error(s)">!</span>`）与**排序后的表头**（`arrow = tpl…` 没包
+   `raw` → `Task <span class="arrow">▲</span>`，`sortKey` 初值是 null，所以**只有读者点过表头才会出现**）。
+   共同点：**载荷全对、退出码 0、印出来的也不是 `[object `** —— 既有护栏一条都不响。正确形状是
+   **整格一个 `raw(tpl…)`**（见 `toolCell`）。定位法：`grep '+ raw('`（曾经只有一处）。
 2. **节点只能 append，不能插值**（`tpl` 会 `String()` 它）—— 抽屉六个标签页全因此画成
    `[object HTMLDivElement]`；读代码看不出来，必须真渲染。
 3. `raw()` 自带 `toString()`，否则 `'a' + raw(x)` 得到 `[object Object]`（baseline 行犯过）。
@@ -249,20 +280,29 @@ DSL **已删**（`internal/metric` 不存在）。
 护栏：`tests/render_test.go`，**唯一需要浏览器的测试**（找不到 skip，`AGENTEVAL_CHROME` 可覆盖）。
 探针注入 → **读运行头部**（`.card.runhead` 的 `textContent`，`out.header`）→ 点每个 tab → 读回 DOM，
 断言字节数下限、无 `.bad`、无 `[object `、diff 有 `<span class="dl `、baseline 卡两个 delta 含录制
-总量、两栏答案都在。四处变异验过会红。
+总量、两栏答案都在。**表格也要读回来**（`out.toolsCell` / `toolsBadges` / `tableMarkup`，
+以及 `sortedHead` / `sortedMarkup` —— 表头要**点一下再读**，箭头只在排序后才存在）：
+`TestReportTaskTableShowsValuesNotMarkup` 断言 `toolsCell == "2!"`、徽章是元素、表格与排序后的表头
+里都没有字面标签。夹具 `tool-errors.sh` 是**全套唯一会调用工具的那个**（2 calls / 1 error）——
+工具的计数列在没有工具调用的 cell 上只画 `-`，那个坏掉的格子永远不会被走到。本轮这处新增的
+**六项变异**（工具格子 4 + 表头箭头 2）全部确认变红。
 
 **为什么头部也要读回来**：chip 是 JS 运行时画的，**在 HTML 里 grep 到那个字符串只证明源码被装进去了**，
 证明不了它被画出来 —— 这正是 `[object HTMLDivElement]` 当年潜伏的方式（文件/载荷/退出码全对、套件
-全绿）。`TestReportHeaderSaysTheCellsWereChained` 跑一份链式数据集再浏览器渲染，断言头部含
-`chained in order`：把 app.js 那个 `if (r.chain_sessions)` 改成 `if (false)` → 红（已验证）。
-chip 用 `raw()`，所以顺便守住「节点被插值」这一类错。
+全绿）。两条同形状的护栏：`TestReportHeaderSaysTheCellsWereChained`（链式徽章）与
+`TestReportHeaderNamesTheModelTheStreamNamed`（**模型徽章**，跑一份不传 `--model` 的 run，断言头部含
+`default (the CLI chose it): stand-in`）。删掉 app.js 里对应的那行 → 各自变红（已验证）。
+
+**chip 的通用规则**：**「已知为未知」也必须画出来**。skills 与 model 两个 chip 都遵循它（`not recorded`
+是一个断言，不是一个空格），而 `model` 以前只在标签非空时画 —— 于是没传 `--model` 的 run 头部
+**什么模型都不说**。加 chip 时先问：这个值缺了的时候，页面是不是就变成了沉默。
 
 ## 测试与运行
 
 - `go test ./...` 全过（13 包）。e2e 在 `tests/e2e_test.go`，用真实二进制/子进程/SQLite/HTML 驱动。
-  覆盖率 attrib 91.8% / report 89.0% / store 82.5% / session 79.7% / **runner 29.2%**（链式规划
-  `chain_test.go` 把它从 8.9% 抬上来的）—— 编排行为仍主要靠 e2e，这是诚实的现状（编排器的正确层级
-  就是 e2e）。
+  覆盖率 attrib 91.8% / report 89.6% / trace 87.5% / store 82.5% / session 79.7% / **runner 29.2%**
+  （链式规划 `chain_test.go` 把它从 8.9% 抬上来的）—— 编排行为仍主要靠 e2e，这是诚实的现状
+  （编排器的正确层级就是 e2e）。
 - **链式的可观察性只在 e2e 成立**：`tests/testdata/agents/chain.sh`（读 stdin 的 prompt，`*WRITE*`
   写 `handoff.txt` 并答 `wrote handoff.txt`，`*READ*` 答 `found: $(cat handoff.txt)` 或 `missing`）
   —— 「agent 看见了上一步的文件」是单元测试看不见的事。不链式 → 第二格答 `missing` 判负，链式 →
@@ -286,6 +326,11 @@ chip 用 `raw()`，所以顺便守住「节点被插值」这一类错。
   `Google Chrome: signal: trace/BPT trap`。根因是沙箱拒绝 Chrome 清理自己的临时 profile
   （`~/Library/Application Support/Google/Chrome-headless/scoped_dir*/…`、`code_sign_clone/…`）。
   **沙箱外**（`go test ./tests -run TestReportDrawer -count=1`）→ `ok`。别去查代码。
+  **推论：后台 shell 不继承这个放行** —— 变异验证脚本一旦 `run_in_background` 跑，六项全部报
+  `trace/BPT trap`，看起来像「全红」，其实一项都没被断言抓到。变异验证必须**前台**跑（放大 timeout）。
+- **「红了」≠「被抓到了」**：变异验证要**按输出归因** —— 命中自己写的那句断言文案才算抓到，否则
+  只能算环境红了。曾把「浏览器被 context 超时 kill」计成 catch 混进 4/4。脚本里做这层分类，
+  别只看退出码。
 - `--dump-dom` 输出**含注入脚本自身**，探针结果要 base64 回传，匹配字面量要运行时拼
   （`'[' + 'object '`），否则命中探针源码。
 - **本机 grep 空结果先怀疑表达式**：BSD grep 不支持 `\|`，ERE 也不支持 `\s`/`\d`/`\b`（会**静默返回

@@ -248,7 +248,19 @@ type runInfo struct {
 	// continuation rather than independent samples.
 	ChainSessions bool `json:"chain_sessions"`
 
+	// Model is which model the agent used, as far as the record goes. The label
+	// above is only what the command line asked for, and it is empty on every
+	// run that did not pass --model.
+	Model *runModel `json:"model"`
+
 	Summary summary `json:"summary"`
+}
+
+type runModel struct {
+	Declared   string   `json:"declared"`
+	Observed   []string `json:"observed"`
+	Substitute bool     `json:"substitute"`
+	Text       string   `json:"text"`
 }
 
 type runSkills struct {
@@ -307,6 +319,10 @@ type task struct {
 	Turns       int     `json:"turns"`
 	ToolCalls   int     `json:"tool_calls"`
 	ToolErrors  int     `json:"tool_errors"`
+
+	// Model is which model this cell's own stream named, in the shape the page
+	// renders: a statement, never a blank.
+	Model string `json:"model"`
 
 	Baseline *struct {
 		ID         string `json:"id"`
@@ -690,6 +706,97 @@ func TestCLIEndToEnd(t *testing.T) {
 		if !strings.Contains(l.stdout, id) {
 			t.Errorf("list does not mention run %s:\n%s", id, l.stdout)
 		}
+	}
+}
+
+// TestCLIRecordsWhichModelActuallyRan covers what the page can say about the
+// model, which is more than the label column knows.
+//
+// `--model` is optional, so runs.agent_model is empty on every run that did not
+// pass it -- and an empty label used to render as nothing at all, leaving a
+// reader to choose between "no model was requested", "the CLI's default was
+// used" and "nobody recorded it". The stream is the only record that answers
+// it, and this is the level at which "the model on the page is the model the
+// stream named" can be observed at all.
+//
+// The default agent is driven rather than the mock, and that is not incidental:
+// the mock synthesizes its own stream and names the model it was told to use, so
+// it can never answer this question. Only the real agent path parses a stream a
+// fixture wrote.
+func TestCLIRecordsWhichModelActuallyRan(t *testing.T) {
+	work := t.TempDir()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	// Only this fixture emits a stream that names a model.
+	naming := filepath.Join(agents, "chain.sh")
+	silent := filepath.Join(agents, "good.sh")
+
+	run := func(name, bin string, extra ...string) payload {
+		t.Helper()
+		report := filepath.Join(work, name+".html")
+		args := append([]string{"run",
+			"--dataset", ds,
+			"--bin", bin,
+			"--name", name,
+			"--db", filepath.Join(work, "runs.db"),
+			"--work-root", filepath.Join(work, "work-"+name),
+			"--report", report,
+		}, extra...)
+		r := runCLI(t, args...)
+		if r.exitCode != 0 {
+			t.Fatalf("%s run exited %d\nstdout:\n%s\nstderr:\n%s", name, r.exitCode, r.stdout, r.stderr)
+		}
+		return payloadFromHTML(t, report)
+	}
+
+	// The ordinary case, and the one the label cannot describe: nobody passed
+	// --model, the CLI used its own default, and only the stream says which.
+	def := run("default", naming)
+	if def.Run.Model == nil {
+		t.Fatal("the report has no model view, so the page cannot state one")
+	}
+	if def.Run.Model.Text != "default (the CLI chose it): stand-in" {
+		t.Errorf("model text = %q, want the model the stream named", def.Run.Model.Text)
+	}
+	if def.Run.AgentModel != "" {
+		t.Errorf("agent_model = %q, want the empty label this is here to make readable", def.Run.AgentModel)
+	}
+	if len(def.Tasks) != 1 || def.Tasks[0].Model != "stand-in" {
+		t.Errorf("the cell should name its own model, got %+v", def.Tasks)
+	}
+
+	// Asked for the model that answered. The stream's name is not a difference,
+	// and the page must not imply one.
+	asked := run("asked", naming, "--model", "stand-in")
+	if asked.Run.Model.Substitute {
+		t.Errorf("the run got what it asked for: %q", asked.Run.Model.Text)
+	}
+	if asked.Run.Model.Text != "stand-in" {
+		t.Errorf("model text = %q, want the requested model once", asked.Run.Model.Text)
+	}
+
+	// Asked for something else and served this. Every number on the page
+	// measures a model the run did not choose, and this is the only place that
+	// can say so.
+	other := run("other", naming, "--model", "some-other-model")
+	if !other.Run.Model.Substitute {
+		t.Fatalf("a run served a model other than the one it asked for: %q", other.Run.Model.Text)
+	}
+	if !strings.Contains(other.Run.Model.Text, "some-other-model") ||
+		!strings.Contains(other.Run.Model.Text, "stand-in") {
+		t.Errorf("the substitution should name both models, got %q", other.Run.Model.Text)
+	}
+
+	// Nothing named a model and nothing was asked for. The absence is stated
+	// rather than left as a gap where the chip should be.
+	quiet := run("quiet", silent)
+	if quiet.Run.Model.Text != "not recorded" {
+		t.Errorf("model text = %q, want the absence stated", quiet.Run.Model.Text)
+	}
+	if quiet.Run.Model.Substitute {
+		t.Error("nothing was asked for, so nothing could have been substituted")
+	}
+	if len(quiet.Tasks) != 1 || quiet.Tasks[0].Model != "not named by the stream" {
+		t.Errorf("a cell whose stream named nothing must say so: %+v", quiet.Tasks)
 	}
 }
 

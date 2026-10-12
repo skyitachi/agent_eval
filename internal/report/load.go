@@ -102,7 +102,8 @@ func LoadComparison(ctx context.Context, st *store.Store, leftID, rightID string
 	data := build(rightRun, right, opts)
 	data.Title = fmt.Sprintf("%s vs %s", label(leftRun), label(rightRun))
 	data.Compare = compare(leftRun, left, rightRun, right, opts)
-	data.Warnings = append(data.Warnings, comparisonWarnings(leftRun, rightRun)...)
+	data.Warnings = append(data.Warnings,
+		comparisonWarnings(leftRun, rightRun, observedModels(left), observedModels(right))...)
 	return data, nil
 }
 
@@ -189,18 +190,118 @@ func build(run store.Run, attempts []store.Attempt, opts Options) *Data {
 		Version:   DataVersion,
 		Generated: opts.GeneratedAt.UTC().Format(time.RFC3339),
 		Title:     runTitle(run),
-		Run:       runInfo(run, summary),
+		Run:       runInfo(run, attempts, summary),
 		Counts:    count(summary),
 	}
 	data.Metrics = metrics(summary)
 	data.Breakdowns = breakdowns(attempts, summary)
 	if !opts.NoTaskDetail {
-		data.Tasks = tasks(attempts, run.AgentKind, opts)
+		data.Tasks = tasks(attempts, run.AgentKind, run.AgentModel, opts)
 		data.Warnings = append(data.Warnings, fit(data, opts)...)
 	} else {
 		data.Warnings = append(data.Warnings, "per-task detail was omitted on request")
 	}
 	return data
+}
+
+// modelView states which model ran, in the four states the record can be in.
+//
+// The hard case is the third: no --model was passed, so the CLI used its own
+// default, and the stream is the only place that says which one that was. The
+// fourth state is the one a reader has to act on -- a model was asked for and a
+// different one did the work -- and it is decided by trace.SameModel rather
+// than by string equality, so that the alias the CLI resolves (`sonnet` to
+// `claude-sonnet-4-5-20250929`) does not read as a substitution.
+func modelView(declared string, observed []string) *ModelInfo {
+	m := &ModelInfo{Declared: strings.TrimSpace(declared), Observed: observed}
+	switch {
+	case len(observed) == 0 && m.Declared == "":
+		m.Text = "not recorded"
+	case len(observed) == 0:
+		// The command line is a claim about intent. Saying only "sonnet" here
+		// would present it as a fact about what ran.
+		m.Text = m.Declared + " (the stream named no model)"
+	case m.Declared == "":
+		// The ordinary case for a real run: no --model was passed, so the CLI
+		// used its default, and the stream is the only place that says which.
+		m.Text = "default (the CLI chose it): " + strings.Join(observed, ", ")
+	default:
+		for _, name := range observed {
+			if !trace.SameModel(m.Declared, name) {
+				m.Substitute = true
+				break
+			}
+		}
+		if m.Substitute {
+			m.Text = fmt.Sprintf("%s, but the stream billed %s", m.Declared, strings.Join(observed, ", "))
+		} else {
+			m.Text = m.Declared
+			// An alias resolves to a longer name, and naming both is what lets
+			// a reader see that the run got what it asked for.
+			if len(observed) == 1 && !strings.EqualFold(observed[0], m.Declared) {
+				m.Text = m.Declared + " (" + observed[0] + ")"
+			}
+		}
+	}
+	return m
+}
+
+// cellModel states which model ran for one cell.
+//
+// The names come first and the caveat second, because a run is not necessarily
+// one model: a fallback mid-run is served by one cell's stream, and the run
+// header can only say that it happened somewhere. Naming the cell is how a
+// reader finds which one.
+func cellModel(declared string, observed []string) string {
+	if len(observed) == 0 {
+		// Set on a cell whose trace names none, which is the ordinary case for
+		// a fixture that emits no stream. The row says so instead of vanishing,
+		// because an absent row reads as "there was nothing to say".
+		return "not named by the stream"
+	}
+	line := strings.Join(observed, ", ")
+	if strings.TrimSpace(declared) == "" {
+		return line
+	}
+	for _, name := range observed {
+		if !trace.SameModel(declared, name) {
+			return fmt.Sprintf("%s (asked for %s)", line, strings.TrimSpace(declared))
+		}
+	}
+	return line
+}
+
+// observedModels collects what the streams named across a run's attempts.
+//
+// Every cell is consulted, not the first one that answers: a run whose model
+// changed partway -- a fallback, a gateway substituting -- is exactly the case
+// this exists to make visible, and taking one cell's word for it would hide it.
+func observedModels(attempts []store.Attempt) []string {
+	seen := map[string]bool{}
+	for _, a := range attempts {
+		if len(a.Trace) == 0 {
+			continue
+		}
+		var tr trace.Trace
+		if err := json.Unmarshal(a.Trace, &tr); err != nil {
+			// A trace that will not decode is a fact about the record, not a
+			// reason to take the whole report down; the other cells still get
+			// to answer.
+			continue
+		}
+		for _, name := range tr.Models() {
+			seen[name] = true
+		}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func runTitle(run store.Run) string {
@@ -224,7 +325,7 @@ func sweepTitle(att *attrib.Attribution) string {
 	return fmt.Sprintf("%s: %d levels of %s", name, len(att.Levels), att.Axis)
 }
 
-func runInfo(run store.Run, s runner.Summary) RunInfo {
+func runInfo(run store.Run, attempts []store.Attempt, s runner.Summary) RunInfo {
 	info := RunInfo{
 		ID:          run.ID,
 		Name:        run.Name,
@@ -248,6 +349,11 @@ func runInfo(run store.Run, s runner.Summary) RunInfo {
 		ToolVersion: run.ToolVersion,
 		Skills:      skillView(run),
 		Summary:     s,
+		// Two sources, and the page needs both: the label says what was asked
+		// for, the streams say what answered. The view states which of the two
+		// it had, so a run with no --model is not rendered as a run whose model
+		// nobody wrote down.
+		Model: modelView(run.AgentModel, observedModels(attempts)),
 		// Taken straight off the row. Nothing on an attempt says which cells
 		// shared a workspace, so a run whose flag was lost would be rendered as
 		// a set of independent samples -- the one reading that is certainly
@@ -528,7 +634,7 @@ func stopReasons(attempts []store.Attempt) Breakdown {
 // tasks projects the cells. runAgent is the agent the run itself drove, which
 // the baseline card needs in order to say whether the recording it shows was
 // made by the same one.
-func tasks(attempts []store.Attempt, runAgent string, opts Options) []Task {
+func tasks(attempts []store.Attempt, runAgent, declaredModel string, opts Options) []Task {
 	out := make([]Task, 0, len(attempts))
 	for _, a := range attempts {
 		t := Task{
@@ -571,13 +677,16 @@ func tasks(attempts []store.Attempt, runAgent string, opts Options) []Task {
 				Error: g.Error, Details: g.Details,
 			})
 		}
+		var named []string
 		if len(a.Trace) > 0 {
 			var tr trace.Trace
 			if err := json.Unmarshal(a.Trace, &tr); err == nil {
 				t.Tools = toolCalls(tr.ToolCalls, opts.MaxToolCallsPerTask, opts.MaxFieldBytes)
 				t.Events = events(tr.Events, opts.MaxEventsPerTask, opts.MaxFieldBytes)
+				named = tr.Models()
 			}
 		}
+		t.Model = cellModel(declaredModel, named)
 		out = append(out, t)
 	}
 	// Failures first, then by id: the reader's first question is always what
@@ -926,7 +1035,10 @@ func compare(leftRun store.Run, left []store.Attempt,
 // columns: it lives in plugin_dirs plus the isolation flags that decide whether
 // those directories survive, so a pair of runs that differ only in their skills
 // used to compare as identical and the page had no way to say otherwise.
-func comparisonWarnings(left, right store.Run) []string {
+//
+// seenLeft and seenRight are what the two runs' streams named, which is not the
+// same claim as the model columns: those hold what each run asked for.
+func comparisonWarnings(left, right store.Run, seenLeft, seenRight []string) []string {
 	var differing []string
 	if !sameAgent(left.AgentKind, right.AgentKind) {
 		differing = append(differing, fmt.Sprintf(
@@ -935,6 +1047,19 @@ func comparisonWarnings(left, right store.Run) []string {
 	if left.AgentModel != right.AgentModel {
 		differing = append(differing, fmt.Sprintf(
 			"the model (%s vs %s)", orUnset(left.AgentModel), orUnset(right.AgentModel)))
+	} else if len(seenLeft) > 0 && len(seenRight) > 0 && !sameModels(seenLeft, seenRight) {
+		// The declared models agree and the runs were still served differently,
+		// which the columns above cannot show -- including when both declared
+		// nothing, which is the ordinary case for a run that lets the CLI pick.
+		//
+		// Checked only when the declarations agree: when they do not, the
+		// sentence above is already about the model, and two sentences about
+		// one column is how both stop being read. A side whose stream named
+		// nothing is silent rather than different, because an unnamed model is
+		// a gap in the record and not a second model.
+		differing = append(differing, fmt.Sprintf(
+			"which model served the requests (%s vs %s)",
+			strings.Join(seenLeft, ", "), strings.Join(seenRight, ", ")))
 	}
 	if left.AgentBin != right.AgentBin {
 		differing = append(differing, fmt.Sprintf(
@@ -983,6 +1108,26 @@ func comparisonWarnings(left, right store.Run) []string {
 		out = append(out, "the two runs did not run the same dataset content, "+
 			"so the cells paired below are different questions and their verdicts do not compare")
 	}
+	// One side's stream named a model and the other's named none, with neither
+	// run having asked for one. The label column is empty on both -- which is
+	// the ordinary case, because a run only fills it by passing --model -- so
+	// the page has nothing to say about either run's model and a reader fills
+	// the gap with "they were the same". Naming the silent side is what the
+	// skills arm below does, for the same reason: the wrong guess a reader
+	// makes about silence is that the silent run had nothing to declare.
+	//
+	// Restricted to the pair that asked for nothing. When a model was declared
+	// on both sides, that declaration already answers the question and this
+	// would be a second sentence about the same column.
+	if left.AgentModel == "" && right.AgentModel == "" && (len(seenLeft) == 0) != (len(seenRight) == 0) {
+		which := label(right)
+		if len(seenRight) != 0 {
+			which = label(left)
+		}
+		out = append(out, fmt.Sprintf(
+			"run %s named no model in its stream, so whether the two runs were served "+
+				"by the same model is unknown", which))
+	}
 	if lKnown != rKnown {
 		// Only one side can answer the skills question, so the comparison cannot
 		// answer it either. Which side is named: "one of these runs" would leave
@@ -997,6 +1142,24 @@ func comparisonWarnings(left, right store.Run) []string {
 				"so whether the two runs loaded the same skills is unknown", which))
 	}
 	return out
+}
+
+// sameModels reports whether two runs were served the same model.
+//
+// trace.SameModel rather than string equality: the two sides are read from two
+// separate streams, and nothing makes those spell a model the same way. An
+// alias on one side and its resolved name on the other is the same model, and
+// calling it a difference would put a false warning on an ordinary pair.
+func sameModels(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !trace.SameModel(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func orUnset(s string) string {

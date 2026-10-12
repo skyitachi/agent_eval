@@ -219,6 +219,26 @@
     return raw(tpl`<span class="scorebar"><span class="track ${cls}"><i style="width:${w}%"></i></span><span class="num">${num(t.score, 3)}</span></span>`);
   }
 
+  /* How many tool calls the cell made, with a badge on the count when some of
+   * them failed.
+   *
+   * Both halves are markup, so the cell is built as one fragment and handed
+   * over as one value. Adding a raw() fragment to a plain string stringifies
+   * it back to its own source, and a template escapes whatever it is given, so
+   * the form this replaced printed the badge as text: the Tools column read
+   * `6<span class="v fail" title="2 tool error(s)">!</span>`, markup on screen
+   * beside eleven columns that were fine. Nothing else caught it -- the file,
+   * the payload and the exit code were all correct, and "[object " (the
+   * stringified-node mistake this file already guards against) is not what
+   * this one prints. */
+  function toolCell(t) {
+    if (!t.tool_calls) return '-';
+    var badge = t.tool_errors
+      ? raw(tpl`<span class="v fail" title="${t.tool_errors} tool error(s)">!</span>`)
+      : '';
+    return raw(tpl`${int(t.tool_calls)}${badge}`);
+  }
+
   function breakdownClass(label) {
     if (/pass|fixed|completed/i.test(label)) return 'pass';
     if (/fail|error|timeout|regress/i.test(label)) return 'fail';
@@ -258,7 +278,16 @@
     }
     if (r.dataset_hash) chips.push(raw(tpl`<span class="chip">revision <b class="mono-sm">${r.dataset_hash.slice(0, 18)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">agent <b>${r.agent_kind || '-'}</b></span>`));
-    if (r.agent_model) chips.push(raw(tpl`<span class="chip">model <b>${r.agent_model}</b></span>`));
+    /* The model chip is never omitted, which is a change from rendering it only
+     * when the label was set. The label is what the command line asked for, so
+     * it is empty on every run that did not pass --model -- and drawing nothing
+     * then left the reader to choose between "no model was requested", "the
+     * CLI's default was used" and "nobody recorded it", three facts that look
+     * identical on a page. model.text says which of them it is, and it is
+     * written on the server so the browser is not re-deciding where the warning
+     * belongs. */
+    var modelCls = r.model && r.model.substitute ? ' mode-alert' : '';
+    chips.push(raw(tpl`<span class="chip${modelCls}">model <b>${r.model ? r.model.text : 'not recorded'}</b></span>`));
     chips.push(raw(tpl`<span class="chip">backend <b>${r.backend || '-'}</b></span>`));
     /* Skills are always shown, including when nothing is known about them.
      * The skill set is not one of the labels above -- it is the plugin
@@ -541,8 +570,13 @@
     frag.appendChild(filterBar());
 
     var head = COLUMNS.map(function (c) {
+      /* Wrapped, because the header is built by one template and this fragment
+       * is interpolated into it: an unwrapped tpl() result is a plain string,
+       * so the arrow was escaped a second time and the sorted column read
+       * `Task <span class="arrow">▲</span>`. Nothing shows until a reader
+       * clicks a header to sort, which is why it went unnoticed. */
       var arrow = '';
-      if (S.sortKey === c.key) arrow = tpl`<span class="arrow">${S.sortDir > 0 ? '▲' : '▼'}</span>`;
+      if (S.sortKey === c.key) arrow = raw(tpl`<span class="arrow">${S.sortDir > 0 ? '▲' : '▼'}</span>`);
       return raw(tpl`<th class="${c.num ? 'num' : ''}${c.sortable ? '' : ' nosort'}" data-key="${c.sortable ? c.key : ''}">${c.label} ${arrow}</th>`);
     });
 
@@ -562,7 +596,7 @@
           <td class="num">${t.cost_usd ? money(t.cost_usd) : raw('<span class="muted">-</span>')}</td>
           <td class="num">${t.total_tokens ? tokens(t.total_tokens) : raw('<span class="muted">-</span>')}</td>
           <td class="num">${int(t.turns)}</td>
-          <td class="num">${t.tool_calls ? int(t.tool_calls) + (t.tool_errors ? raw(tpl`<span class="v fail" title="${t.tool_errors} tool error(s)">!</span>`) : '') : '-'}</td>
+          <td class="num">${toolCell(t)}</td>
           <td class="mono-sm">${t.stop_reason || '-'}</td>
           <td>${detail}</td>
         </tr>`);
@@ -753,6 +787,7 @@
         ${kv([
           ['status', t.status + (t.graded ? (t.passed ? ' · passed' : ' · failed') : ' · nothing to score against')],
           ['stop reason', t.stop_reason],
+          ['model', t.model],
           ['score', t.graded ? num(t.score, 4) + ' / threshold ' + num(t.threshold, 2) : ''],
           ['duration', dur(t.duration_ms)],
           ['cost', money(t.cost_usd)],

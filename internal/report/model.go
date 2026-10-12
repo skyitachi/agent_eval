@@ -172,9 +172,42 @@ type RunInfo struct {
 	// claims and only one of them is knowledge.
 	Skills *Skills `json:"skills,omitempty"`
 
+	// Model is which model the agent used, as far as the record goes. It is
+	// never nil: a run whose model is unknown has to say so, because a header
+	// that omits the chip is read as "not worth mentioning" rather than as "not
+	// known".
+	Model *ModelInfo `json:"model,omitempty"`
+
 	// Summary is the runner's own arithmetic, borrowed so that the CLI's
 	// printed totals and the page's totals cannot disagree.
 	Summary runner.Summary `json:"summary"`
+}
+
+// ModelInfo is which model a run's agent used, and the page needs it spelled
+// out because the label column cannot carry the whole claim.
+//
+// runs.agent_model holds what the command line asked for, so it is empty on
+// every run that did not pass --model -- and that is not a run whose model is
+// unknown, because the stream names the model that answered. Rendering nothing
+// in that case left a reader guessing between three very different facts: no
+// model was requested, the CLI's default was used, or nobody recorded it. The
+// label is also not the last word even when it is set: a fallback model, or a
+// gateway answering with something else, is a real thing that silently changes
+// what every number on the page measures.
+type ModelInfo struct {
+	// Declared is the model the run was told to use. Empty means none was asked
+	// for, which is ordinary: the CLI then picks its own default.
+	Declared string `json:"declared,omitempty"`
+	// Observed is what the streams report as having served the run, sorted.
+	// Empty means no cell's stream named a model.
+	Observed []string `json:"observed,omitempty"`
+	// Substitute is true when a model was asked for and a different one did the
+	// work, which is the one state here that a reader has to act on.
+	Substitute bool `json:"substitute,omitempty"`
+	// Text is the line the page shows, written here for the same reason
+	// Skills.Text is: which of these combinations deserves a warning is a
+	// judgement, and the browser should not be re-deriving it.
+	Text string `json:"text"`
 }
 
 // Skills is the part of a run's agent configuration that its labels cannot
@@ -275,6 +308,13 @@ type Task struct {
 	Turns      int `json:"turns"`
 	ToolCalls  int `json:"tool_calls"`
 	ToolErrors int `json:"tool_errors"`
+
+	// Model is which model this cell's own stream says served it, or why that
+	// is not known. It is per cell rather than only per run because a run is
+	// not necessarily one model: a fallback mid-run, or a subagent on a smaller
+	// model, shows up on one cell's stream and nowhere else. Always set, for
+	// the same reason as RunInfo.Model.
+	Model string `json:"model"`
 
 	// Baseline is the comparison the runner resolved at run time, so the page
 	// needs no access to the dataset.
