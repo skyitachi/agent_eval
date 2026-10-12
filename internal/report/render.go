@@ -41,6 +41,9 @@ const (
 	ModeRun     Mode = "run"
 	ModeIndex   Mode = "index"
 	ModeCompare Mode = "compare"
+	// ModeSweep renders an attribution: one axis varied, one control, and the
+	// paired differences the levels produced.
+	ModeSweep Mode = "sweep"
 )
 
 // NavLink is one header navigation entry.
@@ -119,6 +122,14 @@ func RenderComparison(w io.Writer, data *Data, opts RenderOptions) error {
 	return render(w, ModeCompare, data, data.Title, opts)
 }
 
+// RenderSweep writes a factor-sweep attribution.
+func RenderSweep(w io.Writer, data *Data, opts RenderOptions) error {
+	if data == nil || data.Sweep == nil {
+		return fmt.Errorf("report: sweep payload is missing")
+	}
+	return render(w, ModeSweep, data, data.Title, opts)
+}
+
 // RenderIndex writes the run listing.
 func RenderIndex(w io.Writer, idx *Index, opts RenderOptions) error {
 	if idx == nil {
@@ -137,6 +148,12 @@ func RenderRunFile(path string, data *Data, opts RenderOptions) error {
 func RenderComparisonFile(path string, data *Data, opts RenderOptions) error {
 	opts.Standalone = true
 	return writeFile(path, func(w io.Writer) error { return RenderComparison(w, data, opts) })
+}
+
+// RenderSweepFile writes a standalone sweep attribution to disk.
+func RenderSweepFile(path string, data *Data, opts RenderOptions) error {
+	opts.Standalone = true
+	return writeFile(path, func(w io.Writer) error { return RenderSweep(w, data, opts) })
 }
 
 // RenderIndexFile writes a standalone index to disk.

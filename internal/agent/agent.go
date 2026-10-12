@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -83,6 +84,16 @@ type Spec struct {
 	Settings string `json:"settings,omitempty" yaml:"settings,omitempty"`
 	// MCPServers maps to --mcp-config entries (paths or JSON strings).
 	MCPServers []string `json:"mcp_servers,omitempty" yaml:"mcp_servers,omitempty"`
+
+	// PluginDirs maps to --plugin-dir: directories of skills the agent may
+	// load for this attempt. This is the hook the "skill" factor varies; it is
+	// deliberately a list so that "no skills" is expressible as the empty list
+	// rather than as a flag that has to be invented.
+	//
+	// Note that --plugin-dir coexists with --bare, but does NOT survive
+	// --disable-slash-commands: that flag removes every skill from the context,
+	// including these. A sweep over skills must therefore clear it.
+	PluginDirs []string `json:"plugin_dirs,omitempty" yaml:"plugin_dirs,omitempty"`
 
 	// Isolation, when nil, defaults to DefaultIsolation(). It is a pointer so that
 	// an all-false configuration (deliberately accepting host configuration) is
@@ -181,11 +192,14 @@ func (a *Attempt) FinalText() string {
 }
 
 // Usage returns token accounting, zero when no trace was produced.
+//
+// This is the whole attempt, not one call: Trace.Usage prefers the CLI's
+// cumulative per-model totals over the single-call usage on a result event.
 func (a *Attempt) Usage() trace.Usage {
 	if a.Trace == nil {
 		return trace.Usage{}
 	}
-	return a.Trace.Result.Usage
+	return a.Trace.Usage()
 }
 
 // CostUSD returns the reported cost.
@@ -206,6 +220,51 @@ type Runner interface {
 	// start the process at all); an agent that ran but failed is reported through
 	// Attempt instead, so that partial results remain gradeable.
 	Run(ctx context.Context, sb sandbox.Sandbox, spec Spec, prompt string) (*Attempt, error)
+}
+
+// ResolveCommand resolves something that may be either a path or a bare command
+// name.
+//
+// A value with no path separator is returned unchanged, because `bin: claude`
+// means "find claude on PATH" and turning it into /dir/claude would break every
+// invocation that does not spell out an absolute path. Anything else is joined
+// with dir when relative.
+//
+// This rule appears in more than one place -- a command-line flag resolved
+// against the caller's directory, and bin inside a matrix document resolved
+// against the document's directory -- and they have to agree.
+func ResolveCommand(dir, p string) string {
+	if strings.TrimSpace(p) == "" || strings.TrimSpace(dir) == "" {
+		return p
+	}
+	if !strings.ContainsRune(p, filepath.Separator) {
+		return p
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(filepath.Join(dir, p))
+}
+
+// ResolveDir resolves a directory path. Unlike an executable there is no PATH
+// to fall back on, so a bare value is always joined with dir rather than left
+// relative to whatever directory the process happens to be in.
+//
+// Getting this wrong is not cosmetic. A plugin directory that silently resolves
+// to nothing loads no skills at all, and a skill sweep then reports that skills
+// make no difference -- the exact false conclusion the sweep's own validation
+// exists to prevent.
+func ResolveDir(dir, p string) string {
+	if strings.TrimSpace(p) == "" {
+		return p
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	if strings.TrimSpace(dir) == "" {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(filepath.Join(dir, p))
 }
 
 // ---------------------------------------------------------------------------

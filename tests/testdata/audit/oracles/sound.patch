@@ -1,7 +1,0 @@
---- a/thing.py
-+++ b/thing.py
-@@ -4,3 +4,3 @@
- def calc(a, b):
-     """Return ``a`` combined with ``b``."""
--    return a + b
-+    return a - b

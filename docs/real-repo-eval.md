@@ -17,23 +17,23 @@
 
 | 能力 | 现状 | 结论 |
 | --- | --- | --- |
-| 真实仓库作为 workspace | `workspace.type: git` + `repo` + `ref` + `subdir`，`internal/sandbox/workspace.go:83` | **可用** |
-| 剥离上游历史防抄答案 | 默认删除克隆来的 `.git` 再重建 baseline（`workspace.go:143`），注释明写「否则 agent 能定位到上游的修复提交并读走答案」 | **已经做对，且是最关键的一条** |
-| 依赖安装不算 agent 的改动 | `setup` 之后自动 re-baseline（`workspace.go:48-57`） | **可用** |
+| 真实仓库作为 workspace | `workspace.type: git` + `repo` + `ref` + `subdir`，`internal/sandbox/workspace.go` 的 `materializeGit` | **可用** |
+| 剥离上游历史防抄答案 | 默认删除克隆来的 `.git` 再重建 baseline（`Materialize` 里的 `os.RemoveAll(root/.git)`），注释明写「否则 agent 能定位到上游的修复提交并读走答案」 | **已经做对，且是最关键的一条** |
+| 依赖安装不算 agent 的改动 | `runSetup` 之后自动 `Rebaseline`（同在 `Materialize` 内） | **可用** |
 | diff 采集 | baseline → `git diff`，含未跟踪文件（`ChangedPaths` 用 `git add -N`） | **可用** |
 | 输出收窄 | `output.paths` / `ignore_paths` | **可用** |
-| 隐藏测试套件 | `pytest.suite` 在评测期才拷进沙箱（`pytest.go:192`），agent 全程看不到 | **可用，等价于 SWE-bench 的 `test_patch`** |
+| 隐藏测试套件 | `pytest.suite` 在评测期才拷进沙箱（`pytest.go` 的 `CopyInto`），agent 全程看不到 | **可用，等价于 SWE-bench 的 `test_patch`** |
 | 保护测试文件 | `patch.forbid_changed_paths` | **可用，但语义见 §4.2** |
 | 规模控制 | `max_diff_lines` / `max_changed_files` / `min_diff_lines` | **可用** |
-| 容器隔离 | docker 后端，agent 在容器内跑，`--pids-limit`、`--memory`、`--cpus` | **可用** |
+| 容器隔离 | `internal/sandbox/docker.go` 写好了 `--pids-limit`、`--memory`、`--cpus`、`--network` | ⚠️ **不可达**：`internal/runner` 硬编码 `backendLocal`，CLI 与数据集都没有选中 docker 的入口。见 §3.1 |
 | 断点续跑 | `--resume` 按 cell key 跳过已完成 | **可用** |
 | **指定跑哪些测试用例** | pytest grader 只有 `paths`（文件级）+ `min_passed`/`max_failed`（计数级） | ❌ **最大缺口** |
 | **"必须由失败转通过"的语义** | 无 | ❌ **缺口** |
 | **"不许回归"的语义** | 无 | ❌ **缺口** |
-| **评测前还原测试文件** | 无（只有事后否决，没有事前还原） | ❌ **缺口** |
+| **评测前还原测试文件** | ✅ 原语已经写好：`sandbox.Baseline.RestorePaths(ctx, globs)`。但它**没有调用方、没有测试、数据集里也没有对应字段** —— 看起来做完了，实际没接上 | ⚠️ **半成品**：比"没有"更危险 |
 | **参考解落位** | 无显式字段，只能塞 `metadata`（引擎从不解释） | ❌ **缺口** |
-| **per-task 环境** | `backend.image` 是 run 级；`BackendConfig` 无 per-task 覆盖 | ❌ **缺口** |
-| **clone / 依赖缓存** | 每个 cell 独立 clone + 独立 setup（`engine.go:686-764`） | ❌ **缺口** |
+| **per-task 环境** | 镜像配置是 `DockerConfig` 的一个字段，无 per-task 覆盖；且 docker 后端整体不可达 | ❌ **缺口** |
+| **clone / 依赖缓存** | 每个 cell 独立 clone + 独立 setup（`internal/runner/runner.go` 每个 cell 调一次 `sandbox.Materialize`） | ❌ **缺口** |
 
 一句话：**链路是通的，判分语义是浅的。**
 
@@ -99,7 +99,7 @@ datasets/<name>/
 
 ### 2.1 `ref` 必须是 commit SHA，不能是分支名
 
-`internal/sandbox/workspace.go:98-116` 对分支/tag 走 `--depth 1 --branch`，对 HEX SHA 走全量克隆
+`internal/sandbox/workspace.go` 的 `materializeGit` 对分支/tag 走 `--depth 1 --branch`，对 HEX SHA 走全量克隆
 再 checkout。**两者都能工作，但只有 SHA 可复现。** 用 `main` 意味着今天和下周跑的不是同一份代码，
 报告之间不可比 —— 而"两次运行可比"正是这套框架的核心承诺。
 
@@ -115,25 +115,44 @@ datasets/<name>/
 
 ## 3. 环境设计
 
-### 3.1 后端必须用 docker
+### 3.1 后端必须是 docker —— 而当前选不出 docker
 
-`local` 后端的能力边界写得很清楚（`sandbox/local.go:34`）：只有独立工作目录和一个受控环境，
+`local` 后端的能力边界写在 `sandbox/local.go` 的包注释里：只有独立工作目录和一个受控环境，
 **没有文件系统与网络边界**。真实仓库评测里这是不可接受的：
 
 - agent 能读到操作者机器上的任何东西，包括那个仓库的另一份克隆；
 - agent 能上网搜到 issue 的修复 PR；
 - `--pids-limit` / `--memory` / `--cpus` 只在 docker 下生效。
 
-### 3.2 网络配置有一个必须先解决的张力
+麻烦在于：`internal/sandbox/docker.go` **已经实现了**上面这一整套（364 行，
+`DockerConfig` 带 `Image` / `Network` / `Memory` / `CPUs` / `PidsLimit` / `User` / `Env`），
+但 `internal/runner` 里 `Backend: backendLocal` 是**写死的**，CLI 没有 `--backend`，
+数据集里也没有对应字段。结果是这份实现**没有任何非测试路径能选中它** —— 它没有集成测试，
+也没有调用方，而 `runner` 的注释却写着容器后端「已被丢弃」。
 
-这是设计里**最现实的障碍**，值得单独说：
+所以这一条是前置工作，而且要先做一个二选一的决定：
 
-- `BackendConfig.Normalize()` 把 docker 的默认 `network` 设为 `"none"`
-  （`engine/backend.go:99-102`），注释写着"hermetic 默认值正是容器后端的全部意义"；
-- 但 `workspace.setup` 是在 sandbox **内部**执行的（`sandbox/workspace.go:159` 的 `sb.Exec`）；
-- 真实仓库的 setup 几乎必然要装依赖。
+- **接上它**：后端做成 run 级可选项，补一条在有 daemon 的机器上真跑的端到端测试；
+- **删掉它**：承认这个 build 只有 local 后端。
 
-于是 `network: none` 和「setup 装依赖」直接冲突。三条出路：
+保留一份谁也调不到的 364 行实现，代价是每个读代码的人都会以为容器隔离已经生效 ——
+比明确地没有更糟。
+
+### 3.2 网络默认值不是 hermetic；而 hermetic 与「setup 装依赖」确实冲突
+
+先纠正一个容易记错的点：`DockerConfig.Network` 的注释写着 `"none"` 是
+「recommended default for hermetic evaluation」，但**代码里没有任何地方设置它** ——
+没有 `Normalize()`，没有别的默认值注入，`DockerConfig` 就是个普通结构体。
+空值意味着不传 `--network`，也就是 docker 自己的默认值：**联网**。
+
+所以现状既不是 hermetic，也谈不上「默认联网」这个有意选择；它只是没有默认值。
+一旦按 §3.1 把 docker 接上，下面这个张力才会真正出现：
+
+- 想把默认值定成 `network: none`（这才叫 hermetic），
+- 但 `workspace.setup` 是在 sandbox **内部**执行的（`sandbox/workspace.go` 的 `runSetup` 调 `sb.Exec`），
+- 而真实仓库的 setup 几乎必然要装依赖。
+
+三条出路：
 
 | 方案 | 做法 | 代价 |
 | --- | --- | --- |
@@ -195,11 +214,17 @@ django 这种仓库，配合 `--concurrency 8`，就是 8 次克隆加 8 次 `pi
 `forbid_changed_paths` 保留给「我想单独测量 agent 是否有越界倾向」的场景。
 
 实现上是评测前对列出的路径执行 `git checkout <baseline_sha> -- <paths>`，
-`Baseline` 结构体里已经存了那个 SHA（`workspace.go:187`），拿得到。
+`Baseline` 结构体里已经存了那个 SHA（`Baseline.SHA`），拿得到。
+
+**这条已经有了一半**：`sandbox.Baseline.RestorePaths(ctx, globs)` 写好了，语义正是上面描述的
+这件事。但它**没有调用方、没有测试，数据集里也没有 `restore_paths` 字段** ——
+所以从外部看它不存在。要完成这一条，缺的是接线：把字段暴露到 `output` 或 grader 配置上、
+在 grading 之前调用、并补上「agent 改了测试但仍然按真实水平判分」的测试。
+注意不要重复实现一遍：这个函数已经在了。
 
 ### 4.3 pytest grader 需要的扩展
 
-现在的 `pytestConfig`（`pytest.go:33-66`）只有计数阈值。计数阈值在真实仓库上很脆弱 ——
+现在的 `pytestConfig`（`pytest.go`）只有计数阈值。计数阈值在真实仓库上很脆弱 ——
 测试总数会随 collector 行为、依赖版本、跳过规则波动，`min_passed: 12` 这种阈值第二年就不成立了。
 
 需要新增的是**用例级的期望**：
@@ -221,7 +246,7 @@ SWE-bench 是在数据集构造期算一次、人工复核后固化下来的，�
 
 ### 4.4 用例级结果需要单独解析
 
-`ParsePytestOutput` 目前只从末尾汇总行抓计数，从 `FAILED`/`ERROR` 行抓失败用例名（`pytest.go:116-176`）。
+`ParsePytestOutput` 目前只从末尾汇总行抓计数，从 `FAILED`/`ERROR` 行抓失败用例名（`pytest.go`）。
 要判定"指定的这 12 个用例是否都通过"，需要拿逐用例的结果 —— 最省事的做法是让 pytest 输出
 JUnit XML（`--junit-xml`）再解析，比正则抓文本稳得多。
 
@@ -310,12 +335,13 @@ JUnit XML（`--junit-xml`）再解析，比正则抓文本稳得多。
 | **P0** | `oracle` 字段 + `aeval verify` 任务自检 | `dataset/spec.go`、`cmd/aeval` | 没有它，`resolve_rate` 无法解释 |
 | **P0** | pytest：用例级 `tests` 列表 + JUnit XML 解析 | `grader/pytest.go` | 计数阈值在真实仓库上不成立 |
 | **P0** | `restore_paths`（评测前还原测试文件） | `grader/context.go` 或 grader 级动作 | 比 `forbid_changed_paths` 更接近业界做法 |
-| **P1** | per-task `image` 覆盖 | `dataset/spec.go`、`engine/backend.go` | 真实仓库需要版本隔离 |
+| **P1** | per-task `image` 覆盖 | `dataset/spec.go`、`internal/sandbox/docker.go` | 真实仓库需要版本隔离 |
+| **P1** | 把 docker 后端接上（或明确删掉） | `internal/runner`、`cmd/aeval` | §3.1：代码已在，但没有 run 路径能选中它 |
 | **P1** | run 级 clone mirror | `sandbox/workspace.go` | 直接决定大规模是否可行 |
 | **P1** | `fail_to_pass` / `pass_to_pass` 显式清单 | `grader/pytest.go` | 分离"做对"与"没弄坏" |
 | **P2** | `infer_expect`（baseline 自动推导期望） | `grader/pytest.go` | 省事但引入 flaky 噪音，仅作备选 |
 | **P2** | flaky 筛选（baseline 连跑 N 次） | `aeval verify` | 数据质量，可先人工 |
-| **P2** | 依赖缓存卷 | `engine/backend.go`（`extra_mounts` 已够） | 能用配置解决，不必改代码 |
+| **P2** | 依赖缓存卷 | `internal/sandbox/docker.go`（`ExtraMounts` 已够） | 能用配置解决，不必改代码 |
 
 P0 三项做完，这条链路才真正算「能用于真实仓库评测」。P1 决定规模上限，P2 是质量优化。
 

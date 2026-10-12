@@ -133,11 +133,6 @@ func (c *Context) diffOptions() sandbox.DiffOptions {
 		opts.Paths = c.Task.Output.Paths
 		opts.IgnorePaths = append(opts.IgnorePaths, c.Task.Output.IgnorePaths...)
 	}
-	// A path that the task resets to its baseline before grading cannot have
-	// contributed anything to the score, so showing it in the diff would invite
-	// exactly the misreading the reset was meant to prevent: "the patch touches
-	// the tests" when the graded state does not.
-	opts.IgnorePaths = append(opts.IgnorePaths, c.Task.RestorePaths...)
 	return opts
 }
 

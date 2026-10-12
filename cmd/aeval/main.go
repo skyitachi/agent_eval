@@ -1,9 +1,23 @@
 // Command aeval runs evaluations and inspects their results.
 //
+// # What it is for
+//
+// The tool answers three questions and refuses to answer a fourth:
+//
+//   - how well did an agent do on a dataset?  (aeval run)
+//   - which of harness, model and skill is responsible for a difference?
+//     (aeval matrix)
+//   - what did a real session cost, so a re-run can be measured against it?
+//     (aeval collect)
+//
+// It does not answer "is this agent good". That question needs a dataset whose
+// tasks have ground truth and a reader who knows what the numbers are for, and
+// no command can supply either.
+//
 // # Exit codes
 //
 //	0   success
-//	1   the operation failed (bad configuration, a run that aborted, ...)
+//	1   the operation failed (bad dataset, a run that could not be carried out)
 //	2   the command line itself was wrong
 //	130 interrupted
 //
@@ -19,27 +33,24 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
 
 	"github.com/skyitachi/agenteval/internal/agent"
-	"github.com/skyitachi/agenteval/internal/audit"
-	"github.com/skyitachi/agenteval/internal/config"
+	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/dataset"
-	"github.com/skyitachi/agenteval/internal/engine"
-	"github.com/skyitachi/agenteval/internal/grader"
-	"github.com/skyitachi/agenteval/internal/metric"
 	"github.com/skyitachi/agenteval/internal/report"
-	"github.com/skyitachi/agenteval/internal/rlenv"
-	"github.com/skyitachi/agenteval/internal/storage"
-	"github.com/skyitachi/agenteval/internal/web"
+	"github.com/skyitachi/agenteval/internal/runner"
+	"github.com/skyitachi/agenteval/internal/session"
+	"github.com/skyitachi/agenteval/internal/store"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...".
@@ -50,1133 +61,297 @@ const (
 	exitError = 1
 	exitUsage = 2
 	exitCtlC  = 130
+
+	// defaultDB is the database a command uses when --db is not given. One file
+	// in the working directory rather than a directory under $HOME, because a
+	// run's results belong next to the dataset they came from.
+	defaultDB = "aeval.db"
 )
 
-func main() { os.Exit(run(os.Args[1:])) }
+func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 
-func run(args []string) int {
+func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		usage(os.Stderr)
+		usage(stderr)
 		return exitUsage
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
-	case "run":
-		return cmdRun(rest)
-	case "audit":
-		return cmdAudit(rest)
+	case "collect":
+		return cmdCollect(rest, stdout, stderr)
 	case "validate":
-		return cmdValidate(rest)
-	case "list", "ls":
-		return cmdList(rest)
+		return cmdValidate(rest, stdout, stderr)
+	case "run":
+		return cmdRun(rest, stdout, stderr)
+	case "matrix":
+		return cmdMatrix(rest, stdout, stderr)
 	case "report":
-		return cmdReport(rest)
-	case "compare":
-		return cmdCompare(rest)
-	case "serve":
-		return cmdServe(rest)
-	case "registry", "metrics":
-		return cmdRegistry(rest)
+		return cmdReport(rest, stdout, stderr)
+	case "list", "ls":
+		return cmdList(rest, stdout, stderr)
 	case "version", "--version", "-v":
-		return cmdVersion()
+		return cmdVersion(rest, stdout, stderr)
 	case "help", "--help", "-h":
-		usage(os.Stdout)
+		usage(stdout)
 		return exitOK
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", cmd)
-		usage(os.Stderr)
+		fmt.Fprintf(stderr, "aeval: unknown command %q\n\n", cmd)
+		usage(stderr)
 		return exitUsage
 	}
 }
 
-func usage(w *os.File) {
-	fmt.Fprint(w, `aeval evaluates agent runs against a dataset and reports the results.
+func usage(w io.Writer) {
+	fmt.Fprint(w, `aeval evaluates an agent harness, a model and a skill, one axis at a time.
 
-Usage:
-  aeval <command> [flags]
+usage: aeval <command> [flags]
 
-Commands:
-  run        Evaluate a dataset and record the results
-  audit      Check whether a dataset's tasks are solvable, necessary and stable
-  validate   Check a dataset and a configuration file without running anything
-  list       List recorded runs
-  report     Write an HTML report for a recorded run
-  compare    Write an HTML comparison of two recorded runs
-  serve      Serve recorded runs over HTTP, with a browsable report UI
-  registry   List the registered agents, graders and metrics
-  version    Print build and environment information
+  collect   turn recorded Claude Code sessions into a dataset with baselines
+  validate  check a dataset without running anything
+  run       run a dataset against one agent
+  matrix    sweep one axis, or attribute a sweep that already ran
+  report    render an HTML report, comparison, attribution or run list
+  list      list recorded runs
+  version   print version and schema information
 
-Global flags (accepted by every command):
-  --config <path>    Configuration file (default: aeval.yaml if present)
-  --db <path>        SQLite database of results (default: agenteval.db)
-  --dataset <path>   Dataset directory or dataset.yaml
+Every command accepts --db <path> for the SQLite file (default `+defaultDB+`).
+Run "aeval <command> -h" for the flags of one command.
 
-Run "aeval <command> --help" for the flags of one command.
+Exit codes: 0 success, 1 operation failed, 2 bad command line, 130 interrupted.
+A run in which tasks failed exits 0: that is a measurement, not a malfunction.
 `)
 }
 
 // ---------------------------------------------------------------------------
-// Shared flags
+// Shared plumbing
 // ---------------------------------------------------------------------------
 
+// commonFlags are accepted by every command that opens the database.
 type commonFlags struct {
-	configPath  string
-	dbPath      string
-	datasetPath string
-	verbose     bool
+	db string
 }
 
 func addCommon(fs *flag.FlagSet, c *commonFlags) {
-	fs.StringVar(&c.configPath, "config", "", "configuration file (default: aeval.yaml when present)")
-	fs.StringVar(&c.dbPath, "db", "", "SQLite database of results (default: agenteval.db)")
-	fs.StringVar(&c.datasetPath, "dataset", "", "dataset directory or dataset.yaml")
-	fs.BoolVar(&c.verbose, "verbose", false, "log progress events during a run")
+	fs.StringVar(&c.db, "db", defaultDB, "SQLite database holding runs and results")
 }
 
-// resolve loads the configuration file and applies the flag overrides.
-//
-// Flags lose to nothing and win over the file: a value typed on the command line
-// is always the most recent intent.
-func resolve(c *commonFlags) (*config.Config, error) {
-	file, err := config.Load(c.configPath)
-	if err != nil {
-		return nil, err
+func openStore(c *commonFlags) (*store.Store, error) {
+	if strings.TrimSpace(c.db) == "" {
+		return nil, errors.New("aeval: --db may not be empty")
 	}
-	if c.datasetPath != "" {
-		file.Dataset = c.datasetPath
-	}
-	if c.dbPath != "" {
-		file.Database = c.dbPath
-	}
-	cfg, err := file.Resolve()
-	if err != nil {
-		return nil, err
-	}
-	return cfg, nil
+	return store.Open(c.db)
 }
 
-func resolveWithDataset(c *commonFlags) (*config.Config, error) {
-	cfg, err := resolve(c)
-	if err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(cfg.DatasetPath) == "" {
-		return nil, errors.New("no dataset: pass --dataset or set `dataset:` in the configuration file")
-	}
-	return cfg, nil
-}
-
-func openStore(cfg *config.Config) (*storage.Store, error) {
-	store, err := storage.Open(cfg.DatabasePath)
-	if err != nil {
-		return nil, fmt.Errorf("open database %s: %w", cfg.DatabasePath, err)
-	}
-	return store, nil
-}
-
-// signalContext cancels on SIGINT/SIGTERM.
-//
-// The engine persists every cell as it finishes, so an interrupted run keeps the
-// work already paid for and can be continued with --resume.
+// signalContext cancels on SIGINT/SIGTERM. A cancelled run records what it
+// managed to measure and marks itself interrupted; it does not lose the file.
 func signalContext() (context.Context, context.CancelFunc) {
 	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
-func fail(format string, args ...any) int {
-	fmt.Fprintf(os.Stderr, "aeval: "+format+"\n", args...)
+func fail(stderr io.Writer, format string, args ...any) int {
+	fmt.Fprintf(stderr, "aeval: "+format+"\n", args...)
 	return exitError
 }
 
-// ---------------------------------------------------------------------------
-// run
-// ---------------------------------------------------------------------------
+// usageFail reports a bad command line. It exists so that "you typed it wrong"
+// and "it did not work" stay distinguishable in a script.
+func usageFail(stderr io.Writer, format string, args ...any) int {
+	fmt.Fprintf(stderr, "aeval: "+format+"\n", args...)
+	return exitUsage
+}
 
-func cmdRun(args []string) int {
-	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	var (
-		c          commonFlags
-		name       string
-		runID      string
-		samples    int
-		workers    int
-		threshold  float64
-		retries    int
-		resume     bool
-		failFast   bool
-		workRoot   string
-		keep       bool
-		reportPath string
-		backend    string
-		image      string
-		model      string
-		agentKind  string
-		agentBin   string
-		concurrent int
-		mode       string
-	)
-	addCommon(fs, &c)
-	fs.StringVar(&name, "name", "", "human label for this run")
-	fs.StringVar(&runID, "run-id", "", "reuse an explicit run id (implied by --resume)")
-	fs.IntVar(&samples, "samples", 0, "samples per task, k for pass@k (default 1)")
-	fs.IntVar(&workers, "concurrency", 0, "cells executed at once (default 1)")
-	fs.Float64Var(&threshold, "threshold", 0, "score required to pass a task (default 1.0)")
-	fs.IntVar(&retries, "retries", 0, "extra attempts when the agent cannot be started")
-	fs.BoolVar(&resume, "resume", false, "skip cells already recorded as completed")
-	fs.BoolVar(&failFast, "fail-fast", false, "stop as soon as one cell fails hard")
-	fs.StringVar(&workRoot, "work-root", "", "directory for workspaces and artifacts (default: a temp dir)")
-	fs.BoolVar(&keep, "keep-workspaces", false, "leave each task's workspace on disk for inspection")
-	fs.StringVar(&reportPath, "report", "", "write an HTML report to this path when the run finishes")
-	fs.StringVar(&backend, "backend", "", "sandbox backend: local or docker")
-	fs.StringVar(&image, "image", "", "container image (docker backend)")
-	fs.StringVar(&model, "model", "", "model name passed to the agent CLI")
-	fs.StringVar(&agentKind, "agent", "", "agent implementation (default claude_code)")
-	fs.StringVar(&agentBin, "bin", "", "agent executable (default: claude on PATH; with --agent mock, the command to run)")
-	fs.IntVar(&concurrent, "jobs", 0, "alias for --concurrency")
-	fs.StringVar(&mode, "mode", "", "what each cell measures: agent, oracle (apply the reference solution) or baseline (grade the untouched workspace)")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: aeval run [flags]"); fs.PrintDefaults() }
-
-	_ = fs.Parse(args)
-	// Which flags were actually typed, as opposed to left at their zero value.
-	// Inferring "was it given?" from the value cannot tell `--threshold 0` from
-	// no --threshold at all, and it forces a sentinel default (-1 for retries)
-	// that then shows up in --help as two contradictory defaults.
-	given := givenFlags(fs)
-	if given["jobs"] {
-		workers = concurrent
-	}
-	// A flag that names a location resolves against *this* shell's directory.
-	// The agent, by contrast, runs inside a sandbox whose working directory is
-	// the task workspace, so a relative --bin would be looked for in the wrong
-	// tree and reported as an opaque agent_error with no hint about the cause.
-	// A bare command name is not a location and is left alone: "claude" means
-	// "on PATH", while "./agent.sh" and "scripts/agent.sh" mean a file.
-	if given["bin"] {
-		agentBin = absFlagPath(agentBin)
-	}
-	if given["work-root"] {
-		workRoot = absFlagPath(workRoot)
-	}
-	if fs.NArg() > 0 {
-		// A positional argument is almost always a dataset path typed without
-		// the flag; accepting it is friendlier than a usage error.
-		c.datasetPath = fs.Arg(0)
-	}
-
-	cfg, err := resolveWithDataset(&c)
-	if err != nil {
-		return fail("%v", err)
-	}
-
-	ds, err := dataset.Load(cfg.DatasetPath)
-	if err != nil {
-		return fail("load dataset: %v", err)
-	}
-
-	run := cfg.Engine
-	applyRunFlags(&run, runFlags{
-		name: name, runID: runID, samples: samples, workers: workers,
-		threshold: threshold, retries: retries, resume: resume, failFast: failFast,
-		workRoot: workRoot, keep: keep,
-		backend: backend, image: image, model: model, agentKind: agentKind, agentBin: agentBin,
-		mode: mode,
-	}, given)
-	run.ToolVersion = version
-
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
-	run.Store = store
-
-	ctx, stop := signalContext()
-	defer stop()
-
-	if c.verbose {
-		run.OnEvent = progressLogger()
-	}
-
-	eng, err := engine.New(run)
-	if err != nil {
-		return fail("%v", err)
-	}
-
-	fmt.Fprintf(os.Stderr, "%s\n", ds.Summary())
-	fmt.Fprintf(os.Stderr, "run %s · agent=%s model=%s backend=%s k=%d concurrency=%d\n",
-		eng.Config().RunID, eng.Config().Agent.Kind, orDefault(eng.Config().Agent.Model, "(default)"),
-		eng.Config().Backend.Kind, eng.Config().SamplesPerTask, eng.Config().Concurrency)
-	if m := eng.Config().Mode; m != engine.RunModeAgent {
-		// Say it out loud. An oracle or baseline run stores a result with the
-		// same shape as an agent run, and the moment to stop a misreading is
-		// before the numbers are printed, not in the report afterwards.
-		fmt.Fprintf(os.Stderr, "  mode %s: no agent will run; the numbers below are not a model's score\n", m)
-	}
-	started := time.Now()
-
-	res, runErr := eng.Run(ctx, ds)
-	if res != nil {
-		fmt.Fprint(os.Stdout, res.Summary())
-	}
-	if runErr != nil && res == nil {
-		return fail("run: %v", runErr)
-	}
-
-	// Write the report from the database, not from the in-memory result, so the
-	// command exercises exactly the path `aeval report` uses later.
-	path := reportPath
-	if path == "" && cfg.Report.Dir != "" && res != nil {
-		path = filepath.Join(cfg.Report.Dir, report.FileName(res.RunID))
-	}
-	if path != "" && res != nil {
-		if err := writeRunReport(ctx, store, res.RunID, path, cfg.Report.Options()); err != nil {
-			fmt.Fprintf(os.Stderr, "aeval: report: %v\n", err)
-		} else {
-			fmt.Fprintf(os.Stderr, "report written to %s\n", path)
+// parse runs a FlagSet and reports whether it succeeded, keeping flag's own
+// error output on stderr and mapping it to the usage exit code.
+func parse(fs *flag.FlagSet, args []string, stderr io.Writer) (bool, int) {
+	fs.SetOutput(stderr)
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return false, exitOK
 		}
+		return false, exitUsage
 	}
-
-	if res == nil {
-		return fail("run produced no result")
-	}
-	fmt.Fprintf(os.Stderr, "elapsed %s\n", time.Since(started).Round(time.Millisecond))
-
-	switch res.Status {
-	case storage.StatusCompleted:
-		return exitOK
-	case storage.StatusCanceled:
-		return exitCtlC
-	default:
-		return exitError
-	}
+	return true, exitOK
 }
 
-type runFlags struct {
-	name, runID            string
-	samples, workers       int
-	threshold              float64
-	retries                int
-	resume, failFast, keep bool
-	workRoot               string
-	backend, image, model  string
-	agentKind              string
-	agentBin               string
-	mode                   string
-}
-
-// applyRunFlags overlays command-line values onto the configured run.
+// absFlagPath resolves a path given on the command line against the caller's
+// working directory.
 //
-// A flag is applied when it was *given*, not when its value is non-zero. The
-// distinction matters: a config file is expected to survive a command line that
-// only mentions one option, but `--concurrency 1` on top of a config that says 8
-// is a deliberate request that a "non-zero wins" rule would honour only by luck.
-func applyRunFlags(run *engine.Config, f runFlags, given map[string]bool) {
-	if given["name"] {
-		run.RunName = f.name
-	}
-	if given["run-id"] {
-		run.RunID = f.runID
-	}
-	if given["samples"] {
-		run.SamplesPerTask = f.samples
-	}
-	if given["concurrency"] || given["jobs"] {
-		run.Concurrency = f.workers
-	}
-	if given["threshold"] {
-		run.GraderThreshold = f.threshold
-	}
-	if given["retries"] {
-		run.Retries = f.retries
-	}
-	if given["work-root"] {
-		run.WorkRoot = f.workRoot
-	}
-	if given["backend"] {
-		run.Backend.Kind = engine.BackendKind(f.backend)
-	}
-	if given["image"] {
-		run.Backend.Image = f.image
-	}
-	if given["model"] {
-		run.Agent.Model = f.model
-	}
-	if given["agent"] {
-		run.Agent.Kind = f.agentKind
-	}
-	if given["bin"] {
-		run.Agent.Bin = f.agentBin
-	}
-	if given["mode"] {
-		// The value is validated by engine.New rather than here, so the error a
-		// user sees names the accepted set in the engine's own words instead of
-		// a second list that can drift out of sync with it.
-		run.Mode = engine.RunMode(f.mode)
-	}
-	if f.resume {
-		run.Resume = true
-	}
-	if f.failFast {
-		run.FailFast = true
-	}
-	if f.keep {
-		run.KeepWorkspaces = true
-	}
-}
-
-// givenFlags returns the names of the flags the user actually passed.
-func givenFlags(fs *flag.FlagSet) map[string]bool {
-	given := map[string]bool{}
-	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
-	return given
-}
-
-// absFlagPath makes a path-typed flag absolute against the current directory.
-//
-// A value with no separator is a command name to be found on PATH and is
-// returned untouched, because turning "claude" into "/cwd/claude" would break
-// every ordinary invocation.
+// A value with no separator is left alone: `--bin claude` means "find claude on
+// PATH", and turning it into /cwd/claude would break every invocation that does
+// not spell out an absolute path. The rule itself lives in agent.ResolveCommand,
+// because a matrix document resolves paths the same way against its own
+// directory and the two must not drift.
 func absFlagPath(p string) string {
-	if p == "" || filepath.IsAbs(p) {
+	if p == "" {
 		return p
 	}
-	if !strings.ContainsRune(p, '/') && !strings.ContainsRune(p, filepath.Separator) {
-		return p
-	}
-	abs, err := filepath.Abs(p)
+	wd, err := os.Getwd()
 	if err != nil {
 		return p
 	}
-	return abs
+	return agent.ResolveCommand(wd, p)
 }
 
-// progressLogger prints one line per finished cell.
-func progressLogger() func(engine.Event) {
-	return func(ev engine.Event) {
-		switch ev.Kind {
-		case engine.EventRunStart:
-			fmt.Fprintf(os.Stderr, "→ %d cell(s) planned\n", ev.Total)
-		case engine.EventTaskRetry:
-			fmt.Fprintf(os.Stderr, "  retry %s#%d: %s\n", ev.TaskID, ev.SampleIndex, ev.Message)
-		case engine.EventTaskDone:
-			if ev.Result == nil {
-				return
-			}
-			mark := "FAIL"
-			if ev.Result.Passed() {
-				mark = "ok  "
-			}
-			fmt.Fprintf(os.Stderr, "  [%d/%d] %s %s#%d %.1fs %s\n",
-				ev.Completed, ev.Total, mark, ev.Result.TaskID, ev.Result.SampleIndex,
-				ev.Result.Duration().Seconds(), ev.Result.StopReason)
-		}
-	}
-}
-
-func writeRunReport(ctx context.Context, store *storage.Store, runID, path string, opts report.Options) error {
-	data, err := report.Load(ctx, store, runID, opts)
-	if err != nil {
-		return err
-	}
-	return report.RenderRunFile(path, data, report.RenderOptions{Title: data.Title})
-}
-
-// ---------------------------------------------------------------------------
-// audit
-// ---------------------------------------------------------------------------
-
-func cmdAudit(args []string) int {
-	fs := flag.NewFlagSet("audit", flag.ExitOnError)
-	var (
-		c        commonFlags
-		group    string
-		repeats  int
-		only     string
-		workers  int
-		asJSON   bool
-		strict   bool
-		keep     bool
-		backend  string
-		image    string
-		agentBin string
-	)
-	addCommon(fs, &c)
-	fs.StringVar(&group, "group", "", "id prefix and tag for the runs this audit creates (default: audit-<uuid>)")
-	fs.IntVar(&repeats, "repeats", 2, "oracle runs per task; 1 skips the stability check")
-	fs.StringVar(&only, "only", "", "restrict to checks: solvability,necessity,stability")
-	fs.IntVar(&workers, "concurrency", 0, "cells executed at once (default: from the config)")
-	fs.BoolVar(&asJSON, "json", false, "emit the audit report as JSON")
-	fs.BoolVar(&strict, "strict", false, "exit non-zero when any task is unhealthy")
-	fs.BoolVar(&keep, "keep-workspaces", false, "leave each task's workspace on disk for inspection")
-	fs.StringVar(&backend, "backend", "", "sandbox backend: local or docker")
-	fs.StringVar(&image, "image", "", "container image (docker backend)")
-	fs.StringVar(&agentBin, "bin", "", "agent executable (unused unless a task's oracle runs a command)")
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: aeval audit [flags] [dataset]")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Runs the dataset without an agent and reports, per task:")
-		fmt.Fprintln(os.Stderr, "  solvability  the declared oracle passes")
-		fmt.Fprintln(os.Stderr, "  necessity    the untouched workspace fails")
-		fmt.Fprintln(os.Stderr, "  stability    repeated oracle runs agree, grader by grader")
-		fs.PrintDefaults()
-	}
-	_ = fs.Parse(args)
-	given := givenFlags(fs)
-	if fs.NArg() > 0 {
-		c.datasetPath = fs.Arg(0)
-	}
-
-	onlyList, err := parseOnly(only)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "aeval: %v\n", err)
-		return exitUsage
-	}
-
-	cfg, err := resolveWithDataset(&c)
-	if err != nil {
-		return fail("%v", err)
-	}
-	ds, err := dataset.Load(cfg.DatasetPath)
-	if err != nil {
-		return fail("load dataset: %v", err)
-	}
-
-	run := cfg.Engine
-	// An audit never starts the agent, but the sandbox still has to be built the
-	// way a real run builds it: a solvability verdict from a different
-	// environment than the one being evaluated would be about a different task.
-	run.ToolVersion = version
-	if given["backend"] {
-		run.Backend.Kind = engine.BackendKind(backend)
-	}
-	if given["image"] {
-		run.Backend.Image = image
-	}
-	if given["bin"] {
-		run.Agent.Bin = absFlagPath(agentBin)
-	}
-
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
-	run.Store = store
-
-	ctx, stop := signalContext()
-	defer stop()
-	if c.verbose {
-		run.OnEvent = progressLogger()
-	}
-
-	fmt.Fprintf(os.Stderr, "%s\n", ds.Summary())
-	if len(onlyList) == 0 {
-		fmt.Fprintf(os.Stderr, "auditing %d task(s), %d oracle run(s) each, no agent and no API spend\n",
-			len(ds.Tasks), repeats)
-	} else {
-		fmt.Fprintf(os.Stderr, "auditing %d task(s), checks: %s\n", len(ds.Tasks), strings.Join(onlyList, ", "))
-	}
-
-	started := time.Now()
-	rep, auditErr := audit.Run(ctx, run, ds, audit.Options{
-		Group:          group,
-		Repeats:        repeats,
-		Concurrency:    workers,
-		KeepWorkspaces: keep,
-		Only:           onlyList,
-	})
-	if rep == nil {
-		return fail("audit: %v", auditErr)
-	}
-	if asJSON {
-		raw, err := json.MarshalIndent(rep, "", "  ")
-		if err != nil {
-			return fail("encode report: %v", err)
-		}
-		fmt.Println(string(raw))
-	} else {
-		fmt.Fprint(os.Stdout, rep.Summary())
-		printUnhealthy(rep)
-	}
-	fmt.Fprintf(os.Stderr, "elapsed %s\n", time.Since(started).Round(time.Millisecond))
-
-	if auditErr != nil {
-		// A partial audit is still printed: the runs that did happen are real
-		// evidence, and throwing them away would waste the sandbox time already
-		// spent. The non-zero exit says the picture is incomplete.
-		fmt.Fprintf(os.Stderr, "aeval: %v\n", auditErr)
-		return exitError
-	}
-	if strict && rep.Healthy() < len(rep.Tasks) {
-		fmt.Fprintf(os.Stderr, "aeval: %d task(s) are not healthy\n", len(rep.Tasks)-rep.Healthy())
-		return exitError
-	}
-	return exitOK
-}
-
-// printUnhealthy lists the defective tasks, one line each.
+// absDirList resolves repeatable directory flags against the caller's working
+// directory.
 //
-// Only the unhealthy ones: a healthy task has nothing to say, and printing the
-// whole dataset would bury the three lines that matter.
-func printUnhealthy(rep *audit.Report) {
-	bad := rep.Unhealthy()
-	if len(bad) == 0 {
-		fmt.Printf("\nall %d task(s) healthy\n", len(rep.Tasks))
-		return
+// A directory gets the resolver that always joins: there is no PATH to fall back
+// on, so `--plugin-dir skills` means the skills directory here, and leaving it
+// bare would point inside the sandbox workspace instead.
+func absDirList(in []string) []string {
+	if len(in) == 0 {
+		return nil
 	}
-	fmt.Printf("\n%d of %d task(s) unhealthy:\n", len(bad), len(rep.Tasks))
-	for _, t := range bad {
-		fmt.Printf("\n  %s\n", t.TaskID)
-		for _, ch := range t.Checks {
-			if ch.Status == audit.StatusOK {
-				continue
-			}
-			fmt.Printf("    %-12s %-8s %s\n", ch.Name, ch.Status, ch.Detail)
-		}
-	}
-	if len(rep.Runs) > 0 {
-		fmt.Printf("\n  evidence:\n")
-		for _, r := range rep.Runs {
-			fmt.Printf("    %-12s %s\n", r.Role, r.RunID)
-		}
-	}
-}
-
-// parseOnly validates the --only list.
-//
-// It validates rather than silently ignoring an unknown name: a typo would
-// otherwise produce an audit that ran nothing and reported every check as
-// unknown, which reads like a broken dataset instead of a broken command.
-func parseOnly(s string) ([]string, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, nil
-	}
-	var out []string
-	for _, part := range strings.Split(s, ",") {
-		name := strings.TrimSpace(part)
-		if name == "" {
-			continue
-		}
-		if !slices.Contains(audit.AllChecks, name) {
-			return nil, fmt.Errorf("unknown check %q (available: %s)",
-				name, strings.Join(audit.AllChecks, ", "))
-		}
-		out = append(out, name)
-	}
-	return out, nil
-}
-
-// ---------------------------------------------------------------------------
-// validate
-// ---------------------------------------------------------------------------
-
-func cmdValidate(args []string) int {
-	fs := flag.NewFlagSet("validate", flag.ExitOnError)
-	var c commonFlags
-	addCommon(fs, &c)
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: aeval validate [flags]"); fs.PrintDefaults() }
-	_ = fs.Parse(args)
-	if fs.NArg() > 0 {
-		c.datasetPath = fs.Arg(0)
-	}
-
-	cfg, err := resolve(&c)
+	wd, err := os.Getwd()
 	if err != nil {
-		return fail("%v", err)
+		// Without a base the values are returned as written; every other
+		// resolver in this program degrades the same way rather than failing a
+		// run over a missing environment.
+		return in
 	}
-	problems := 0
-
-	if cfg.Source != "" {
-		fmt.Printf("config  %s\n", cfg.Source)
-	} else {
-		fmt.Println("config  (built-in defaults)")
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		out = append(out, agent.ResolveDir(wd, v))
 	}
-	fmt.Printf("db      %s\n", cfg.DatabasePath)
-
-	if err := cfg.Validate(); err != nil {
-		fmt.Printf("        ✗ %v\n", err)
-		problems++
-	} else {
-		fmt.Println("        ✓ configuration is usable")
-	}
-
-	if cfg.DatasetPath == "" {
-		fmt.Println("dataset (none configured)")
-	} else {
-		ds, err := dataset.Load(cfg.DatasetPath)
-		if err != nil {
-			fmt.Printf("dataset %s\n        ✗ %v\n", cfg.DatasetPath, err)
-			problems++
-		} else {
-			fmt.Printf("dataset %s\n", ds.Dir)
-			fmt.Printf("        ✓ %s\n", ds.Summary())
-			fmt.Printf("        hash %s\n", ds.Hash)
-			if err := checkGraderTypes(ds); err != nil {
-				fmt.Printf("        ✗ %v\n", err)
-				problems++
-			}
-			if err := checkMetricNames(cfg); err != nil {
-				fmt.Printf("        ✗ %v\n", err)
-				problems++
-			}
-		}
-	}
-
-	if problems > 0 {
-		return exitError
-	}
-	fmt.Println("\nok")
-	return exitOK
+	return out
 }
 
-// checkGraderTypes resolves every grader a dataset names, without a sandbox.
-//
-// The engine does the same check at run time, but doing it here turns a typo
-// into a one-second answer instead of a failure discovered after three hours of
-// paid API calls.
-func checkGraderTypes(ds *dataset.Dataset) error {
-	seen := map[string]bool{}
-	var unknown []string
-	for _, t := range ds.Tasks {
-		for _, g := range t.Graders {
-			if seen[g.Type] {
-				continue
-			}
-			seen[g.Type] = true
-			if _, err := grader.Get(g.Type); err != nil {
-				unknown = append(unknown, fmt.Sprintf("task %s: %v", t.ID, err))
-			}
-		}
-	}
-	if len(unknown) > 0 {
-		return fmt.Errorf("unknown grader type(s): %s", strings.Join(unknown, "; "))
-	}
-	return nil
-}
+// stringList collects a repeatable flag.
+type stringList []string
 
-func checkMetricNames(cfg *config.Config) error {
-	names := cfg.Engine.Metrics
-	if len(names) == 0 {
-		names = metric.DefaultRunMetrics()
-	}
-	for _, n := range names {
-		if _, err := metric.Get(n); err != nil {
-			return err
-		}
-	}
-	for _, cm := range cfg.Engine.CustomMetrics {
-		if err := cm.Validate(); err != nil {
-			return err
-		}
-	}
+func (s *stringList) String() string { return strings.Join(*s, ",") }
+
+func (s *stringList) Set(v string) error {
+	*s = append(*s, v)
 	return nil
 }
 
 // ---------------------------------------------------------------------------
-// list
+// Agent flags
 // ---------------------------------------------------------------------------
 
-func cmdList(args []string) int {
-	fs := flag.NewFlagSet("list", flag.ExitOnError)
-	var c commonFlags
-	var limit int
-	var asJSON bool
-	addCommon(fs, &c)
-	fs.IntVar(&limit, "limit", 50, "maximum number of runs to show")
-	fs.BoolVar(&asJSON, "json", false, "emit JSON instead of a table")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: aeval list [flags]"); fs.PrintDefaults() }
-	_ = fs.Parse(args)
+// agentFlags is the harness configuration: everything that selects or shapes
+// the agent process without changing the model or the skills.
+//
+// It is a separate type because `aeval matrix --axis harness` varies exactly
+// these, and a matrix document reuses the same vocabulary in its levels.
+type agentFlags struct {
+	kind     string
+	bin      string
+	model    string
+	fallback string
+	effort   string
 
-	cfg, err := resolve(&c)
-	if err != nil {
-		return fail("%v", err)
-	}
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
+	permissionMode string
+	tools          stringList
+	allowedTools   stringList
+	deniedTools    stringList
+	addDirs        stringList
 
-	idx, err := report.LoadIndex(context.Background(), store, limit, cfg.Report.Options())
-	if err != nil {
-		return fail("%v", err)
-	}
-	if asJSON {
-		raw, err := report.DataJSON(idx)
-		if err != nil {
-			return fail("%v", err)
-		}
-		fmt.Println(string(raw))
-		return exitOK
-	}
-	if len(idx.Runs) == 0 {
-		fmt.Printf("no runs recorded in %s\n", cfg.DatabasePath)
-		return exitOK
-	}
+	systemPrompt       string
+	appendSystemPrompt string
+	settings           string
+	mcpServers         stringList
+	pluginDirs         stringList
+	extraArgs          stringList
 
-	// The id column is printed in full even though it costs horizontal space.
-	// A truncated uuid cannot be pasted into `aeval report --run`, so the column
-	// would look informative and be useless. `aeval list --json` is there for
-	// scripts that want structure.
-	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "RUN\tSTATUS\tDATASET\tAGENT\tMODEL\tRESOLVED\tCOST\tDURATION\tSTARTED")
-	for _, r := range idx.Runs {
-		rate := "-"
-		if r.TaskCount > 0 {
-			rate = fmt.Sprintf("%d/%d (%.0f%%)", r.PassedCount, r.TaskCount,
-				float64(r.PassedCount)/float64(r.TaskCount)*100)
-		}
-		cost := "-"
-		if r.TotalCostUSD > 0 {
-			cost = fmt.Sprintf("$%.4f", r.TotalCostUSD)
-		}
-		// An oracle or baseline run is not an agent run. Labelling its status
-		// rather than its agent column keeps "claude_code" from being read as
-		// "the model scored 100%", which is the one conclusion that must not be
-		// drawn from an audit run.
-		status := r.Status
-		if r.Mode != "" && r.Mode != "agent" {
-			status = fmt.Sprintf("%s (%s)", r.Status, r.Mode)
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s@%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.ID, status, r.DatasetName, r.DatasetVersion,
-			r.AgentKind, orDefault(r.AgentModel, "-"), rate, cost,
-			(time.Duration(r.DurationMs) * time.Millisecond).Round(time.Millisecond),
-			r.CreatedAt.Local().Format("2006-01-02 15:04"))
-	}
-	tw.Flush()
-	fmt.Printf("\n%d run(s) in %s\n", len(idx.Runs), cfg.DatabasePath)
-	return exitOK
+	bare         bool
+	strictMCP    bool
+	disableSlash bool
+	maxBudgetUSD float64
 }
 
-// ---------------------------------------------------------------------------
-// report / compare
-// ---------------------------------------------------------------------------
+func addAgentFlags(fs *flag.FlagSet, a *agentFlags) {
+	fs.StringVar(&a.kind, "agent", "claude_code", "agent implementation to drive")
+	fs.StringVar(&a.bin, "bin", "", "agent executable; a bare name is looked up on PATH (default claude)")
+	fs.StringVar(&a.model, "model", "", "model to pass to the agent; forwarded verbatim")
+	fs.StringVar(&a.fallback, "fallback-model", "", "model to fall back to when the first is unavailable")
+	fs.StringVar(&a.effort, "effort", "", "reasoning effort, when the agent supports it")
 
-func cmdReport(args []string) int {
-	fs := flag.NewFlagSet("report", flag.ExitOnError)
-	var c commonFlags
-	var (
-		runID string
-		out   string
-		title string
-	)
-	addCommon(fs, &c)
-	fs.StringVar(&runID, "run", "", "run id to report on (default: the most recent run)")
-	fs.StringVar(&out, "out", "", "output path (default: report-<run>.html)")
-	fs.StringVar(&title, "title", "", "document title")
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: aeval report [flags]"); fs.PrintDefaults() }
-	_ = fs.Parse(args)
-	if runID == "" && fs.NArg() > 0 {
-		runID = fs.Arg(0)
-	}
+	fs.StringVar(&a.permissionMode, "permission-mode", "bypassPermissions", "how the agent asks for permission; evaluation runs are unattended")
+	fs.Var(&a.tools, "tools", "available tool set (repeatable); bare mode collapses the default set")
+	fs.Var(&a.allowedTools, "allow-tool", "auto-approved tool pattern (repeatable)")
+	fs.Var(&a.deniedTools, "deny-tool", "forbidden tool pattern (repeatable)")
+	fs.Var(&a.addDirs, "add-dir", "extra directory the agent may read (repeatable)")
 
-	cfg, err := resolve(&c)
-	if err != nil {
-		return fail("%v", err)
-	}
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
+	fs.StringVar(&a.systemPrompt, "system-prompt", "", "replace the system prompt")
+	fs.StringVar(&a.appendSystemPrompt, "append-system-prompt", "", "append to the system prompt")
+	fs.StringVar(&a.settings, "settings", "", "settings file or inline JSON")
+	fs.Var(&a.mcpServers, "mcp-config", "MCP configuration path or JSON (repeatable)")
+	fs.Var(&a.pluginDirs, "plugin-dir", "skill directory to make available (repeatable)")
+	fs.Var(&a.extraArgs, "extra-arg", "argument appended verbatim; not validated (repeatable)")
 
-	ctx := context.Background()
-	if runID == "" {
-		idx, err := report.LoadIndex(ctx, store, 1, cfg.Report.Options())
-		if err != nil {
-			return fail("%v", err)
-		}
-		if len(idx.Runs) == 0 {
-			return fail("no runs recorded in %s", cfg.DatabasePath)
-		}
-		runID = idx.Runs[0].ID
-		fmt.Fprintf(os.Stderr, "using the most recent run: %s\n", runID)
-	}
-
-	opts := cfg.Report.Options()
-	if title != "" {
-		opts.Title = title
-	}
-	data, err := report.Load(ctx, store, runID, opts)
-	if err != nil {
-		return fail("%v", err)
-	}
-	if out == "" {
-		out = report.FileName(runID)
-	}
-	if err := report.RenderRunFile(out, data, report.RenderOptions{Title: data.Title}); err != nil {
-		return fail("%v", err)
-	}
-	info, err := os.Stat(out)
-	if err != nil {
-		return fail("stat report: %v", err)
-	}
-	fmt.Printf("%s\n", out)
-	fmt.Printf("  %d cell(s), %d resolved, %s\n", data.Counts.Samples, data.Counts.Passed, humanBytes(int(info.Size())))
-	for _, w := range data.Warnings {
-		fmt.Fprintf(os.Stderr, "  note: %s\n", w)
-	}
-	return exitOK
+	fs.BoolVar(&a.bare, "bare", true, "run the agent in a clean room: no user hooks, no auto-memory, no CLAUDE.md")
+	fs.BoolVar(&a.strictMCP, "strict-mcp", true, "load only the MCP servers named on the command line")
+	fs.BoolVar(&a.disableSlash, "disable-slash-commands", true, "remove user skills from the agent's context")
+	fs.Float64Var(&a.maxBudgetUSD, "max-budget-usd", 0, "abort an attempt once it has spent this much")
 }
 
-func cmdCompare(args []string) int {
-	fs := flag.NewFlagSet("compare", flag.ExitOnError)
-	var c commonFlags
-	var out string
-	addCommon(fs, &c)
-	fs.StringVar(&out, "out", "compare.html", "output path")
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: aeval compare [flags] <left-run-id> <right-run-id>")
-		fs.PrintDefaults()
+// spec turns the flags into an agent.Spec. Every path-shaped value is resolved
+// against the caller's working directory.
+func (a agentFlags) spec() agent.Spec {
+	spec := agent.Spec{
+		Kind:               a.kind,
+		Bin:                absFlagPath(a.bin),
+		Model:              a.model,
+		FallbackModel:      a.fallback,
+		Effort:             a.effort,
+		PermissionMode:     a.permissionMode,
+		Tools:              a.tools,
+		AllowedTools:       a.allowedTools,
+		DisallowedTools:    a.deniedTools,
+		AddDirs:            absDirList(a.addDirs),
+		SystemPrompt:       a.systemPrompt,
+		AppendSystemPrompt: a.appendSystemPrompt,
+		Settings:           a.settings,
+		// Not put through a resolver: an MCP entry may be a JSON blob, and a blob
+		// containing a "/" would be mangled into a path.
+		MCPServers:   a.mcpServers,
+		PluginDirs:   absDirList(a.pluginDirs),
+		ExtraArgs:    a.extraArgs,
+		MaxBudgetUSD: a.maxBudgetUSD,
+		Isolation: &agent.Isolation{
+			Bare:                 a.bare,
+			StrictMCPConfig:      a.strictMCP,
+			DisableSlashCommands: a.disableSlash,
+		},
 	}
-	_ = fs.Parse(args)
-	if fs.NArg() != 2 {
-		fs.Usage()
-		return exitUsage
-	}
-	left, right := fs.Arg(0), fs.Arg(1)
-
-	cfg, err := resolve(&c)
-	if err != nil {
-		return fail("%v", err)
-	}
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
-
-	data, err := report.LoadComparison(context.Background(), store, left, right, cfg.Report.Options())
-	if err != nil {
-		return fail("%v", err)
-	}
-	if err := report.RenderComparisonFile(out, data, report.RenderOptions{Title: data.Title}); err != nil {
-		return fail("%v", err)
-	}
-	s := data.Compare.Summary
-	fmt.Printf("%s\n", out)
-	fmt.Printf("  %s → %s\n", data.Compare.LeftLabel, data.Compare.RightLabel)
-	fmt.Printf("  %d common cell(s): %d fixed, %d regressed, %d still passing, %d still failing\n",
-		s.Common, s.Fixed, s.Regressed, s.BothPass, s.BothFail)
-	for _, w := range data.Warnings {
-		fmt.Fprintf(os.Stderr, "  note: %s\n", w)
-	}
-	return exitOK
+	return spec
 }
 
-// ---------------------------------------------------------------------------
-// serve
-// ---------------------------------------------------------------------------
-
-func cmdServe(args []string) int {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	var c commonFlags
-	var (
-		addr     string
-		allowDel bool
-		refresh  int
-		rl       bool
-		rlExec   bool
-		rlEnvs   int
-		rlTTL    time.Duration
-		rlRolls  int
-		rlExecs  int
-		rlCost   float64
-	)
-	addCommon(fs, &c)
-	fs.StringVar(&addr, "addr", "", "listen address (default 127.0.0.1:8787)")
-	fs.BoolVar(&allowDel, "allow-delete", false, "enable the run deletion route")
-	fs.IntVar(&refresh, "refresh", 0, "reload the index every N seconds (0 disables)")
-	fs.BoolVar(&rl, "rl", false, "also serve the dataset as RL environments under /api/rl")
-	fs.BoolVar(&rlExec, "rl-allow-exec", false, "let /api/rl run commands and write files inside environments (arbitrary code execution)")
-	fs.IntVar(&rlEnvs, "rl-max-envs", 8, "maximum environments open at once")
-	fs.DurationVar(&rlTTL, "rl-ttl", 15*time.Minute, "how long an environment may stay open")
-	fs.IntVar(&rlRolls, "rl-max-rollouts", 0, "maximum rollouts this process will perform (0 = unlimited)")
-	fs.IntVar(&rlExecs, "rl-max-execs", 200, "maximum commands per environment")
-	fs.Float64Var(&rlCost, "rl-max-cost-usd", 0, "cumulative agent cost cap in USD (0 = unlimited)")
-	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "Usage: aeval serve [flags]")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Serves recorded runs. With --rl (or serve.rl.enabled in the config)")
-		fmt.Fprintln(os.Stderr, "it also serves --dataset as a set of environments for a training")
-		fmt.Fprintln(os.Stderr, "loop; see docs/rl-environment.md.")
-		fs.PrintDefaults()
+// summarizeAgent renders the harness configuration the way it will be recorded,
+// so a reader of the run list can tell two harnesses apart without opening a
+// report.
+func summarizeAgent(s agent.Spec) string {
+	iso := agent.DefaultIsolation()
+	if s.Isolation != nil {
+		iso = *s.Isolation
 	}
-	_ = fs.Parse(args)
-
-	cfg, err := resolve(&c)
-	if err != nil {
-		return fail("%v", err)
+	var parts []string
+	parts = append(parts, "kind="+orDefault(s.Kind, "claude_code"))
+	if s.Bin != "" {
+		parts = append(parts, "bin="+s.Bin)
 	}
-	if addr != "" {
-		cfg.Serve.Addr = addr
+	if s.Model != "" {
+		parts = append(parts, "model="+s.Model)
 	}
-	if allowDel {
-		cfg.Serve.AllowDelete = true
+	parts = append(parts, fmt.Sprintf("bare=%t", iso.Bare))
+	parts = append(parts, fmt.Sprintf("skills=%s", onOff(!iso.DisableSlashCommands)))
+	if len(s.PluginDirs) > 0 {
+		parts = append(parts, fmt.Sprintf("plugin_dirs=%d", len(s.PluginDirs)))
 	}
-	if refresh > 0 {
-		cfg.Serve.LiveRefreshSeconds = refresh
+	if s.AppendSystemPrompt != "" {
+		parts = append(parts, "system_prompt=appended")
 	}
-	// The flags and the config file are merged field by field, not section by
-	// section: a config file that sets only allow_exec and a command line that
-	// only sets --rl-max-envs has to mean both. A flag that was actually typed
-	// wins, which is why this asks which flags were given rather than comparing
-	// values -- `--rl-max-envs 8` is indistinguishable from the default 8.
-	given := givenFlags(fs)
-	if given["rl"] {
-		cfg.Serve.RL.Enabled = rl
-	}
-	if given["rl-allow-exec"] {
-		cfg.Serve.RL.AllowExec = rlExec
-	}
-	if given["rl-max-envs"] {
-		cfg.Serve.RL.MaxEnvs = rlEnvs
-	}
-	if given["rl-ttl"] {
-		cfg.Serve.RL.TTL = rlTTL
-	}
-	if given["rl-max-rollouts"] {
-		cfg.Serve.RL.MaxRollouts = rlRolls
-	}
-	if given["rl-max-execs"] {
-		cfg.Serve.RL.MaxExecs = rlExecs
-	}
-	if given["rl-max-cost-usd"] {
-		cfg.Serve.RL.MaxCostUSD = rlCost
-	}
-	if err := cfg.Validate(); err != nil {
-		return fail("%v", err)
-	}
-
-	store, err := openStore(cfg)
-	if err != nil {
-		return fail("%v", err)
-	}
-	defer store.Close()
-
-	ctx, stop := signalContext()
-	defer stop()
-
-	var mgr *rlenv.Manager
-	if rlc := cfg.Serve.RL; rlc.Enabled {
-		// The environment service is the one part of the tool that can act, so it
-		// refuses to start on guesses: without a dataset there is nothing to
-		// serve as an environment, and silently serving none looks like a
-		// client-side bug.
-		dsPath, err := resolveWithDataset(&c)
-		if err != nil {
-			return fail("--rl: %v", err)
-		}
-		ds, err := dataset.Load(dsPath.DatasetPath)
-		if err != nil {
-			return fail("--rl: load dataset: %v", err)
-		}
-		run := cfg.Engine
-		run.Mode = engine.RunModeAgent
-		run.Store = store
-		run.ToolVersion = version
-		mgr, err = rlenv.New(run, ds, rlenv.Options{
-			MaxEnvs:     rlc.MaxEnvs,
-			TTL:         rlc.TTL,
-			MaxExecs:    rlc.MaxExecs,
-			AllowExec:   rlc.AllowExec,
-			MaxRollouts: rlc.MaxRollouts,
-			MaxCostUSD:  rlc.MaxCostUSD,
-		})
-		if err != nil {
-			return fail("--rl: %v", err)
-		}
-		defer mgr.CloseAll(context.WithoutCancel(ctx))
-	}
-
-	srv, err := web.New(web.Config{
-		Store:              store,
-		Addr:               cfg.Serve.Addr,
-		Title:              cfg.Report.Title,
-		Report:             cfg.Report.Options(),
-		AllowDelete:        cfg.Serve.AllowDelete,
-		LiveRefreshSeconds: cfg.Serve.LiveRefreshSeconds,
-		RL:                 mgr,
-	})
-	if err != nil {
-		return fail("%v", err)
-	}
-
-	fmt.Printf("serving %s on http://%s\n", cfg.DatabasePath, srv.Addr())
-	if cfg.Serve.AllowDelete {
-		fmt.Println("  deletion enabled: the API can remove runs")
-	}
-	if mgr != nil {
-		st := mgr.Stats()
-		fmt.Printf("  rl enabled: dataset %s, %d task(s)\n", mgr.DatasetName(), len(mgr.Tasks()))
-		fmt.Printf("    open at most %d env(s) for %s, %d command(s) each\n",
-			st.MaxEnvs, time.Duration(st.TTLSeconds*float64(time.Second)), st.MaxExecs)
-		if st.MaxRollouts > 0 {
-			fmt.Printf("    rollout cap %d\n", st.MaxRollouts)
-		}
-		if st.MaxCostUSD > 0 {
-			fmt.Printf("    cost cap $%.4f\n", st.MaxCostUSD)
-		}
-		if st.ExecEnabled {
-			fmt.Println("    command execution ENABLED: /api/rl can run commands as this user")
-		} else {
-			fmt.Println("    command execution disabled (--rl-allow-exec to enable)")
-		}
-	}
-	if err := srv.ListenAndServe(ctx); err != nil && !errors.Is(err, context.Canceled) {
-		return fail("%v", err)
-	}
-	return exitOK
+	return strings.Join(parts, " ")
 }
 
-// ---------------------------------------------------------------------------
-// registry / version
-// ---------------------------------------------------------------------------
-
-func cmdRegistry(args []string) int {
-	fs := flag.NewFlagSet("registry", flag.ExitOnError)
-	fs.Usage = func() { fmt.Fprintln(os.Stderr, "Usage: aeval registry") }
-	_ = fs.Parse(args)
-
-	fmt.Println("agents")
-	for _, kind := range agent.Registered() {
-		fmt.Printf("  %s\n", kind)
+func onOff(b bool) string {
+	if b {
+		return "on"
 	}
-
-	fmt.Println("\ngraders")
-	for _, t := range grader.Registered() {
-		fmt.Printf("  %s\n", t)
-	}
-
-	fmt.Println("\nmetrics (run level)")
-	for _, n := range metric.NamesOfKind(metric.KindRun) {
-		m, err := metric.Get(n)
-		if err != nil {
-			continue
-		}
-		fmt.Printf("  %-26s %s\n", n, m.Description())
-	}
-
-	fmt.Println("\ndefault metric set")
-	fmt.Printf("  %s\n", strings.Join(metric.DefaultRunMetrics(), ", "))
-	return exitOK
+	return "off"
 }
-
-func cmdVersion() int {
-	fmt.Printf("aeval %s\n", version)
-	fmt.Printf("  go        %s\n", runtime.Version())
-	fmt.Printf("  platform  %s/%s\n", runtime.GOOS, runtime.GOARCH)
-	fmt.Printf("  schema    sqlite v%d, report payload v%d\n", storage.SchemaVersion(), report.DataVersion)
-	fmt.Printf("  agents    %s\n", strings.Join(agent.Registered(), ", "))
-	fmt.Printf("  graders   %s\n", strings.Join(grader.Registered(), ", "))
-	fmt.Printf("  metrics   %d registered\n", len(metric.Names()))
-	return exitOK
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
 
 func orDefault(v, fallback string) string {
 	if strings.TrimSpace(v) == "" {
@@ -1185,13 +360,1100 @@ func orDefault(v, fallback string) string {
 	return v
 }
 
-func humanBytes(n int) string {
-	switch {
-	case n >= 1<<20:
-		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
-	case n >= 1<<10:
-		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
-	default:
-		return fmt.Sprintf("%d B", n)
+// ---------------------------------------------------------------------------
+// collect
+// ---------------------------------------------------------------------------
+
+func cmdCollect(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
+	var (
+		root     = fs.String("root", "", "directory holding Claude Code transcripts (default ~/.claude/projects)")
+		selector = fs.String("session", "", "a .jsonl path, a session id prefix, or the working directory to search")
+		cwd      = fs.String("cwd", "", "collect every session recorded for this working directory")
+		latest   = fs.Bool("latest", false, "collect the most recently modified session")
+		out      = fs.String("out", "", "directory to write the dataset into (required)")
+		name     = fs.String("name", "", "dataset name (default: the output directory's name)")
+		desc     = fs.String("description", "", "dataset description")
+
+		split      = fs.String("split", string(session.SplitSession), "one task per session, or per human turn")
+		minPrompt  = fs.Int("min-prompt-runes", 0, "under --split turn, drop prompts shorter than this")
+		graderType = fs.String("grader", "", "attach a grader of this type; without one the task is measurable but not scorable")
+		graderName = fs.String("grader-name", "", "name for the attached grader")
+		graderCfg  = fs.String("grader-config", "", "inline JSON configuration for the grader")
+
+		wsRepo   = fs.String("workspace-repo", "", "bind every task to this repository")
+		wsRef    = fs.String("ref", "", "commit or ref to check out")
+		wsSubdir = fs.String("subdir", "", "subdirectory of the repository to work in")
+		wsAssets = fs.String("assets", "", "directory of files to copy into every workspace")
+		outputT  = fs.String("output-type", "", "deliverable contract: patch, files, stdout or none")
+
+		timeoutS = fs.Int("timeout", 0, "per-task budget in seconds; 0 derives it from the baseline")
+		maxTurns = fs.Int("max-turns", 0, "per-task turn budget; 0 derives it from the baseline")
+		idPrefix = fs.String("id-prefix", "", "prefix for generated task ids")
+		category = fs.String("category", "", "category applied to every task")
+		tags     = stringList{}
+		asJSON   = fs.Bool("json", false, "print the summary as JSON")
+		dryRun   = fs.Bool("dry-run", false, "parse the sessions and report what would be written, without writing")
+	)
+	fs.Var(&tags, "tag", "tag applied to every task (repeatable)")
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
 	}
+
+	if *out == "" && !*dryRun {
+		return usageFail(stderr, "collect: --out is required (or --dry-run to look without writing)")
+	}
+	splitMode := session.Split(*split)
+	if splitMode != session.SplitSession && splitMode != session.SplitTurn {
+		return usageFail(stderr, "collect: --split must be %q or %q, got %q",
+			session.SplitSession, session.SplitTurn, *split)
+	}
+
+	var graderConfig map[string]any
+	if *graderCfg != "" {
+		if err := json.Unmarshal([]byte(*graderCfg), &graderConfig); err != nil {
+			return usageFail(stderr, "collect: --grader-config is not valid JSON: %v", err)
+		}
+	}
+
+	sources, code := collectSources(*root, *selector, *cwd, *latest, stderr)
+	if code != exitOK {
+		return code
+	}
+
+	var sessions []*session.Session
+	for _, src := range sources {
+		s, err := session.ParseFile(src.Path)
+		if err != nil {
+			return fail(stderr, "collect: parse %s: %v", src.Path, err)
+		}
+		sessions = append(sessions, s)
+	}
+
+	opts := session.Options{
+		Split:           splitMode,
+		Grader:          *graderType,
+		GraderName:      *graderName,
+		GraderConfig:    graderConfig,
+		WorkspaceRepo:   absFlagPath(*wsRepo),
+		WorkspaceRef:    *wsRef,
+		WorkspaceSubdir: *wsSubdir,
+		WorkspaceAssets: absFlagPath(*wsAssets),
+		OutputType:      dataset.OutputType(*outputT),
+		TimeoutS:        *timeoutS,
+		MaxTurns:        *maxTurns,
+		MinPromptRunes:  *minPrompt,
+		IDPrefix:        *idPrefix,
+		Category:        *category,
+		Tags:            tags,
+	}
+	items, err := session.Collect(sessions, opts)
+	if err != nil {
+		return fail(stderr, "collect: %v", err)
+	}
+
+	if *dryRun {
+		fmt.Fprintf(stdout, "would write %d task(s) from %d session(s)\n\n%s\n",
+			len(items), len(sources), session.Summarize(items))
+		return exitOK
+	}
+
+	dir := absFlagPath(*out)
+	dsName := *name
+	if dsName == "" {
+		dsName = filepath.Base(dir)
+	}
+	if err := session.WriteDataset(dir, dsName, *desc, items); err != nil {
+		return fail(stderr, "collect: write dataset: %v", err)
+	}
+
+	if *asJSON {
+		out := map[string]any{
+			"dir": dir, "name": dsName, "tasks": len(items),
+			"sources": sourceNames(sources),
+		}
+		return emitJSON(stdout, stderr, out)
+	}
+	fmt.Fprintf(stdout, "wrote %d task(s) to %s\n\n%s\n", len(items), dir, session.Summarize(items))
+	fmt.Fprintf(stdout, "\nNext: aeval validate --dataset %s\n", filepath.Join(dir, "dataset.yaml"))
+	return exitOK
+}
+
+func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) ([]session.Source, int) {
+	if root == "" {
+		root = session.DefaultRoot()
+	}
+	switch {
+	case selector != "":
+		// Resolved against the caller's directory before anything is read, so
+		// the transcript path the collected dataset records means the same
+		// thing from anywhere. A bare session-id prefix has no separator and is
+		// left alone. Without this the written dataset names a file that only
+		// exists relative to wherever collect happened to be run.
+		src, err := session.Resolve(root, absFlagPath(selector))
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, exitError
+		}
+		return []session.Source{src}, exitOK
+	case cwd != "":
+		srcs, err := session.SourcesForCwd(root, absFlagPath(cwd))
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, exitError
+		}
+		if len(srcs) == 0 {
+			fail(stderr, "collect: no sessions recorded for %s", cwd)
+			return nil, exitError
+		}
+		return srcs, exitOK
+	case latest:
+		src, err := session.Latest(root)
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, exitError
+		}
+		return []session.Source{src}, exitOK
+	default:
+		fail(stderr,
+			"collect: name what to collect: --session <path|id|cwd>, --cwd <dir>, or --latest\n"+
+				"       transcripts are read from %s", root)
+		return nil, exitUsage
+	}
+}
+
+func sourceNames(srcs []session.Source) []string {
+	out := make([]string, 0, len(srcs))
+	for _, s := range srcs {
+		out = append(out, s.SessionID)
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// validate
+// ---------------------------------------------------------------------------
+
+func cmdValidate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	var (
+		path   = fs.String("dataset", "", "dataset manifest to check (required)")
+		asJSON = fs.Bool("json", false, "print the result as JSON")
+	)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if *path == "" {
+		return usageFail(stderr, "validate: --dataset is required")
+	}
+
+	ds, err := dataset.ValidatePath(absFlagPath(*path))
+	if err != nil {
+		// Validation issues are the expected failure and get one line each, so
+		// that a manifest with eight typos does not have to be fixed eight
+		// times. Anything else is an environment problem and stays a terse
+		// single-line error.
+		var vErr *dataset.ValidationError
+		if errors.As(err, &vErr) {
+			if *asJSON {
+				return emitJSON(stdout, stderr, map[string]any{
+					"valid": false, "issues": issueStrings(vErr.Issues),
+				})
+			}
+			fmt.Fprintf(stderr, "%s is not valid: %d issue(s)\n", *path, len(vErr.Issues))
+			for _, issue := range vErr.Issues {
+				fmt.Fprintf(stderr, "  - %s\n", issue.String())
+			}
+			return exitError
+		}
+		return fail(stderr, "validate: %v", err)
+	}
+
+	if *asJSON {
+		return emitJSON(stdout, stderr, map[string]any{
+			"valid": true, "name": ds.Manifest.Name, "tasks": len(ds.Tasks),
+			"hash": ds.Hash, "dir": ds.Dir,
+		})
+	}
+	fmt.Fprintf(stdout, "%s is valid\n", *path)
+	fmt.Fprintf(stdout, "  name     %s\n", ds.Manifest.Name)
+	fmt.Fprintf(stdout, "  tasks    %d\n", len(ds.Tasks))
+	fmt.Fprintf(stdout, "  hash     %s\n", ds.Hash)
+	fmt.Fprintf(stdout, "\nNext: aeval run --dataset %s\n", *path)
+	return exitOK
+}
+
+func issueStrings(issues []dataset.ValidationIssue) []string {
+	out := make([]string, 0, len(issues))
+	for _, issue := range issues {
+		out = append(out, issue.String())
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+func cmdRun(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	var (
+		common   commonFlags
+		agents   agentFlags
+		dsPath   = fs.String("dataset", "", "dataset manifest to run (required)")
+		name     = fs.String("name", "", "run name (default: the dataset's name)")
+		notes    = fs.String("notes", "", "free-form note recorded on the run")
+		samples  = fs.Int("samples", 1, "how many times to run each task (pass@k)")
+		conc     = fs.Int("concurrency", 1, "cells to keep in flight")
+		timeout  = fs.Duration("timeout", 10*time.Minute, "per-task budget when the task declares none")
+		turns    = fs.Int("max-turns", 0, "per-task turn budget when the task declares none")
+		thresh   = fs.Float64("threshold", runner.DefaultThreshold, "composite score a task must reach to pass")
+		work     = fs.String("work-root", "", "where per-cell workspaces are created (default: beside the database)")
+		keep     = fs.Bool("keep", false, "leave each cell's workspace on disk for inspection")
+		failFast = fs.Bool("fail-fast", false, "stop scheduling cells after the first harness failure")
+		resume   = fs.Bool("resume", false, "skip cells that already have a row for this run")
+		runID    = fs.String("run-id", "", "reuse a run id, which is what --resume needs")
+		quiet    = fs.Bool("quiet", false, "do not print per-cell progress")
+		asJSON   = fs.Bool("json", false, "print the summary as JSON")
+		reportTo = fs.String("report", "", "also write an HTML report to this path")
+	)
+	addCommon(fs, &common)
+	addAgentFlags(fs, &agents)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if *dsPath == "" {
+		return usageFail(stderr, "run: --dataset is required")
+	}
+
+	ds, err := dataset.Load(absFlagPath(*dsPath))
+	if err != nil {
+		return fail(stderr, "run: %v", err)
+	}
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "run: %v", err)
+	}
+	defer st.Close()
+
+	ctx, stop := signalContext()
+	defer stop()
+
+	cfg := runner.Config{
+		Store:          st,
+		Agent:          agents.spec(),
+		RunID:          *runID,
+		RunName:        *name,
+		Notes:          *notes,
+		Samples:        *samples,
+		Concurrency:    *conc,
+		WorkRoot:       absFlagPath(*work),
+		KeepWorkspaces: *keep,
+		Timeout:        *timeout,
+		MaxTurns:       *turns,
+		Threshold:      *thresh,
+		ToolVersion:    version,
+		FailFast:       *failFast,
+		Resume:         *resume,
+	}
+	if !*quiet && !*asJSON {
+		cfg.Progress = progressLogger(stdout)
+	}
+
+	fmt.Fprintf(stdout, "running %d task(s) × %d sample(s) from %s\n", len(ds.Tasks), cfg.Samples, ds.Dir)
+	fmt.Fprintf(stdout, "harness %s\n\n", summarizeAgent(cfg.Agent))
+
+	res, err := runner.Run(ctx, ds, cfg)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(stdout, "\ninterrupted; what was measured is recorded")
+			return exitCtlC
+		}
+		return fail(stderr, "run: %v", err)
+	}
+
+	if *asJSON {
+		if code := emitJSON(stdout, stderr, map[string]any{
+			"run": res.Run, "summary": res.Summary,
+		}); code != exitOK {
+			return code
+		}
+	} else {
+		printSummary(stdout, res.Summary, res.Run, common.db)
+	}
+
+	if *reportTo != "" {
+		data, err := report.Load(ctx, st, res.Run.ID, report.Options{})
+		if err != nil {
+			return fail(stderr, "run: build report: %v", err)
+		}
+		if err := report.RenderRunFile(absFlagPath(*reportTo), data, report.RenderOptions{}); err != nil {
+			return fail(stderr, "run: write report: %v", err)
+		}
+		fmt.Fprintf(stdout, "\nreport  %s\n", absFlagPath(*reportTo))
+	}
+	return exitOK
+}
+
+// progressLogger prints one line per finished cell.
+//
+// The columns are padded by hand rather than with tabwriter: a progress line
+// has to stand on its own as it arrives, and tabwriter buffers a whole block
+// before emitting anything, which is exactly wrong here.
+func progressLogger(w io.Writer) func(runner.Progress) {
+	return func(p runner.Progress) {
+		cell := p.Cell
+		fmt.Fprintf(w, "[%*d/%d] %-28s %-9s %8s  %7s\n",
+			len(fmt.Sprint(p.Total)), p.Done, p.Total,
+			truncate(cell.TaskID, 28), cellState(cell),
+			compactInt(cell.TokenTotal()), shortDuration(cell.DurationMs))
+	}
+}
+
+// cellState is the word shown for a finished cell.
+//
+// A timeout keeps its own label: calling it "failed" would claim the agent got
+// the task wrong, when all that is known is that it did not finish inside the
+// budget. Likewise a cell with no grader is "measured", not "failed".
+func cellState(cell store.Attempt) string {
+	switch {
+	case cell.Status == store.CellError:
+		return "error"
+	case cell.Status == store.CellTimeout:
+		return "timeout"
+	case cell.Graded && cell.Passed:
+		return "passed"
+	case cell.Graded:
+		return "failed"
+	default:
+		return "measured"
+	}
+}
+
+func printSummary(w io.Writer, s runner.Summary, run store.Run, db string) {
+	fmt.Fprintf(w, "run     %s\n", run.ID)
+	fmt.Fprintf(w, "status  %s\n", run.Status)
+	if run.Error != "" {
+		fmt.Fprintf(w, "error   %s\n", run.Error)
+	}
+	fmt.Fprintln(w)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "cells\t"+fmt.Sprint(s.Cells))
+	fmt.Fprintln(tw, "graded\t"+fmt.Sprint(s.Graded))
+	if rate, ok := s.PassRate(); ok {
+		fmt.Fprintf(tw, "passed\t%d (%.1f%%)\n", s.Passed, rate*100)
+	} else {
+		fmt.Fprintln(tw, "passed\tn/a (nothing in this run was graded)")
+	}
+	if s.Ungraded > 0 {
+		fmt.Fprintf(tw, "ungraded\t%d (measured, nothing to score)\n", s.Ungraded)
+	}
+	if s.Timeouts > 0 {
+		fmt.Fprintf(tw, "timed out\t%d (ran out of budget: data about the agent)\n", s.Timeouts)
+	}
+	if s.HarnessErrors > 0 {
+		fmt.Fprintf(tw, "harness errors\t%d (could not be measured at all)\n", s.HarnessErrors)
+	}
+	fmt.Fprintln(tw, "tokens\t"+compactInt(s.Tokens))
+	fmt.Fprintln(tw, "cost\t"+fmt.Sprintf("$%.4f", s.CostUSD))
+	fmt.Fprintln(tw, "wall clock\t"+shortDuration(s.DurationMs))
+	// Each half is printed only when some cell actually carried the matching
+	// measurement. A recording that never captured busy time leaves the delta at
+	// zero, and printing that as "0" would read as "took the same time" rather
+	// than as "was never timed".
+	if s.BaselineCells > 0 {
+		var parts []string
+		if s.TokenCells > 0 {
+			parts = append(parts, signed(s.TokenDelta)+" tokens")
+		}
+		if s.TimedCells > 0 {
+			parts = append(parts, signedDuration(s.TimeDeltaMs))
+		}
+		if len(parts) > 0 {
+			fmt.Fprintf(tw, "vs baseline\t%s across %d cell(s)\n",
+				strings.Join(parts, ", "), s.BaselineCells)
+		} else {
+			fmt.Fprintln(tw, "vs baseline\trecorded, but it carries neither tokens nor time to subtract")
+		}
+	}
+	tw.Flush()
+
+	// The hint has to be the command that actually works. Repeating the --db
+	// only when it is not the default keeps the common case short, and omitting
+	// it when it was given is worse than noise: `report` would look in the
+	// default file and fail with "not found" for a run the user just watched
+	// finish. The value is echoed as typed rather than absolutised, because the
+	// reader is in the same directory that this command was run from.
+	next := fmt.Sprintf("aeval report --run %s", run.ID)
+	if db != "" && db != defaultDB {
+		next += " --db " + hintArg(db)
+	}
+	fmt.Fprintf(w, "\nNext: %s\n", next)
+}
+
+// hintArg renders a flag value for a copy-pasteable command line. Only values
+// that would otherwise be split or expanded get quoted; a plain path stays bare,
+// because that is what the user typed and what the hint should look like.
+func hintArg(v string) string {
+	if v == "" || !strings.ContainsAny(v, " \t\n'\"\\$`*?[]{}()|&;<>#!~") {
+		return v
+	}
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+}
+
+// ---------------------------------------------------------------------------
+// matrix
+// ---------------------------------------------------------------------------
+
+func cmdMatrix(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("matrix", flag.ContinueOnError)
+	var (
+		common   commonFlags
+		file     = fs.String("file", "", "matrix document describing the sweep")
+		sweep    = fs.String("sweep", "", "attribute a sweep that already ran, by id")
+		only     = fs.String("only", "", "run just this level")
+		sweepID  = fs.String("sweep-id", "", "use this sweep id instead of generating one")
+		dryRun   = fs.Bool("dry-run", false, "print the plan and exit without running anything")
+		quiet    = fs.Bool("quiet", false, "do not print per-cell progress")
+		asJSON   = fs.Bool("json", false, "print the attribution as JSON")
+		reportTo = fs.String("report", "", "write an attribution report to this path")
+		base     = fs.String("base-model", "", "override the model every level starts from")
+	)
+	addCommon(fs, &common)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if *file == "" && *sweep == "" {
+		return usageFail(stderr, "matrix: give --file to run a sweep, or --sweep to attribute one that already ran")
+	}
+
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "matrix: %v", err)
+	}
+	defer st.Close()
+
+	ctx, stop := signalContext()
+	defer stop()
+
+	id := *sweep
+	if *file != "" {
+		plan, err := attrib.Load(absFlagPath(*file))
+		if err != nil {
+			return fail(stderr, "matrix: %v", err)
+		}
+		// Resolve the threshold here rather than leaving it 0 in the plan: the
+		// runner would substitute its own default anyway, and a plan that prints
+		// "threshold 0" while the run uses 1.0 is a plan that lies about itself.
+		if plan.Threshold <= 0 {
+			plan.Threshold = runner.DefaultThreshold
+		}
+		if *base != "" {
+			plan.Base.Model = *base
+			for i := range plan.Levels {
+				if plan.Levels[i].Agent.Model == "" {
+					plan.Levels[i].Agent.Model = *base
+				}
+			}
+		}
+		if *dryRun {
+			printPlan(stdout, plan)
+			return exitOK
+		}
+		if id == "" {
+			id = *sweepID
+		}
+		if id == "" {
+			id = newSweepID(plan.Name)
+		}
+		if code := runSweep(ctx, st, plan, id, *only, !*quiet, stdout, stderr); code != exitOK {
+			return code
+		}
+	}
+
+	att, err := attrib.Attribute(ctx, st, id)
+	if err != nil {
+		return fail(stderr, "matrix: %v", err)
+	}
+	if *asJSON {
+		if code := emitJSON(stdout, stderr, att); code != exitOK {
+			return code
+		}
+	} else {
+		printAttribution(stdout, att)
+	}
+	if *reportTo != "" {
+		data, err := report.LoadSweep(ctx, st, id, report.Options{})
+		if err != nil {
+			return fail(stderr, "matrix: build report: %v", err)
+		}
+		if err := report.RenderSweepFile(absFlagPath(*reportTo), data, report.RenderOptions{}); err != nil {
+			return fail(stderr, "matrix: write report: %v", err)
+		}
+		fmt.Fprintf(stdout, "\nreport  %s\n", absFlagPath(*reportTo))
+	}
+	return exitOK
+}
+
+// runSweep executes every level of a sweep, control first.
+//
+// Each level is a separate run with the same sweep id and its own factor label,
+// which is what lets an attribution be recomputed later from the database
+// alone. Running levels concurrently would be faster and would also let them
+// contend for the same machine, so the default is one at a time.
+func runSweep(ctx context.Context, st *store.Store, plan *attrib.Plan, sweepID, only string, progress bool,
+	stdout, stderr io.Writer) int {
+
+	ds, err := dataset.Load(plan.DatasetPath)
+	if err != nil {
+		return fail(stderr, "matrix: %v", err)
+	}
+
+	steps := plan.Steps()
+	fmt.Fprintf(stdout, "sweep %s over %s: %d level(s), control %s\n\n",
+		sweepID, plan.Axis, len(steps), plan.Control)
+
+	for _, step := range steps {
+		if only != "" && step.Level.Name != only {
+			continue
+		}
+		label := fmt.Sprintf("%s=%s", plan.Axis, step.Level.Name)
+		if step.IsControl {
+			label += " (control)"
+		}
+		fmt.Fprintf(stdout, "── %s\n", label)
+		if len(step.Level.Changed) > 0 {
+			fmt.Fprintf(stdout, "   varies %s\n", strings.Join(step.Level.Changed, ", "))
+		}
+		fmt.Fprintf(stdout, "   harness %s\n\n", summarizeAgent(step.Level.Agent))
+
+		// The blob is built per level rather than once for the sweep: `changed`
+		// is the level's own evidence of what it varied, and the levels do not
+		// vary the same keys.
+		meta := attrib.Meta{
+			Name:    plan.Name,
+			Axis:    plan.Axis,
+			Control: plan.Control,
+			Notes:   plan.Notes,
+			Changed: step.Level.Changed,
+		}
+		blob, err := meta.Encode()
+		if err != nil {
+			return fail(stderr, "matrix: %v", err)
+		}
+
+		cfg := runner.Config{
+			Store:          st,
+			Agent:          step.Level.Agent,
+			RunName:        plan.Name,
+			Notes:          plan.Notes,
+			Samples:        plan.Samples,
+			Concurrency:    plan.Concurrency,
+			WorkRoot:       plan.WorkRoot,
+			KeepWorkspaces: plan.KeepWork,
+			Timeout:        plan.Timeout,
+			Threshold:      plan.Threshold,
+			FactorAxis:     string(plan.Axis),
+			FactorLevel:    step.Level.Name,
+			SweepID:        sweepID,
+			ToolVersion:    version,
+			ConfigJSON:     blob,
+		}
+		if progress {
+			cfg.Progress = progressLogger(stdout)
+		}
+		res, err := runner.Run(ctx, ds, cfg)
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				fmt.Fprintln(stdout, "\ninterrupted; the levels already run are recorded and can be attributed")
+				return exitCtlC
+			}
+			return fail(stderr, "matrix: level %s: %v", step.Level.Name, err)
+		}
+		rate := "n/a"
+		if r, ok := res.Summary.PassRate(); ok {
+			rate = fmt.Sprintf("%.1f%%", r*100)
+		}
+		fmt.Fprintf(stdout, "   → run %s  pass %s  tokens %s  %s\n\n",
+			res.Run.ID, rate, compactInt(res.Summary.Tokens), shortDuration(res.Summary.DurationMs))
+	}
+	for _, w := range plan.Warnings {
+		fmt.Fprintf(stderr, "warning: %s\n", w)
+	}
+	return exitOK
+}
+
+// headlineFindings drops the findings that only restate the table above.
+//
+// Every metric gets a verdict, so the JSON and the report can show a complete
+// matrix. The terminal summary is a different job: a level that moved on
+// nothing produces one identical sentence per metric, and a findings list that
+// does that is one readers learn to skip -- which costs exactly the line that
+// mattered. So correctness is always reported, and everything else only when it
+// actually moved.
+func headlineFindings(all []attrib.Finding) []attrib.Finding {
+	out := make([]attrib.Finding, 0, len(all))
+	for _, f := range all {
+		if f.Metric == attrib.MetricPassRate || f.MeanDelta != 0 {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func printPlan(w io.Writer, plan *attrib.Plan) {
+	fmt.Fprintf(w, "sweep  %s\naxis   %s\ncontrol %s\ndataset %s\n",
+		plan.Name, plan.Axis, plan.Control, plan.DatasetPath)
+	fmt.Fprintf(w, "samples %d · concurrency %d · threshold %g\n\n", plan.Samples, plan.Concurrency, plan.Threshold)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "level\tvaries\tnotes")
+	for _, step := range plan.Steps() {
+		name := step.Level.Name
+		if step.IsControl {
+			name += " *"
+		}
+		varies := strings.Join(step.Level.Changed, ", ")
+		if varies == "" {
+			varies = "(nothing)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\n", name, varies, step.Level.Notes)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "\n* control level; every other level is measured against it")
+	for _, warn := range plan.Warnings {
+		fmt.Fprintf(w, "\nwarning: %s\n", warn)
+	}
+}
+
+func printAttribution(w io.Writer, att *attrib.Attribution) {
+	fmt.Fprintf(w, "%s: %d level(s) of %s, control %s\n\n",
+		orDefault(att.Name, att.SweepID), len(att.Levels), att.Axis, att.Control)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "level\tstatus\tpass rate\ttokens\twall clock")
+	for _, l := range att.Levels {
+		rate := "n/a"
+		if l.PassRate != nil {
+			rate = fmt.Sprintf("%.1f%%", *l.PassRate*100)
+		}
+		name := l.Name
+		if l.IsControl {
+			name += " *"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n", name, l.Status, rate,
+			compactInt(l.Summary.Tokens), shortDuration(l.Summary.DurationMs))
+	}
+	tw.Flush()
+
+	for _, cmp := range att.Comparisons {
+		fmt.Fprintf(w, "\n%s against %s\n\n", cmp.Level, cmp.Control)
+		tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "  metric\t"+cmp.Control+"\t"+cmp.Level+"\tmean delta\twin/loss/tie\tp")
+		for _, s := range cmp.Stats {
+			p := "n/a"
+			if s.Testable {
+				p = fmt.Sprintf("%.3f", s.P)
+			}
+			mark := " "
+			if s.Primary {
+				mark = "*"
+			}
+			fmt.Fprintf(tw, "%s %s\t%.2f\t%.2f\t%+.2f %s\t%d/%d/%d\t%s\n",
+				mark, s.Label, s.ControlMean, s.LevelMean, s.MeanDelta, s.Unit,
+				s.Wins, s.Losses, s.Ties, p)
+		}
+		tw.Flush()
+		fmt.Fprintln(w, "\n  * correctness: the metric a change is judged on")
+	}
+
+	if lines := headlineFindings(att.Findings); len(lines) > 0 {
+		fmt.Fprintln(w, "\nfindings")
+		for _, f := range lines {
+			fmt.Fprintf(w, "  %-21s %s\n", "["+f.Direction+"]", f.Text)
+		}
+	}
+	if len(att.Caveats) > 0 {
+		fmt.Fprintln(w, "\ncaveats")
+		for _, c := range att.Caveats {
+			fmt.Fprintf(w, "  - %s\n", c)
+		}
+	}
+}
+
+// newSweepID names a sweep so it is identifiable in a list weeks later: the
+// plan's name plus the moment it started, with the timestamp in the format that
+// sorts.
+func newSweepID(name string) string {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, name)
+	safe = strings.Trim(safe, "-")
+	if safe == "" {
+		safe = "sweep"
+	}
+	if len(safe) > 40 {
+		safe = safe[:40]
+	}
+	return safe + "-" + time.Now().UTC().Format("20060102-150405")
+}
+
+// ---------------------------------------------------------------------------
+// report
+// ---------------------------------------------------------------------------
+
+func cmdReport(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("report", flag.ContinueOnError)
+	var (
+		common  commonFlags
+		runID   = fs.String("run", "", "run to render")
+		cmp     = fs.Bool("compare", false, "render a comparison of the two positional run ids")
+		sweep   = fs.String("sweep", "", "render the attribution of this sweep")
+		listAll = fs.Bool("index", false, "render the run list, plus one report per run")
+		outDir  = fs.String("out-dir", "", "directory for --index output (default .)")
+		limit   = fs.Int("limit", 100, "with --index, how many runs to list")
+		sweepF  = fs.String("sweep-filter", "", "with --index, only list this sweep's runs")
+		title   = fs.String("title", "", "document title")
+		summary = fs.Bool("summary", false, "omit per-task detail: a small report of the numbers only")
+	)
+	addCommon(fs, &common)
+	// -o is the conventional spelling for where the artifact goes.
+	var out string
+	fs.StringVar(&out, "o", "", "output path (default: report-<id>.html beside the database)")
+	fs.StringVar(&out, "out", "", "alias for -o")
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+
+	ctx := context.Background()
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "report: %v", err)
+	}
+	defer st.Close()
+
+	opts := report.Options{Title: *title, NoTaskDetail: *summary}
+	ropts := report.RenderOptions{}
+
+	switch {
+	case *listAll:
+		dir := orDefault(*outDir, ".")
+		dir = absFlagPath(dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		idx, err := report.LoadIndex(ctx, st, *limit, store.RunFilter{SweepID: *sweepF}, opts)
+		if err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		for _, entry := range idx.Runs {
+			data, err := report.Load(ctx, st, entry.ID, opts)
+			if err != nil {
+				return fail(stderr, "report: %v", err)
+			}
+			path := filepath.Join(dir, report.FileName(entry.ID))
+			if err := report.RenderRunFile(path, data, ropts); err != nil {
+				return fail(stderr, "report: %v", err)
+			}
+		}
+		indexPath := filepath.Join(dir, "index.html")
+		if err := report.RenderIndexFile(indexPath, idx, ropts); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		fmt.Fprintf(stdout, "%d run report(s) and %s\n", len(idx.Runs), indexPath)
+		return exitOK
+
+	case *sweep != "":
+		data, err := report.LoadSweep(ctx, st, *sweep, opts)
+		if err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		path := absFlagPath(orDefault(out, "attribution-"+safeName(*sweep)+".html"))
+		if err := report.RenderSweepFile(path, data, ropts); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		fmt.Fprintln(stdout, path)
+		return exitOK
+
+	case *cmp:
+		ids, code := positionals(fs, stderr)
+		if code != exitOK {
+			return code
+		}
+		if len(ids) != 2 {
+			return usageFail(stderr, "report: --compare needs exactly two run ids, got %d", len(ids))
+		}
+		data, err := report.LoadComparison(ctx, st, ids[0], ids[1], opts)
+		if err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		path := absFlagPath(orDefault(out, "compare-"+safeName(ids[0])+"-"+safeName(ids[1])+".html"))
+		if err := report.RenderComparisonFile(path, data, ropts); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		fmt.Fprintln(stdout, path)
+		return exitOK
+	}
+
+	id := *runID
+	if id == "" {
+		rest, code := positionals(fs, stderr)
+		if code != exitOK {
+			return code
+		}
+		if len(rest) == 1 {
+			id = rest[0]
+		}
+	}
+	if id == "" {
+		return usageFail(stderr, "report: give --run <id>, --compare <a> <b>, --sweep <id> or --index")
+	}
+	data, err := report.Load(ctx, st, id, opts)
+	if err != nil {
+		return fail(stderr, "report: %v", err)
+	}
+	path := absFlagPath(orDefault(out, report.FileName(id)))
+	if err := report.RenderRunFile(path, data, ropts); err != nil {
+		return fail(stderr, "report: %v", err)
+	}
+	fmt.Fprintln(stdout, path)
+	return exitOK
+}
+
+// safeName makes an id usable inside a filename, matching the sanitiser the
+// report package uses so that a link and the file it points at agree.
+func safeName(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	s := strings.Trim(b.String(), "-")
+	if s == "" {
+		s = "run"
+	}
+	if len(s) > 40 {
+		s = s[:40]
+	}
+	return s
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+func cmdList(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	var (
+		common commonFlags
+		sweep  = fs.String("sweep", "", "only runs of this sweep")
+		axis   = fs.String("axis", "", "only runs that varied this axis")
+		limit  = fs.Int("limit", 50, "how many runs to show")
+		asJSON = fs.Bool("json", false, "print the runs as JSON")
+	)
+	addCommon(fs, &common)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+
+	ctx := context.Background()
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "list: %v", err)
+	}
+	defer st.Close()
+
+	runs, err := st.ListRuns(ctx, store.RunFilter{SweepID: *sweep, FactorAxis: *axis, Limit: *limit})
+	if err != nil {
+		return fail(stderr, "list: %v", err)
+	}
+	if *asJSON {
+		return emitJSON(stdout, stderr, runs)
+	}
+	if len(runs) == 0 {
+		fmt.Fprintln(stdout, "no runs recorded")
+		return exitOK
+	}
+
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "id\trun\tstatus\tfactor\tpass\tcells\ttokens\tstarted")
+	for _, r := range runs {
+		attempts, err := st.ListAttempts(ctx, r.ID)
+		if err != nil {
+			return fail(stderr, "list: %v", err)
+		}
+		s := runner.Summarize(attempts, len(distinct(attempts)))
+		rate := "n/a"
+		if v, ok := s.PassRate(); ok {
+			rate = fmt.Sprintf("%.0f%%", v*100)
+		}
+		factor := "-"
+		if r.FactorAxis != "" {
+			factor = r.FactorAxis + "=" + r.FactorLevel
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			r.ID, truncate(r.Name, 24), r.Status, factor, rate, s.Cells,
+			compactInt(s.Tokens), r.StartedAt.Local().Format("2006-01-02 15:04"))
+	}
+	tw.Flush()
+	return exitOK
+}
+
+func distinct(attempts []store.Attempt) map[string]bool {
+	seen := map[string]bool{}
+	for _, a := range attempts {
+		seen[a.TaskID] = true
+	}
+	return seen
+}
+
+// ---------------------------------------------------------------------------
+// version
+// ---------------------------------------------------------------------------
+
+func cmdVersion(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	asJSON := fs.Bool("json", false, "print the version information as JSON")
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	info := map[string]any{
+		"version":        version,
+		"schema_version": store.SchemaVersion(),
+		"data_version":   report.DataVersion,
+		"go":             runtime.Version(),
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+		"agents":         agent.Registered(),
+	}
+	if *asJSON {
+		return emitJSON(stdout, stderr, info)
+	}
+	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(tw, "version\t%s\n", version)
+	fmt.Fprintf(tw, "schema\t%d (SQLite)\n", store.SchemaVersion())
+	fmt.Fprintf(tw, "payload\t%d (report JSON)\n", report.DataVersion)
+	fmt.Fprintf(tw, "go\t%s %s/%s\n", runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	fmt.Fprintf(tw, "agents\t%s\n", strings.Join(agent.Registered(), ", "))
+	tw.Flush()
+	return exitOK
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+// positionals returns the positional words a command needs, tolerating flags
+// written after them.
+//
+// Go's flag package stops parsing at the first non-flag word, so the natural
+// spelling `aeval report --compare a b -o out.html` leaves "-o out.html" looking
+// positional and fails with a count of four. Re-parsing from that word recovers
+// the flags, which is plainly what the caller meant. Positional words keep the
+// order they were written in.
+func positionals(fs *flag.FlagSet, stderr io.Writer) ([]string, int) {
+	rest := append([]string(nil), fs.Args()...)
+	for i, w := range rest {
+		if !isFlagWord(w) {
+			continue
+		}
+		head := rest[:i]
+		if ok, code := parse(fs, rest[i:], stderr); !ok {
+			return nil, code
+		}
+		return append(head, fs.Args()...), exitOK
+	}
+	return rest, exitOK
+}
+
+// isFlagWord reports whether w looks like a flag rather than a value. A lone "-"
+// is a value (it means stdin), so it does not count.
+func isFlagWord(w string) bool {
+	return len(w) > 1 && w[0] == '-'
+}
+
+func emitJSON(stdout, stderr io.Writer, v any) int {
+	enc := json.NewEncoder(stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return fail(stderr, "encode output: %v", err)
+	}
+	return exitOK
+}
+
+func compactInt(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1_000)
+	default:
+		return fmt.Sprint(n)
+	}
+}
+
+func shortDuration(ms int64) string {
+	switch {
+	case ms <= 0:
+		return "-"
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.1fs", float64(ms)/1000)
+	case ms < 3_600_000:
+		return fmt.Sprintf("%dm%02ds", ms/60_000, (ms/1000)%60)
+	default:
+		return fmt.Sprintf("%dh%02dm", ms/3_600_000, (ms/60_000)%60)
+	}
+}
+
+func signed(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	if n > 0 {
+		return "+" + compactInt(n)
+	}
+	return "-" + compactInt(-n)
+}
+
+func signedDuration(ms int64) string {
+	if ms == 0 {
+		return "0"
+	}
+	if ms > 0 {
+		return "+" + shortDuration(ms)
+	}
+	return "-" + shortDuration(-ms)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	if n <= 1 {
+		return s[:n]
+	}
+	return s[:n-1] + "…"
+}
+
+// sortedKeys is here for callers that want a stable order over a set; keeping
+// it in one place is cheaper than re-deriving it at each call site.
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

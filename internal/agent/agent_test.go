@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/skyitachi/agenteval/internal/sandbox"
+	"github.com/skyitachi/agenteval/internal/trace"
 )
 
 func TestBuildCommandDefaultsAreReproducible(t *testing.T) {
@@ -235,6 +236,35 @@ func TestRegisterRejectsDuplicates(t *testing.T) {
 // ---------------------------------------------------------------------------
 // mock runner
 // ---------------------------------------------------------------------------
+
+// TestAttemptUsageReadsTheSessionTotalNotTheLastCall is the guard on the
+// indirection: Trace.Usage has its own test, but nothing stops Attempt.Usage
+// from reaching past it to Result.Usage again -- which is precisely the line
+// that reported 18.5k tokens for a 164k-token run.
+func TestAttemptUsageReadsTheSessionTotalNotTheLastCall(t *testing.T) {
+	att := &Attempt{Trace: &trace.Trace{
+		Result: trace.Result{
+			Usage: trace.Usage{InputTokens: 2394, OutputTokens: 274, CacheReadInputTokens: 15872},
+			ModelUsage: map[string]trace.ModelUsage{
+				"m": {InputTokens: 72652, OutputTokens: 4983, CacheReadInputTokens: 86784},
+			},
+		},
+	}}
+	if got := att.Usage().Total(); got != 164419 {
+		t.Errorf("Usage total = %d, want the per-model session total 164419", got)
+	}
+}
+
+// A trace with nothing in it is the shape a killed run leaves behind; it must
+// report nothing rather than panic.
+func TestAttemptUsageOnAnEmptyTraceIsZero(t *testing.T) {
+	if got := (&Attempt{}).Usage(); got.Total() != 0 {
+		t.Errorf("Usage = %+v, want zero", got)
+	}
+	if got := (&Attempt{Trace: &trace.Trace{}}).Usage(); got.Total() != 0 {
+		t.Errorf("Usage = %+v, want zero", got)
+	}
+}
 
 func TestMockRunnerProducesGradeableTrace(t *testing.T) {
 	sb, err := sandbox.NewLocal(sandbox.LocalConfig{Root: t.TempDir()})

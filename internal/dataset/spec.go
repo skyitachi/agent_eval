@@ -13,9 +13,11 @@
 package dataset
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -161,75 +163,116 @@ type Limits struct {
 }
 
 // ---------------------------------------------------------------------------
-// Reward contract
+// Baseline
 // ---------------------------------------------------------------------------
 
-// RewardType selects how a rollout's scalar reward is derived from the grade.
+// BaselineRef points at a recorded reference attempt.
 //
-// The choice is the density of the training signal, which is the first thing an
-// RL consumer has to decide between:
+// A baseline usually comes from `aeval collect`, which turns a real Claude Code
+// session into one. It is never handed to the agent. It exists so that two
+// questions have answers that do not rest on the reader's intuition:
 //
-//   - a sparse 0/1 signal, which is hard to game but slow to learn from;
-//   - the dense weighted score, which pays out partial credit and therefore
-//     provides a gradient on almost every attempt, at the cost of rewarding
-//     shapes of progress the task author never intended to reward.
+//   - correctness: did this attempt reach the outcome the recorded session
+//     reached?
+//   - cost: did it get there in fewer tokens, in less wall-clock time?
 //
-// Declaring it explicitly, rather than leaving it implied by grader_threshold,
-// is what makes a reward auditable: "why did this rollout score 0.7?" has to be
-// answerable from the dataset alone, not from the reader's guess about defaults.
-type RewardType string
-
-const (
-	// RewardScore is the weighted grader score in [0,1]. The default.
-	RewardScore RewardType = "score"
-	// RewardPass is 1 when the task passes and 0 otherwise.
-	RewardPass RewardType = "pass"
-)
-
-// RewardSpec declares a task's reward contract.
-type RewardSpec struct {
-	Type RewardType `json:"type" yaml:"type"`
-	// Notes documents intent for humans and is never interpreted.
+// A task without a baseline can still be graded. It just cannot be compared to
+// anything except another run of this harness, which is exactly the comparison
+// that cannot tell you whether the harness is any good.
+type BaselineRef struct {
+	// File is the baseline document, relative to the dataset directory.
+	File string `json:"file,omitempty" yaml:"file,omitempty"`
+	// Notes records where the session came from, for humans.
 	Notes string `json:"notes,omitempty" yaml:"notes,omitempty"`
 }
 
-// EffectiveType resolves the reward type, defaulting to the dense score.
+// Baseline is a recorded attempt, kept so a new one can be compared against it.
 //
-// The nil receiver is deliberate: a task without a reward block must behave
-// exactly like one that spells out `type: score`, because that is the behaviour
-// every dataset written before this field existed already has.
-func (r *RewardSpec) EffectiveType() RewardType {
-	if r == nil || r.Type == "" {
-		return RewardScore
-	}
-	return r.Type
+// It is deliberately a record of *what happened*, not a script to re-run. The
+// tool calls are evidence, so a new attempt can be set beside them step by step,
+// but nothing here is fed back into the agent.
+//
+// What it cannot promise: the workspace the session started from. Claude Code
+// records the branch it was on but not the commit, so the tool records what it
+// knows (Cwd, GitBranch) and leaves GitHead empty rather than guessing.
+type Baseline struct {
+	// ID identifies the source session, or whatever else produced this.
+	ID string `json:"id"`
+	// Source names the producer, e.g. "claude-code-session".
+	Source string `json:"source,omitempty"`
+	// Notes records what this baseline does *not* cover. Baselines are
+	// approximate in ways that are easy to forget when reading a comparison --
+	// a per-turn baseline inside a longer session, for instance, has no cost of
+	// its own, because the record only ever reports a running session total.
+	Notes string `json:"notes,omitempty"`
+	// TaskID is the task this baseline belongs to, when known.
+	TaskID string `json:"task_id,omitempty"`
+
+	// Provenance of the machine the recorded attempt ran on.
+	Cwd        string `json:"cwd,omitempty"`
+	GitBranch  string `json:"git_branch,omitempty"`
+	GitHead    string `json:"git_head,omitempty"`
+	AgentName  string `json:"agent_name,omitempty"`
+	AgentModel string `json:"agent_model,omitempty"`
+
+	StartedAt time.Time `json:"started_at,omitempty"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+
+	// FinalOutput is the last non-empty assistant text: the answer, for the
+	// purposes of "did the new attempt conclude the same thing?".
+	FinalOutput string `json:"final_output,omitempty"`
+	// Turns is the recorded conversation, tool calls included.
+	Turns []BaselineTurn `json:"turns,omitempty"`
+
+	// Usage and CostUSD are the recorded spend.
+	Usage   BaselineUsage `json:"usage,omitempty"`
+	CostUSD float64       `json:"cost_usd,omitempty"`
+	// DurationMs is the recorded wall-clock time of the whole session.
+	DurationMs int64 `json:"duration_ms,omitempty"`
+	// BusyMs is the time the machine was actually working -- API time plus tool
+	// time, with the human's reading and typing excluded.
+	//
+	// This, not DurationMs, is what an unattended run is compared against. A
+	// recorded session was measured with a person in the loop and spent most of
+	// its wall clock idle; in one real session the two differed by 8.3x, so
+	// comparing wall clocks would have flattered every automated attempt by
+	// nearly an order of magnitude.
+	BusyMs int64 `json:"busy_ms,omitempty"`
+
+	// EditedFiles are the paths the recorded session modified.
+	EditedFiles []string `json:"edited_files,omitempty"`
 }
 
-// ---------------------------------------------------------------------------
-// Oracle
-// ---------------------------------------------------------------------------
+// BaselineTurn is one recorded turn.
+type BaselineTurn struct {
+	Role string `json:"role"`
+	Text string `json:"text,omitempty"`
+	// Thinking is the assistant's reasoning, kept as evidence rather than as a
+	// target: a new attempt is not expected to reason the same way.
+	Thinking string `json:"thinking,omitempty"`
+	// Tools are the tool calls issued by an assistant turn.
+	Tools []BaselineToolCall `json:"tools,omitempty"`
+	// DurationMs is this turn's wall-clock time, when the record carries it.
+	DurationMs int64 `json:"duration_ms,omitempty"`
+}
 
-// Oracle is a reference solution: what a correct attempt looks like.
-//
-// It is never handed to the agent, and it does not participate in scoring an
-// agent attempt. Its only job is to make the task's own health checkable --
-// `aeval audit` applies it and requires the task to pass, which is what turns a
-// resolve rate into an interpretable number. Without it, a task that nothing can
-// solve is indistinguishable from an agent that solved nothing.
-type Oracle struct {
-	// Patch is a unified diff applied to the workspace after setup.
-	Patch string `json:"patch,omitempty" yaml:"patch,omitempty"`
-	// PatchFile loads the patch from a file, relative to the dataset directory.
-	PatchFile string `json:"patch_file,omitempty" yaml:"patch_file,omitempty"`
-	// Files are written verbatim after the patch is applied. They exist for the
-	// cases a patch cannot express, such as adding a file to an empty directory.
-	Files map[string]string `json:"files,omitempty" yaml:"files,omitempty"`
-	// Apply runs additional commands after the patch and files, inside the
-	// sandbox, with the workspace as the working directory.
-	Apply []Command `json:"apply,omitempty" yaml:"apply,omitempty"`
+// BaselineToolCall is one recorded tool invocation.
+type BaselineToolCall struct {
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input,omitempty"`
+}
 
-	// Notes records provenance (upstream PR, commit, author) for humans.
-	Notes string `json:"notes,omitempty" yaml:"notes,omitempty"`
+// BaselineUsage is the recorded token spend.
+type BaselineUsage struct {
+	InputTokens       int `json:"input_tokens,omitempty"`
+	OutputTokens      int `json:"output_tokens,omitempty"`
+	CacheReadTokens   int `json:"cache_read_tokens,omitempty"`
+	CacheCreateTokens int `json:"cache_create_tokens,omitempty"`
+}
+
+// Total is the token count used for cost comparison, billed and cached alike.
+func (u BaselineUsage) Total() int {
+	return u.InputTokens + u.OutputTokens + u.CacheReadTokens + u.CacheCreateTokens
 }
 
 // ---------------------------------------------------------------------------
@@ -263,32 +306,11 @@ type TaskSpec struct {
 	Graders   []GraderSpec `json:"graders,omitempty" yaml:"graders,omitempty"`
 	Limits    *Limits      `json:"limits,omitempty" yaml:"limits,omitempty"`
 
-	// Reward declares how the scalar training signal is derived. Nil means the
-	// dense weighted score.
-	Reward *RewardSpec `json:"reward,omitempty" yaml:"reward,omitempty"`
-	// Oracle is the reference solution, used only by `aeval audit`.
-	Oracle *Oracle `json:"oracle,omitempty" yaml:"oracle,omitempty"`
-
-	// RestorePaths are glob patterns reset to their baseline state before the
-	// task is graded, so the attempt is judged on the code it left behind rather
-	// than on the tests it rewrote. Set this to the test files (and conftest, and
-	// any test configuration) whenever the agent could otherwise edit them.
-	//
-	// This is not anti-cheating for its own sake. Under RL a task with editable
-	// tests has a shortest path to reward that is "make the assertion vacuous",
-	// and a policy optimising against it will find that path: the guard removes
-	// the shortcut before the policy can learn it.
-	//
-	// Restored paths are also removed from the graded diff, because a file that
-	// has been reset to the baseline cannot have contributed anything to the
-	// score.
-	RestorePaths []string `json:"restore_paths,omitempty" yaml:"restore_paths,omitempty"`
-	// ForbidChangedPaths fails the attempt when the agent modified any matching
-	// path, without undoing the change. Use it where touching a file should be
-	// reported as a violation rather than silently neutralised -- it is the
-	// "did it obey the constraint?" question, whereas RestorePaths answers "can
-	// it do the work?".
-	ForbidChangedPaths []string `json:"forbid_changed_paths,omitempty" yaml:"forbid_changed_paths,omitempty"`
+	// Baseline is the recorded reference attempt this task is compared against,
+	// usually one exported from a real session by `aeval collect`. Optional: a
+	// task without one is still graded, it just has nothing to be measured
+	// against except another run of this harness.
+	Baseline *BaselineRef `json:"baseline,omitempty" yaml:"baseline,omitempty"`
 
 	// Metadata is free-form provenance: source benchmark, upstream instance id,
 	// PR links, license, etc. Never interpreted by the engine.
@@ -298,6 +320,8 @@ type TaskSpec struct {
 	DatasetDir string `json:"-" yaml:"-"`
 	// Resolved prompt text after PromptFile handling (set by loader).
 	ResolvedPrompt string `json:"-" yaml:"-"`
+	// ResolvedBaseline is the loaded baseline document (set by loader).
+	ResolvedBaseline *Baseline `json:"-" yaml:"-"`
 }
 
 // ---------------------------------------------------------------------------
@@ -332,9 +356,6 @@ type TaskDefaults struct {
 	Limits       *Limits      `json:"limits,omitempty" yaml:"limits,omitempty"`
 	Workspace    *Workspace   `json:"workspace,omitempty" yaml:"workspace,omitempty"`
 	SystemPrompt string       `json:"system_prompt,omitempty" yaml:"system_prompt,omitempty"`
-	// Reward is usually a dataset-wide decision -- one density for the whole
-	// training set -- so it is inheritable rather than per-task only.
-	Reward *RewardSpec `json:"reward,omitempty" yaml:"reward,omitempty"`
 }
 
 // Filter narrows which tasks a dataset exposes.

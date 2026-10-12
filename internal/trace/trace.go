@@ -75,7 +75,14 @@ type ToolCall struct {
 	DurationMs int64 `json:"duration_ms,omitempty"`
 }
 
-// Usage aggregates token accounting. Values come from the final result event.
+// Usage aggregates token accounting **for one API call**.
+//
+// This is the shape of the `usage` field on a result event, and that field
+// describes the call that produced that event -- not the session. Do not treat
+// it as the run's total; use Trace.Usage for that. The distinction is invisible
+// in a stream that emits one result event whose usage happens to be cumulative,
+// and glaring in one that emits several: a run that fanned out to a background
+// search reported 18.5k here against a real total of 164k.
 type Usage struct {
 	InputTokens              int `json:"input_tokens"`
 	OutputTokens             int `json:"output_tokens"`
@@ -87,6 +94,11 @@ type Usage struct {
 // Total returns the sum of all billed token classes.
 func (u Usage) Total() int {
 	return u.InputTokens + u.OutputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+}
+
+// Total returns the sum of all billed token classes.
+func (m ModelUsage) Total() int {
+	return m.InputTokens + m.OutputTokens + m.CacheReadInputTokens + m.CacheCreationInputTokens
 }
 
 // ModelUsage is per-model accounting as reported by the CLI.
@@ -219,6 +231,32 @@ func (t *Trace) ThinkingText() string {
 	return string(b)
 }
 
+// Usage returns the token accounting for the whole attempt.
+//
+// It sums the per-model totals, which the CLI reports as a running total for the
+// session, and falls back to the result event's own usage only when the endpoint
+// supplied no per-model breakdown. The result event's `usage` field is not a
+// substitute: it describes the call that emitted that event, so reading it means
+// reporting one call as if it were the run.
+//
+// Summing per model also makes the number comparable to a baseline recorded by
+// `aeval collect`, which adds up per message. Both sides then answer the same
+// question -- what did this cost in total -- and the comparison means something.
+func (t *Trace) Usage() Usage {
+	if len(t.Result.ModelUsage) == 0 {
+		return t.Result.Usage
+	}
+	var u Usage
+	for _, m := range t.Result.ModelUsage {
+		u.InputTokens += m.InputTokens
+		u.OutputTokens += m.OutputTokens
+		u.CacheReadInputTokens += m.CacheReadInputTokens
+		u.CacheCreationInputTokens += m.CacheCreationInputTokens
+		u.ThinkingTokens += m.ThinkingTokens
+	}
+	return u
+}
+
 // CostUSD returns the reported cost. Zero means "not reported" when CostBasis
 // is "unknown"; use CostReliable to distinguish.
 func (t *Trace) CostUSD() float64 { return t.Result.TotalCostUSD }
@@ -237,13 +275,20 @@ func (t *Trace) CostReliable() bool {
 	return true
 }
 
-// Turns returns the turn count, preferring the CLI's authoritative value and
-// falling back to the count derived from the stream.
+// Turns returns the number of assistant turns.
+//
+// The count derived from the stream wins over the CLI's num_turns, because
+// num_turns is not a session total. A run that emitted two result events
+// reported num_turns 1 and 2 for a session that had taken eleven turns; taking
+// the last event's word for it would have recorded a third of the work.
+// TurnCount is defined as distinct assistant message ids, so it means the same
+// thing however many result events turn up. num_turns is the fallback for a
+// stream we could not count at all.
 func (t *Trace) Turns() int {
-	if t.Result.NumTurns > 0 {
-		return t.Result.NumTurns
+	if t.TurnCount > 0 {
+		return t.TurnCount
 	}
-	return t.TurnCount
+	return t.Result.NumTurns
 }
 
 // ToolCounts returns per-tool invocation counts.

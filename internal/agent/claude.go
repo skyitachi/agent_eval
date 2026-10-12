@@ -135,6 +135,7 @@ type flags struct {
 	AgentsJSON             string
 	Settings               string
 	MCPServers             []string
+	PluginDirs             []string
 	SettingSources         []string
 	Bare                   bool
 	StrictMCPConfig        bool
@@ -166,6 +167,7 @@ func BuildCommand(spec Spec, sessionID string) string {
 		AgentsJSON:             spec.AgentsJSON,
 		Settings:               spec.Settings,
 		MCPServers:             spec.MCPServers,
+		PluginDirs:             spec.PluginDirs,
 		SettingSources:         iso.SettingSources,
 		Bare:                   iso.Bare,
 		StrictMCPConfig:        iso.StrictMCPConfig,
@@ -209,6 +211,13 @@ func renderCommand(bin string, f flags) string {
 	parts = appendList(parts, "--disallowedTools", f.DisallowedTools)
 	parts = appendList(parts, "--add-dir", f.AddDirs)
 	parts = appendList(parts, "--mcp-config", f.MCPServers)
+
+	// --plugin-dir takes exactly one value per occurrence, so it is repeated
+	// rather than made variadic. Emitting it here, after the variadic --mcp-config
+	// list, keeps that list from swallowing the flag.
+	for _, dir := range f.PluginDirs {
+		parts = append(parts, "--plugin-dir", shellQuote(dir))
+	}
 
 	if f.SystemPrompt != "" {
 		parts = append(parts, "--system-prompt", shellQuote(f.SystemPrompt))

@@ -1,0 +1,583 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"github.com/skyitachi/agenteval/internal/grader"
+)
+
+func openTemp(t *testing.T) *Store {
+	t.Helper()
+	s, err := Open(filepath.Join(t.TempDir(), "runs.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func sampleRun(id string) Run {
+	return Run{
+		ID: id, Name: "sweep-model-opus", Status: RunRunning,
+		StartedAt:   time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC),
+		DatasetPath: "/ds/demo", DatasetName: "demo", DatasetHash: "sha256:abc",
+		AgentKind: "claude_code", AgentModel: "opus", AgentBin: "claude",
+		Backend: "local", Samples: 3, Concurrency: 4,
+		FactorAxis: "model", FactorLevel: "opus", SweepID: "sw1",
+		Notes: "n", ToolVersion: "dev", ConfigJSON: `{"a":1}`,
+	}
+}
+
+func sampleAttempt(runID, taskID string) Attempt {
+	return Attempt{
+		RunID: runID, TaskID: taskID, Sample: 0,
+		Category: "bugfix", Tags: []string{"go", "easy"},
+		Status: CellOK, StopReason: "completed",
+		Graded: true, Passed: true, Score: 0.75, Threshold: 1,
+		DurationMs: 1234, CostUSD: 0.5,
+		InputTokens: 100, OutputTokens: 20, CacheReadTokens: 5, CacheCreateTokens: 1,
+		Turns: 7, ToolCalls: 9, ToolErrors: 1,
+		Diff: "--- a\n+++ b\n", Answer: "done",
+		Grades: []grader.Result{{Grader: "tests", Type: "pytest", Passed: true, Score: 1, Weight: 1}},
+		Trace:  json.RawMessage(`{"turns":[{"role":"assistant"}]}`),
+		Baseline: BaselineComparison{
+			Present: true, ID: "sess-1", Ref: "baselines/x.json",
+			Tokens: 9000, Ms: 60000, Cost: 0.25, Turns: 12,
+			Output: "the recorded answer",
+		},
+		Error: "warn", WorkspaceDir: "/tmp/ws",
+	}
+}
+
+func TestSchemaVersionIsWrittenOnFirstOpen(t *testing.T) {
+	s := openTemp(t)
+	v, err := s.existingVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v != schemaVersion {
+		t.Errorf("version = %d, want %d", v, schemaVersion)
+	}
+}
+
+func TestOpenRefusesASchemaFromAnotherBuild(t *testing.T) {
+	// Silently reusing a database whose columns mean something else is how a
+	// reporting bug becomes a week of confusion.
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE schema_meta(key TEXT PRIMARY KEY, value TEXT);` +
+		`INSERT INTO schema_meta VALUES('version','99')`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	_, err = Open(path)
+	if err == nil {
+		t.Fatal("opening a v99 database must fail")
+	}
+	if !strings.Contains(err.Error(), "v99") || !strings.Contains(err.Error(), "fresh file") {
+		t.Errorf("the error should name the version and the way out, got %v", err)
+	}
+}
+
+func TestOpenRefusesAPrototypeDatabase(t *testing.T) {
+	// The earlier prototype had a task_runs table and RL reward columns. Its
+	// results answer different questions, so it is refused rather than guessed
+	// at.
+	path := filepath.Join(t.TempDir(), "prototype.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE task_runs(id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	if _, err := Open(path); err == nil {
+		t.Fatal("opening a prototype database must fail")
+	}
+}
+
+// TestOpenUpgradesAV1Database covers the other half of the version rule: an
+// older database is not one to throw away. The alternative is asking someone to
+// discard runs they already paid for because a text column was added.
+//
+// The v1 shape is built from this build's own schema minus the column v2 adds,
+// rather than from a copied-out DDL string, so the fixture cannot quietly drift
+// away from what v1 actually was.
+func TestOpenUpgradesAV1Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v1.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE attempts DROP COLUMN baseline_output`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','1')`,
+		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
+		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id, baseline_tokens)
+		 VALUES('r1','t1','ok',1,'sess-1',9000)`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v1 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v1 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	got, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatalf("list attempts: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("attempts = %d, want the row that was already in the database", len(got))
+	}
+	// Empty is the honest reading of a v1 row, not a defect: the column did not
+	// exist when it was written, so no recording's answer was ever kept for it.
+	if got[0].Baseline.Output != "" {
+		t.Errorf("baseline output = %q, want empty for a row written before v2", got[0].Baseline.Output)
+	}
+	if !got[0].Baseline.Present || got[0].Baseline.Tokens != 9000 || got[0].Baseline.ID != "sess-1" {
+		t.Errorf("the upgrade lost numbers that were already in the row: %+v", got[0].Baseline)
+	}
+	// The point of upgrading rather than refusing is being able to write to the
+	// old database at the new revision.
+	if err := s.SaveAttempt(ctx, Attempt{
+		RunID: "r1", TaskID: "t2", Status: CellOK,
+		Baseline: BaselineComparison{Present: true, Output: "an answer kept after the upgrade"},
+	}); err != nil {
+		t.Fatalf("save into an upgraded database: %v", err)
+	}
+	again, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range again {
+		if a.TaskID == "t2" && a.Baseline.Output != "an answer kept after the upgrade" {
+			t.Errorf("baseline output = %q after the upgrade", a.Baseline.Output)
+		}
+	}
+}
+
+// TestAnInterruptedUpgradeCanBeReRun covers the window between a migration
+// step's DDL and the version bump: the column already exists and the version
+// still says v1. ADD COLUMN is not idempotent, so without the guard the next
+// open dies on "duplicate column name" -- a confusing way to say "nothing is
+// wrong".
+func TestAnInterruptedUpgradeCanBeReRun(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "midway.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(string(body)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`INSERT INTO schema_meta(key, value) VALUES('version','1')`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-running an interrupted migration must be a no-op, got: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d", v, schemaVersion)
+	}
+}
+
+func TestRunRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	want := sampleRun("r1")
+	if err := s.CreateRun(ctx, want); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	got, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if got.Name != want.Name || got.AgentModel != "opus" || got.Backend != "local" {
+		t.Errorf("run = %+v", got)
+	}
+	if got.Samples != 3 || got.Concurrency != 4 {
+		t.Errorf("samples/concurrency = %d/%d", got.Samples, got.Concurrency)
+	}
+	if got.FactorAxis != "model" || got.FactorLevel != "opus" || got.SweepID != "sw1" {
+		t.Errorf("factor labels lost: %+v", got)
+	}
+	if !got.StartedAt.Equal(want.StartedAt) {
+		t.Errorf("started = %v, want %v", got.StartedAt, want.StartedAt)
+	}
+	if got.Status != RunRunning {
+		t.Errorf("status = %q", got.Status)
+	}
+}
+
+func TestGetRunReportsMissing(t *testing.T) {
+	_, err := openTemp(t).GetRun(context.Background(), "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestMissingRunNamesTheDatabase pins the one piece of context that turns a
+// confusing failure into an obvious one. "run X not found" reads like a broken
+// tool; "not found in aeval.db" reads like the wrong --db, which is what it
+// almost always is. The sentinel still has to match, because callers branch on
+// it rather than on the wording.
+func TestMissingRunNamesTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+
+	_, err := s.GetRun(ctx, "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Errorf("a missing run must still match ErrNotFound: %v", err)
+	}
+	if !strings.Contains(err.Error(), s.path) {
+		t.Errorf("the error does not say which database was searched: %v", err)
+	}
+
+	// FinishRun and DeleteRun are the other two lookups a user can miss with,
+	// and they have to say the same thing.
+	if err := s.FinishRun(ctx, "nope", RunCompleted, ""); !strings.Contains(err.Error(), s.path) {
+		t.Errorf("FinishRun does not name the database: %v", err)
+	}
+	if err := s.DeleteRun(ctx, "nope"); !strings.Contains(err.Error(), s.path) {
+		t.Errorf("DeleteRun does not name the database: %v", err)
+	}
+}
+
+func TestFinishRunStampsTheOutcome(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishRun(ctx, "r1", RunCompleted, ""); err != nil {
+		t.Fatalf("FinishRun: %v", err)
+	}
+	got, _ := s.GetRun(ctx, "r1")
+	if got.Status != RunCompleted {
+		t.Errorf("status = %q", got.Status)
+	}
+	if got.EndedAt == nil {
+		t.Error("ended_at was not set")
+	}
+	if err := s.FinishRun(ctx, "missing", RunCompleted, ""); !errors.Is(err, ErrNotFound) {
+		t.Errorf("finishing a missing run: %v", err)
+	}
+}
+
+func TestCreateRunUpserts(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	r := sampleRun("r1")
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	r.Notes = "updated"
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatalf("second CreateRun: %v", err)
+	}
+	runs, err := s.ListRuns(ctx, RunFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Notes != "updated" {
+		t.Errorf("runs = %+v", runs)
+	}
+}
+
+func TestListRunsOrdersAndFilters(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	base := time.Date(2026, 2, 3, 4, 5, 6, 0, time.UTC)
+
+	a := sampleRun("a")
+	a.StartedAt = base
+	b := sampleRun("b")
+	b.StartedAt = base.Add(time.Hour)
+	b.SweepID, b.FactorLevel = "sw2", "sonnet"
+	c := sampleRun("c")
+	c.StartedAt = base.Add(2 * time.Hour)
+	c.SweepID, c.FactorAxis, c.FactorLevel = "sw2", "skill", "none"
+	for _, r := range []Run{a, b, c} {
+		if err := s.CreateRun(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	all, _ := s.ListRuns(ctx, RunFilter{})
+	if len(all) != 3 {
+		t.Fatalf("runs = %d, want 3", len(all))
+	}
+	if all[0].ID != "c" || all[2].ID != "a" {
+		t.Errorf("order = %s,%s,%s; want newest first", all[0].ID, all[1].ID, all[2].ID)
+	}
+
+	bySweep, _ := s.ListRuns(ctx, RunFilter{SweepID: "sw2"})
+	if len(bySweep) != 2 {
+		t.Errorf("sweep filter returned %d, want 2", len(bySweep))
+	}
+
+	byAxis, _ := s.ListRuns(ctx, RunFilter{FactorAxis: "skill"})
+	if len(byAxis) != 1 || byAxis[0].ID != "c" {
+		t.Errorf("axis filter returned %+v", byAxis)
+	}
+
+	limited, _ := s.ListRuns(ctx, RunFilter{Limit: 2})
+	if len(limited) != 2 {
+		t.Errorf("limit returned %d, want 2", len(limited))
+	}
+}
+
+func TestDeleteRunTakesItsAttemptsWithIt(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveAttempt(ctx, sampleAttempt("r1", "t1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteRun(ctx, "r1"); err != nil {
+		t.Fatalf("DeleteRun: %v", err)
+	}
+	if _, err := s.GetRun(ctx, "r1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("run survived deletion: %v", err)
+	}
+	attempts, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 0 {
+		t.Errorf("attempts survived their run: %d", len(attempts))
+	}
+}
+
+func TestAttemptRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	want := sampleAttempt("r1", "t1")
+	if err := s.SaveAttempt(ctx, want); err != nil {
+		t.Fatalf("SaveAttempt: %v", err)
+	}
+	got, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("attempts = %d", len(got))
+	}
+	g := got[0]
+	switch {
+	case g.TaskID != "t1" || g.Category != "bugfix":
+		t.Errorf("identity = %+v", g)
+	case !g.Graded || !g.Passed || g.Score != 0.75 || g.Threshold != 1:
+		t.Errorf("verdict = %+v", g)
+	case g.DurationMs != 1234 || g.CostUSD != 0.5:
+		t.Errorf("cost = %+v", g)
+	case g.InputTokens != 100 || g.OutputTokens != 20 || g.CacheReadTokens != 5 || g.CacheCreateTokens != 1:
+		t.Errorf("tokens = %+v", g)
+	case g.Turns != 7 || g.ToolCalls != 9 || g.ToolErrors != 1:
+		t.Errorf("counts = %+v", g)
+	case g.StopReason != "completed" || g.Error != "warn":
+		t.Errorf("outcome = %+v", g)
+	case g.WorkspaceDir != "/tmp/ws":
+		t.Errorf("workspace = %q", g.WorkspaceDir)
+	}
+	if len(g.Tags) != 2 || g.Tags[0] != "go" {
+		t.Errorf("tags = %v", g.Tags)
+	}
+	if len(g.Grades) != 1 || g.Grades[0].Grader != "tests" || !g.Grades[0].Passed {
+		t.Errorf("grades = %+v", g.Grades)
+	}
+	if len(g.Trace) == 0 {
+		t.Error("trace did not survive")
+	}
+	if !g.Baseline.Present || g.Baseline.ID != "sess-1" || g.Baseline.Tokens != 9000 ||
+		g.Baseline.Ms != 60000 || g.Baseline.Cost != 0.25 || g.Baseline.Turns != 12 {
+		t.Errorf("baseline = %+v", g.Baseline)
+	}
+	// The recorded answer is why the column exists: without it the report can
+	// compare what two attempts cost but never whether they agreed.
+	if g.Baseline.Output != "the recorded answer" {
+		t.Errorf("baseline output = %q, want the recorded answer to survive storage", g.Baseline.Output)
+	}
+}
+
+func TestAttemptUpsertsOnTheSameCell(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	a := sampleAttempt("r1", "t1")
+	if err := s.SaveAttempt(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	a.Passed = false
+	a.Score = 0
+	if err := s.SaveAttempt(ctx, a); err != nil {
+		t.Fatalf("re-save: %v", err)
+	}
+	got, _ := s.ListAttempts(ctx, "r1")
+	if len(got) != 1 {
+		t.Fatalf("attempts = %d, want 1 (the cell is the key)", len(got))
+	}
+	if got[0].Passed {
+		t.Error("the second save did not replace the first")
+	}
+}
+
+func TestSamplesAreDistinctCells(t *testing.T) {
+	// pass@k runs a task k times; the samples must not collapse onto one row.
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		a := sampleAttempt("r1", "t1")
+		a.Sample = i
+		if err := s.SaveAttempt(ctx, a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, _ := s.ListAttempts(ctx, "r1")
+	if len(got) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(got))
+	}
+	for i, a := range got {
+		if a.Sample != i {
+			t.Errorf("attempt %d has sample %d; ListAttempts must order by sample", i, a.Sample)
+		}
+	}
+}
+
+func TestSaveAttemptRejectsAMalformedTrace(t *testing.T) {
+	// Storing invalid JSON would push the failure into the reporting layer,
+	// where it would look like a rendering bug.
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	a := sampleAttempt("r1", "t1")
+	a.Trace = json.RawMessage(`{"oops"`)
+	if err := s.SaveAttempt(ctx, a); err == nil {
+		t.Fatal("a malformed trace must be refused")
+	}
+}
+
+func TestSaveAttemptRequiresIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.SaveAttempt(ctx, Attempt{TaskID: "t1"}); err == nil {
+		t.Error("an attempt with no run id must be refused")
+	}
+	if err := s.SaveAttempt(ctx, Attempt{RunID: "r1"}); err == nil {
+		t.Error("an attempt with no task id must be refused")
+	}
+}
+
+func TestColumnListsMatchTheirValues(t *testing.T) {
+	// The insert builds its values as a slice and checks the count against the
+	// column list. This asserts the mechanism itself works, so a future column
+	// addition fails loudly here rather than in a saved run.
+	if err := checkArity("attempts", attemptColumns, make([]any, countColumns(attemptColumns))); err != nil {
+		t.Errorf("arity check rejected a matching slice: %v", err)
+	}
+	err := checkArity("attempts", attemptColumns, make([]any, countColumns(attemptColumns)-1))
+	if err == nil {
+		t.Fatal("arity check accepted a short slice")
+	}
+	if !strings.Contains(err.Error(), "attempts") {
+		t.Errorf("the error should name the table, got %v", err)
+	}
+}
+
+func countColumns(list string) int {
+	n := 0
+	for _, p := range strings.Split(list, ",") {
+		if strings.TrimSpace(p) != "" {
+			n++
+		}
+	}
+	return n
+}
+
+func TestOpenCreatesParentDirectories(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "deeper", "runs.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	if s.Path() != path {
+		t.Errorf("path = %q", s.Path())
+	}
+}
+
+func TestOpenRejectsAnEmptyPath(t *testing.T) {
+	if _, err := Open(""); err == nil {
+		t.Error("an empty path must be refused")
+	}
+}
+
+func TestTagsAndGradesNeverStoreAsNull(t *testing.T) {
+	// NULL and [] decode differently; a report that has to special-case nil
+	// slices is a report that will forget to.
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatal(err)
+	}
+	a := sampleAttempt("r1", "t1")
+	a.Tags, a.Grades = nil, nil
+	if err := s.SaveAttempt(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.ListAttempts(ctx, "r1")
+	if got[0].Tags == nil || got[0].Grades == nil {
+		t.Errorf("tags/grades came back nil: %+v", got[0])
+	}
+}

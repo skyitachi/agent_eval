@@ -7,7 +7,27 @@
 *.db
 *.db-wal
 *.db-shm
+# A journal file appears only when SQLite falls back from WAL to rollback mode
+# (a filesystem without shared memory, e.g. a network mount). `Open` does not
+# check the mode WAL was set to, so that fallback is silent and this is the only
+# trace of it.
+*.db-journal
 /reports/
+
+# Per-cell workspaces. `aeval run` puts them in <db dir>/workspaces, which is the
+# repository root whenever --db is left at its default. Each cell is a full copy
+# of the task's repository, so this is the largest thing that can land in
+# `git status`; `--keep` is what leaves them on disk for inspection.
+#
+# Anchored to the root on purpose: datasets/demo/workspaces/ is a dataset asset
+# that must stay tracked.
+/workspaces/
+
+# Datasets collected from local sessions, via `aeval collect --out datasets/<name>`.
+# They record absolute paths on this machine and the text of real sessions, and
+# they can be regenerated from those sessions at any time. Add the directory each
+# `--out` points at; `git add -f` one deliberately if it should become an example.
+/datasets/local_claude_code/
 
 # Reports written into the working tree by `aeval run --report` / `report` / `compare`.
 /report-*.html

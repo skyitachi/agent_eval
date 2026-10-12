@@ -3,80 +3,93 @@
 // # Why a view model instead of the storage types
 //
 // The report is a *function of the database*, not of the process that produced
-// it. A report generated two weeks later from a copied .db file must be
-// byte-identical to one generated on the machine that ran the evaluation. That
-// only holds if the renderer reads nothing but persisted state, so the storage
-// rows are projected onto the types below first and everything downstream --
-// HTML, the web UI, the comparison page -- works on that projection.
+// it. A report generated two weeks later from a copied .db must be the document
+// the run produced. That only holds if the renderer reads nothing but persisted
+// state, so storage rows are projected onto the types below first and everything
+// downstream -- the file, the served page, the comparison -- works on the
+// projection.
+//
+// # Why some types are borrowed rather than mirrored
+//
+// The run's arithmetic is runner.Summary and a sweep's answer is
+// attrib.Attribution, both embedded here rather than copied into report-local
+// equivalents. A mirror struct is a second definition of the same thing, and the
+// two drift: a field added to the runner's summary would silently never reach
+// the page. Borrowing the type means the only way to change the shape is to
+// change it in one place.
 //
 // # Why the data travels as JSON inside the page
 //
 // A report is opened from a file:// URL or an email attachment as often as from
-// a server, and the interesting interactions (filter, sort, expand a
-// trajectory) must work with no network. So the page ships a shell plus one JSON
-// document and lets the browser do the rest. The same JSON is what the web UI's
-// API returns, which is why the file report and the served report cannot drift.
+// a server, and its interactions -- filter, sort, expand a trajectory -- must
+// work with no network. So the page ships a shell plus one JSON document and
+// lets the browser do the rest.
 package report
 
-import "time"
+import (
+	"time"
+
+	"github.com/skyitachi/agenteval/internal/attrib"
+	"github.com/skyitachi/agenteval/internal/runner"
+)
 
 // DataVersion guards the embedded payload against a stale renderer. Bump it when
 // the JSON shape changes in a way an older app.js cannot read.
-const DataVersion = 1
+//
+// v2 is the minimal model: the reward, guard and oracle fields are gone, and a
+// task carries what it cost against its recorded baseline instead of what a
+// training loop would have paid for it.
+const DataVersion = 2
 
 // Options controls what a report embeds.
 //
-// Every limit exists because reports have two opposing failure modes: too big
-// to open (a 900-task SWE-bench run with full trajectories is hundreds of
-// megabytes) and too lossy to debug. The defaults favour completeness and the
-// builder degrades deterministically -- dropping *passing* task detail before
-// failing detail -- rather than silently producing an unusable file.
+// Every limit exists because reports have two opposing failure modes: too big to
+// open (a 300-task run with full trajectories is tens of megabytes) and too
+// lossy to debug. The defaults favour completeness and the builder degrades
+// deterministically -- dropping *passing* task detail before failing detail --
+// rather than silently producing an unusable file.
 type Options struct {
 	// Title overrides the document title.
 	Title string
 	// GeneratedAt stamps the report; zero means time.Now.
 	GeneratedAt time.Time
 
-	// MaxEventsPerTask bounds how many normalized trajectory events are kept
-	// per task. The head and the tail are kept, because both the opening
-	// instructions and the final answer matter.
-	MaxEventsPerTask int
 	// MaxToolCallsPerTask bounds the per-task tool-call table.
 	MaxToolCallsPerTask int
-	// MaxFieldBytes clips a single text field (diff, answer, tool output,
-	// event text). Kept generous: a truncated stack trace is worthless.
+	// MaxEventsPerTask bounds the per-task trajectory. Both ends are kept: the
+	// opening events carry the task framing and the last ones carry the answer,
+	// and a viewer that shows only the head is a viewer that never shows what
+	// happened.
+	MaxEventsPerTask int
+	// MaxFieldBytes clips a single text field (diff, answer, tool output).
+	// Kept generous: a truncated stack trace is worthless.
 	MaxFieldBytes int
 
 	// MaxInlineBytes budgets the whole serialized payload. Once the budget is
-	// exhausted, remaining *passing* tasks lose their trajectory/diff detail;
-	// failing tasks are always detailed first.
+	// exhausted, remaining *passing* tasks lose their trajectory and diff;
+	// failing tasks keep their evidence longest.
 	MaxInlineBytes int
 
-	// Artifacts maps a cell key ("taskID#sampleIndex") to the directory holding
-	// the engine's artifact bundle. When absent the directory is derived from
-	// the stored raw-stream path. This is what lets the report show the task
-	// prompt and definition, which live in task.json rather than in SQLite.
-	Artifacts map[string]string
-
-	// IncludeRawConfig keeps the redacted configuration JSON on the run. It is
-	// already stored, so this only decides whether the report carries it.
-	IncludeRawConfig bool
+	// NoTaskDetail drops per-task diffs, answers and trajectories entirely,
+	// producing a small summary report rather than a truncated one. This is
+	// what a reader who only wants the numbers is asking for; it is also the
+	// only way to get a bounded document out of a run whose cells are enormous.
+	NoTaskDetail bool
 }
 
-// withDefaults resolves an Options into a usable one.
 func (o Options) withDefaults() Options {
-	if o.MaxEventsPerTask <= 0 {
-		o.MaxEventsPerTask = 400
-	}
 	if o.MaxToolCallsPerTask <= 0 {
 		o.MaxToolCallsPerTask = 200
+	}
+	if o.MaxEventsPerTask <= 0 {
+		o.MaxEventsPerTask = 400
 	}
 	if o.MaxFieldBytes <= 0 {
 		o.MaxFieldBytes = 20000
 	}
-	// 8 MiB of JSON inflates to roughly 12 MiB of HTML once the page is
-	// pretty-printed by a browser. That opens instantly on any machine made in
-	// the last decade and still fits a 300-task run with every failure detailed.
+	// 8 MiB of JSON inflates to roughly 12 MiB of HTML once a browser has
+	// pretty-printed it. That opens instantly on any machine made in the last
+	// decade and still fits a 300-task run with every failure detailed.
 	if o.MaxInlineBytes <= 0 {
 		o.MaxInlineBytes = 8 << 20
 	}
@@ -90,19 +103,25 @@ func (o Options) withDefaults() Options {
 // Payload
 // ---------------------------------------------------------------------------
 
-// Data is everything a rendered report needs.
+// Data is everything a rendered report needs. Exactly one of Compare and Sweep
+// is set on a report that is not about a single run.
 type Data struct {
-	Version     int         `json:"version"`
-	Generated   string      `json:"generated"`
-	Title       string      `json:"title"`
-	Run         RunInfo     `json:"run"`
-	Metrics     []Metric    `json:"metrics"`
-	Breakdowns  []Breakdown `json:"breakdowns"`
-	Tasks       []Task      `json:"tasks"`
-	Counts      Counts      `json:"counts"`
-	Warnings    []string    `json:"warnings,omitempty"`
-	Compare     *Compare    `json:"compare,omitempty"`
-	Description []string    `json:"description,omitempty"`
+	Version   int      `json:"version"`
+	Generated string   `json:"generated"`
+	Title     string   `json:"title"`
+	Run       RunInfo  `json:"run"`
+	Metrics   []Metric `json:"metrics"`
+	Tasks     []Task   `json:"tasks"`
+	Counts    Counts   `json:"counts"`
+
+	// Breakdowns render as bars: pass rate per category, stop-reason mix, and
+	// the split between graded, timed-out and unmeasured cells.
+	Breakdowns []Breakdown `json:"breakdowns,omitempty"`
+	// Warnings record where the report is less complete than the run was.
+	Warnings []string `json:"warnings,omitempty"`
+
+	Compare *Compare            `json:"compare,omitempty"`
+	Sweep   *attrib.Attribution `json:"sweep,omitempty"`
 }
 
 // RunInfo is the run's provenance and headline metadata.
@@ -112,68 +131,68 @@ type RunInfo struct {
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
 
-	CreatedAt  string `json:"created_at"`
-	FinishedAt string `json:"finished_at,omitempty"`
+	StartedAt  string `json:"started_at"`
+	EndedAt    string `json:"ended_at,omitempty"`
 	DurationMs int64  `json:"duration_ms"`
 
-	DatasetName    string `json:"dataset_name"`
-	DatasetVersion string `json:"dataset_version,omitempty"`
-	DatasetHash    string `json:"dataset_hash,omitempty"`
-	DatasetPath    string `json:"dataset_path,omitempty"`
+	DatasetName string `json:"dataset_name"`
+	DatasetHash string `json:"dataset_hash,omitempty"`
+	DatasetPath string `json:"dataset_path,omitempty"`
 
-	AgentKind      string `json:"agent_kind"`
-	AgentModel     string `json:"agent_model,omitempty"`
-	SandboxBackend string `json:"sandbox_backend"`
-	SandboxImage   string `json:"sandbox_image,omitempty"`
+	AgentKind  string `json:"agent_kind"`
+	AgentModel string `json:"agent_model,omitempty"`
+	AgentBin   string `json:"agent_bin,omitempty"`
+	Backend    string `json:"backend"`
 
-	// Mode says who acted: agent, oracle, baseline or rl. It is rendered rather
-	// than hidden because the four produce identically shaped results, and an
-	// unlabelled oracle run reads as an unusually good model.
-	Mode string `json:"mode,omitempty"`
+	Samples     int `json:"samples_per_task"`
+	Concurrency int `json:"concurrency"`
 
-	SamplesPerTask int   `json:"samples_per_task"`
-	Concurrency    int   `json:"concurrency"`
-	Seed           int64 `json:"seed"`
+	// The sweep coordinates, rendered because a run that is one point of a
+	// sweep reads very differently from a standalone one.
+	FactorAxis  string `json:"factor_axis,omitempty"`
+	FactorLevel string `json:"factor_level,omitempty"`
+	SweepID     string `json:"sweep_id,omitempty"`
 
-	ConfigHash  string `json:"config_hash,omitempty"`
-	ConfigJSON  string `json:"config_json,omitempty"`
 	Notes       string `json:"notes,omitempty"`
 	ToolVersion string `json:"tool_version,omitempty"`
-	HostArch    string `json:"host_arch,omitempty"`
+
+	// Summary is the runner's own arithmetic, borrowed so that the CLI's
+	// printed totals and the page's totals cannot disagree.
+	Summary runner.Summary `json:"summary"`
 }
 
 // Counts is the cell tally, kept separate so the header never has to reduce the
 // task list in JavaScript.
 type Counts struct {
-	// Samples counts cells; Tasks counts distinct task ids. They differ whenever
-	// SamplesPerTask > 1, and both are worth showing.
-	Samples        int `json:"samples"`
+	// Cells counts attempts; Tasks counts distinct task ids. They differ
+	// whenever SamplesPerTask > 1 and both are worth showing.
+	Cells          int `json:"cells"`
 	Tasks          int `json:"tasks"`
+	Graded         int `json:"graded"`
 	Passed         int `json:"passed"`
-	TasksPassed    int `json:"tasks_passed"`
 	Failed         int `json:"failed"`
-	Skipped        int `json:"skipped"`
-	Errored        int `json:"errored"`
+	Ungraded       int `json:"ungraded"`
+	Timeouts       int `json:"timeouts"`
+	HarnessErrors  int `json:"harness_errors"`
 	SamplesPerTask int `json:"samples_per_task"`
 }
 
-// Metric is one computed number, pre-rendered so the browser needs no unit
-// formatting logic of its own.
+// Metric is one headline number, pre-formatted so the browser needs no unit
+// logic of its own.
 type Metric struct {
-	Name        string         `json:"name"`
-	Label       string         `json:"label,omitempty"`
-	Value       float64        `json:"value"`
-	Display     string         `json:"display"`
-	Unit        string         `json:"unit"`
-	Kind        string         `json:"kind"`
-	Description string         `json:"description,omitempty"`
-	Group       string         `json:"group"`
-	Direction   string         `json:"direction,omitempty"` // up | down | neutral
-	Extra       map[string]any `json:"extra,omitempty"`
+	Key     string `json:"key"`
+	Label   string `json:"label"`
+	Display string `json:"display"`
+	// Unit is for the tooltip; Display already carries it where it reads well.
+	Unit string `json:"unit,omitempty"`
+	// Direction says which way is good, and is the reason a metric is not just
+	// a number: painting a token increase green is worse than not painting it.
+	Direction string `json:"direction,omitempty"` // up | down | neutral
+	// Note explains a number that would otherwise read as a defect.
+	Note string `json:"note,omitempty"`
 }
 
-// Breakdown is a named distribution rendered as bars (resolve rate per
-// category, stop-reason mix, ...).
+// Breakdown is a named distribution rendered as bars.
 type Breakdown struct {
 	Title string         `json:"title"`
 	Note  string         `json:"note,omitempty"`
@@ -189,71 +208,42 @@ type BreakdownRow struct {
 	Hits  int     `json:"hits,omitempty"`
 }
 
-// Task is one graded cell, the unit the detail panel renders.
+// Task is one cell, the unit the detail drawer renders.
 type Task struct {
 	Key         string   `json:"key"`
 	ID          string   `json:"id"`
 	SampleIndex int      `json:"sample_index"`
 	Category    string   `json:"category,omitempty"`
-	Difficulty  string   `json:"difficulty,omitempty"`
 	Tags        []string `json:"tags,omitempty"`
 
-	Status     string  `json:"status"`
-	StopReason string  `json:"stop_reason,omitempty"`
-	Passed     bool    `json:"passed"`
-	Score      float64 `json:"score"`
-	Threshold  float64 `json:"threshold"`
+	Status     string `json:"status"`
+	StopReason string `json:"stop_reason,omitempty"`
+	// Graded is false when the task had nothing to score it against. Kept
+	// distinct from Passed so that "measured but unscored" is not rendered as a
+	// failure.
+	Graded    bool    `json:"graded"`
+	Passed    bool    `json:"passed"`
+	Score     float64 `json:"score"`
+	Threshold float64 `json:"threshold"`
 
-	// Reward is the scalar a training loop is paid, projected through the
-	// task's declared contract. It is reported next to Passed and Score rather
-	// than instead of them: the two answer different questions, and a reader
-	// comparing a reward against a score needs to see both to tell a sparse
-	// contract from a wrong answer.
-	Reward     float64 `json:"reward"`
-	RewardKind string  `json:"reward_kind,omitempty"`
-	// Rejected marks an attempt that tripped an anti-gaming guard. Its reward is
-	// zero, and the distinction between "wrong" and "tampered" is the point.
-	Rejected   bool     `json:"rejected,omitempty"`
-	Violations []string `json:"violations,omitempty"`
-	// Restored names the paths reset to the baseline before grading, so a
-	// reader can see that a shortcut was removed rather than that the agent
-	// obeyed.
-	Restored []string `json:"restored,omitempty"`
+	DurationMs int64   `json:"duration_ms"`
+	CostUSD    float64 `json:"cost_usd"`
 
-	StartedAt  string `json:"started_at,omitempty"`
-	EndedAt    string `json:"ended_at,omitempty"`
-	DurationMs int64  `json:"duration_ms"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	CacheRead    int `json:"cache_read_tokens"`
+	CacheCreate  int `json:"cache_create_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 
-	CostUSD      float64 `json:"cost_usd"`
-	CostReliable bool    `json:"cost_reliable"`
-	InputTokens  int     `json:"input_tokens"`
-	OutputTokens int     `json:"output_tokens"`
-	CacheRead    int     `json:"cache_read_tokens"`
-	CacheCreate  int     `json:"cache_create_tokens"`
-	TotalTokens  int     `json:"total_tokens"`
-	Turns        int     `json:"turns"`
-	ToolCalls    int     `json:"tool_calls"`
-	ToolErrors   int     `json:"tool_errors"`
-	TTFTMs       int64   `json:"ttft_ms"`
-	APIDuration  int64   `json:"api_duration_ms"`
+	Turns      int `json:"turns"`
+	ToolCalls  int `json:"tool_calls"`
+	ToolErrors int `json:"tool_errors"`
 
-	SessionID string `json:"session_id,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Error     string `json:"error,omitempty"`
+	// Baseline is the comparison the runner resolved at run time, so the page
+	// needs no access to the dataset.
+	Baseline *BaselineView `json:"baseline,omitempty"`
 
-	// Attempt-level diagnostics, from the stored attempt blob.
-	ExitCode      *int     `json:"exit_code,omitempty"`
-	TimedOut      bool     `json:"timed_out,omitempty"`
-	TurnsExceeded bool     `json:"turns_exceeded,omitempty"`
-	AgentFailed   bool     `json:"agent_failed,omitempty"`
-	CommandLine   string   `json:"command_line,omitempty"`
-	Stderr        string   `json:"stderr,omitempty"`
-	ParseErrors   []string `json:"parse_errors,omitempty"`
-	Incomplete    bool     `json:"incomplete,omitempty"`
-
-	// Definition is the task contract, read from the artifact bundle when it is
-	// reachable; nil when the bundle is gone.
-	Definition *Definition `json:"definition,omitempty"`
+	Error string `json:"error,omitempty"`
 
 	Diff   string `json:"diff,omitempty"`
 	Answer string `json:"answer,omitempty"`
@@ -262,41 +252,50 @@ type Task struct {
 	Tools   []ToolCall `json:"tools,omitempty"`
 	Events  []Event    `json:"events,omitempty"`
 
-	// Detail records why this task carries less than the full trajectory.
-	// Empty means nothing was dropped.
+	// Detail records why this task carries less than it did at run time. Empty
+	// means nothing was dropped.
 	Detail string `json:"detail,omitempty"`
-
-	ArtifactDir   string `json:"artifact_dir,omitempty"`
-	WorkspaceDir  string `json:"workspace_dir,omitempty"`
-	RawStreamPath string `json:"raw_stream_path,omitempty"`
 }
 
-// Definition is the task as declared in the dataset, recovered from task.json.
-type Definition struct {
-	Prompt       string         `json:"prompt,omitempty"`
-	SystemPrompt string         `json:"system_prompt,omitempty"`
-	Version      string         `json:"version,omitempty"`
-	Workspace    string         `json:"workspace,omitempty"`
-	Output       string         `json:"output,omitempty"`
-	Limits       string         `json:"limits,omitempty"`
-	Graders      []string       `json:"graders,omitempty"`
-	Metadata     map[string]any `json:"metadata,omitempty"`
-	Baseline     string         `json:"baseline,omitempty"`
-	Raw          string         `json:"raw,omitempty"`
+// BaselineView is a cell's numbers next to the recorded session's.
+type BaselineView struct {
+	ID  string `json:"id,omitempty"`
+	Ref string `json:"ref,omitempty"`
+	// Tokens and Ms are the baseline's own totals; BusyMs rather than wall
+	// clock for the time, because the recorded session had a human in the loop.
+	Tokens int     `json:"tokens"`
+	Ms     int64   `json:"ms"`
+	Cost   float64 `json:"cost_usd"`
+	Turns  int     `json:"turns"`
+	// Deltas are this attempt minus the baseline. Negative means cheaper.
+	//
+	// HasTokens and HasTime are false when the recording carried nothing to
+	// subtract, in which case the delta is meaningless and has to be rendered
+	// as a dash. A recording that never captured busy time is not a recording
+	// that took no time.
+	TokenDelta int   `json:"token_delta"`
+	MsDelta    int64 `json:"ms_delta"`
+	HasTokens  bool  `json:"has_tokens"`
+	HasTime    bool  `json:"has_time"`
+
+	// Output is the recorded session's final answer, rendered beside this
+	// attempt's so the reader can compare conclusions and not only spend.
+	// Empty means the recording kept none -- which is every row written before
+	// schema v2, and any recording whose session ended without assistant text.
+	Output string `json:"output,omitempty"`
 }
 
 // Grader is one grader verdict.
 type Grader struct {
-	Grader     string         `json:"grader"`
-	Type       string         `json:"type"`
-	Passed     bool           `json:"passed"`
-	Score      float64        `json:"score"`
-	Weight     float64        `json:"weight"`
-	Required   bool           `json:"required"`
-	Reason     string         `json:"reason,omitempty"`
-	Error      string         `json:"error,omitempty"`
-	DurationMs int64          `json:"duration_ms"`
-	Details    map[string]any `json:"details,omitempty"`
+	Name     string         `json:"name"`
+	Type     string         `json:"type"`
+	Passed   bool           `json:"passed"`
+	Score    float64        `json:"score"`
+	Weight   float64        `json:"weight"`
+	Required bool           `json:"required"`
+	Reason   string         `json:"reason,omitempty"`
+	Error    string         `json:"error,omitempty"`
+	Details  map[string]any `json:"details,omitempty"`
 }
 
 // ToolCall is one flattened tool invocation.
@@ -310,7 +309,8 @@ type ToolCall struct {
 	Output     string `json:"output,omitempty"`
 }
 
-// Event is one normalized trajectory step.
+// Event is one step of the normalized trajectory. Kind matches the trace
+// package's vocabulary, which is what the client switches on.
 type Event struct {
 	Index     int    `json:"index"`
 	Kind      string `json:"kind"`
@@ -327,8 +327,7 @@ type Event struct {
 // Comparison
 // ---------------------------------------------------------------------------
 
-// Compare is a side-by-side of two runs. It reuses the task and metric types so
-// the same client-side renderer handles both modes.
+// Compare is a side-by-side of two runs.
 type Compare struct {
 	LeftRunID  string `json:"left_run_id"`
 	RightRunID string `json:"right_run_id"`
@@ -342,45 +341,43 @@ type Compare struct {
 
 // MetricDelta is one metric across two runs.
 type MetricDelta struct {
-	Name        string  `json:"name"`
-	Label       string  `json:"label,omitempty"`
-	Unit        string  `json:"unit"`
-	Description string  `json:"description,omitempty"`
-	Direction   string  `json:"direction,omitempty"`
-	Left        float64 `json:"left"`
-	Right       float64 `json:"right"`
-	LeftText    string  `json:"left_text"`
-	RightText   string  `json:"right_text"`
-	Delta       float64 `json:"delta"`
-	DeltaText   string  `json:"delta_text"`
-	Verdict     string  `json:"verdict"` // better | worse | same | unknown
-	// OnlyRight / OnlyLeft mark a metric present in one run but not the other,
-	// which is what happens when a custom metric was added between runs.
-	OnlyLeft  bool `json:"only_left,omitempty"`
-	OnlyRight bool `json:"only_right,omitempty"`
+	Key       string  `json:"key"`
+	Label     string  `json:"label"`
+	Unit      string  `json:"unit,omitempty"`
+	Direction string  `json:"direction,omitempty"`
+	Left      float64 `json:"left"`
+	Right     float64 `json:"right"`
+	LeftText  string  `json:"left_text"`
+	RightText string  `json:"right_text"`
+	Delta     float64 `json:"delta"`
+	DeltaText string  `json:"delta_text"`
+	// Verdict is better | worse | same | unknown. Unknown is the honest answer
+	// for a metric whose direction is not known, which is every custom one.
+	Verdict string `json:"verdict"`
 }
 
 // TaskDelta is one task across two runs.
 type TaskDelta struct {
-	Key       string  `json:"key"`
-	TaskID    string  `json:"id"`
-	Category  string  `json:"category,omitempty"`
-	Verdict   string  `json:"verdict"` // fixed | regressed | unchanged | added | removed
-	Left      TaskRef `json:"left"`
-	Right     TaskRef `json:"right"`
-	LeftDiff  string  `json:"left_diff,omitempty"`
-	RightDiff string  `json:"right_diff,omitempty"`
+	Key      string `json:"key"`
+	ID       string `json:"id"`
+	Category string `json:"category,omitempty"`
+	// Verdict is fixed | regressed | unchanged | added | removed | ungraded.
+	Verdict string  `json:"verdict"`
+	Left    TaskRef `json:"left"`
+	Right   TaskRef `json:"right"`
 }
 
 // TaskRef is the compact per-run view of a task inside a comparison.
 type TaskRef struct {
 	Present    bool    `json:"present"`
+	Graded     bool    `json:"graded"`
 	Passed     bool    `json:"passed"`
 	Status     string  `json:"status,omitempty"`
 	StopReason string  `json:"stop_reason,omitempty"`
 	Score      float64 `json:"score"`
 	DurationMs int64   `json:"duration_ms"`
 	CostUSD    float64 `json:"cost_usd"`
+	Tokens     int     `json:"total_tokens"`
 	Turns      int     `json:"turns"`
 	Error      string  `json:"error,omitempty"`
 }
@@ -392,6 +389,46 @@ type CompareCounts struct {
 	Regressed int `json:"regressed"`
 	BothPass  int `json:"both_pass"`
 	BothFail  int `json:"both_fail"`
+	Ungraded  int `json:"ungraded"`
 	OnlyLeft  int `json:"only_left"`
 	OnlyRight int `json:"only_right"`
+}
+
+// ---------------------------------------------------------------------------
+// Run index
+// ---------------------------------------------------------------------------
+
+// Index is the run listing.
+type Index struct {
+	Version   int          `json:"version"`
+	Generated string       `json:"generated"`
+	Title     string       `json:"title"`
+	Runs      []IndexEntry `json:"runs"`
+	// Live is true when the listing was produced while a run was still going,
+	// which is what makes the page reload itself instead of going stale.
+	Live bool `json:"live,omitempty"`
+}
+
+// IndexEntry is one row of the listing.
+type IndexEntry struct {
+	ID         string `json:"id"`
+	Name       string `json:"name,omitempty"`
+	Status     string `json:"status"`
+	StartedAt  string `json:"started_at"`
+	DurationMs int64  `json:"duration_ms"`
+
+	DatasetName string `json:"dataset_name"`
+	AgentKind   string `json:"agent_kind,omitempty"`
+	AgentModel  string `json:"agent_model,omitempty"`
+
+	FactorAxis  string `json:"factor_axis,omitempty"`
+	FactorLevel string `json:"factor_level,omitempty"`
+	SweepID     string `json:"sweep_id,omitempty"`
+
+	Counts   Counts   `json:"counts"`
+	Tokens   int      `json:"tokens"`
+	CostUSD  float64  `json:"cost_usd"`
+	PassRate *float64 `json:"pass_rate,omitempty"`
+
+	Error string `json:"error,omitempty"`
 }

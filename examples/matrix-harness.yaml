@@ -1,0 +1,60 @@
+# A harness sweep: one axis varied, everything else held fixed.
+#
+#   aeval matrix --file examples/matrix-harness.yaml --db agenteval.db
+#   aeval matrix --file examples/matrix-harness.yaml --dry-run    # plan only
+#
+# The harness axis owns the implementation and its configuration -- which agent
+# binary, which prompt, which isolation -- and nothing else. A level that
+# changed the model would be rejected at load time rather than quietly producing
+# a number nobody can attribute, because a sweep that moves two things at once
+# measures their combination and can say nothing about either.
+#
+# This particular sweep uses the mock agent and the two scripted stand-ins in
+# tests/testdata, so it runs with no model, no network and no credentials: it is
+# a smoke test of the sweep machinery rather than a finding about any agent.
+# The intended use is a real one, where the levels are two ways of driving
+# Claude Code and the reader wants to know which is cheaper at the same accuracy.
+#
+# A caveat about the demo dataset: it has three tasks, and the sign test used to
+# separate a level from its control cannot reach significance on fewer than six
+# non-tied pairs however lopsided they are. So this sweep will report the
+# difference it found and decline to call it real. That is the intended
+# behaviour, not a defect -- point the sweep at a real dataset to get verdicts.
+name: demo-harness-sweep
+notes: |
+  Two scripted stand-ins compared against the shared configuration, to show what
+  a sweep records and how a level is judged against its control.
+
+dataset: ../datasets/demo
+axis: harness
+# The level every other level is measured against. It is not a special kind of
+# record: it is simply the one the others are subtracted from.
+control: stock
+
+samples: 1
+concurrency: 1
+
+# The configuration every level starts from. A level's agent block is a partial
+# document: it replaces only the keys it names.
+agent:
+  kind: mock
+  bin: ../tests/testdata/agents/good.sh
+  model: scripted-good
+
+levels:
+  - name: stock
+    notes: the shared configuration, unchanged
+
+  # Nothing in the mock reads a system prompt, so this level will come out
+  # identical to the control. It is here deliberately: a sweep that only ever
+  # shows movement cannot be distinguished from one that reports movement for
+  # everything, and this is the level that notices if that starts happening.
+  - name: terse-prompt
+    notes: the same commands with an extra line of system prompt
+    agent:
+      append_system_prompt: Answer with the bare number and nothing else.
+
+  - name: scripted-failure
+    notes: a stand-in that gets every demo task wrong
+    agent:
+      bin: ../tests/testdata/agents/bad.sh

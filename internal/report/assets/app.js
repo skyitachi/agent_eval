@@ -9,6 +9,16 @@
  * browser, which makes innerHTML a stored-XSS sink. Every interpolation goes
  * through esc() by default; only fragments explicitly wrapped in raw() -- and
  * therefore constructed only by this file -- bypass it.
+ *
+ * The two rules that keep that honest, both learned from bugs:
+ *   1. A value interpolated into a template must already be escaped or wrapped
+ *      in raw(). A tpl() result that is interpolated unwrapped is escaped a
+ *      second time and prints its own markup (the diff view did).
+ *   2. A node is appended, never interpolated. tpl() stringifies what it is
+ *      given, so handing it an element built by el() prints "[object
+ *      HTMLDivElement]" where the element should have been (every drawer tab
+ *      did). Rendering the mistake as a named marker is the fallback; not
+ *      making it is the fix.
  */
 (function () {
   'use strict';
@@ -20,6 +30,13 @@
   function raw(s) {
     var o = {};
     o[RAW] = String(s);
+    /* Stringifies back to its own markup, so "a" + raw(x) is the fragment and
+     * not "[object Object]". The baseline rows were written that way -- a
+     * plain string plus, on the next line, a wrapped fragment -- and printed
+     * "[object Object]" where the delta should have been. toString() makes
+     * that form correct instead of merely wrong, and it is what a fragment
+     * means anyway. */
+    o.toString = function () { return o[RAW]; };
     return o;
   }
 
@@ -33,6 +50,18 @@
     });
   }
 
+  /* A value this file never meant to interpolate -- a DOM node built for
+   * appendChild, or a plain object -- used to fall through to String(v) and
+   * print "[object HTMLDivElement]" in the middle of a report: the mistake
+   * looked like data, so nobody could tell a broken card from a card whose
+   * content was that string. It is a bug here, not payload, so it is rendered
+   * as a marker that names itself instead of as a plausible-looking value. */
+  function unrenderable(v) {
+    var name = (v && v.constructor && v.constructor.name) || typeof v;
+    return '<span class="bad" title="a template cannot render a ' + esc(name) +
+      '; append the node, or wrap the value in raw()">\u26a0 unrendered ' + esc(name) + '</span>';
+  }
+
   function tpl(strings) {
     var vals = Array.prototype.slice.call(arguments, 1);
     var out = '';
@@ -43,6 +72,7 @@
       if (v == null || v === false) continue;
       if (isRaw(v)) out += v[RAW];
       else if (Array.isArray(v)) out += v.map(function (x) { return isRaw(x) ? x[RAW] : esc(x); }).join('');
+      else if (typeof v === 'object') out += unrenderable(v);
       else out += esc(v);
     }
     return out;
@@ -162,12 +192,16 @@
     }
   }
 
+  /* A cell's status is about the harness; passed is about the agent. They are
+   * separate because "ran out of its budget" and "did the wrong thing" are
+   * different findings, and "there was nothing to score it against" is a third. */
   function statusPill(t) {
     var cls, text;
-    if (t.status === 'skipped') { cls = 'skip'; text = 'skipped'; }
-    else if (t.status === 'failed') { cls = 'fail'; text = 'failed'; }
+    if (t.status === 'error') { cls = 'fail'; text = 'harness error'; }
+    else if (t.status === 'timeout') { cls = 'warn'; text = 'timed out'; }
+    else if (!t.graded) { cls = 'warn'; text = 'not graded'; }
     else if (t.passed) { cls = 'pass'; text = 'passed'; }
-    else { cls = 'fail'; text = 'not passed'; }
+    else { cls = 'fail'; text = 'failed'; }
     return raw(tpl`<span class="pill ${cls}">${text}</span>`);
   }
 
@@ -175,7 +209,7 @@
    * written) does not change the verdict, so it is surfaced next to the pill
    * rather than folded into it. */
   function errorFlag(t) {
-    if (!t.error || t.status === 'failed') return raw('');
+    if (!t.error || t.status === 'error') return raw('');
     return raw(tpl`<span class="v warn" title="${t.error}">note</span>`);
   }
 
@@ -201,42 +235,41 @@
       b.innerHTML = tpl`Evaluations<span class="brand-sub">run history</span>`;
     } else if (MODE === 'compare') {
       b.innerHTML = tpl`Comparison<span class="brand-sub">${P.compare ? P.compare.left_label + ' → ' + P.compare.right_label : ''}</span>`;
+    } else if (MODE === 'sweep') {
+      var sw = P.sweep || {};
+      b.innerHTML = tpl`Attribution<span class="brand-sub">${sw.axis ? sw.axis + ' sweep' : ''}</span>`;
     } else {
       var r = P.run || {};
-      b.innerHTML = tpl`Report<span class="brand-sub">${r.dataset_name || ''}${r.dataset_version ? '@' + r.dataset_version : ''}</span>`;
+      b.innerHTML = tpl`Report<span class="brand-sub">${r.dataset_name || ''}</span>`;
     }
   }
+
+  var RUN_STATUS_CLASS = { completed: 'pass', running: 'warn', interrupted: 'warn', failed: 'fail' };
 
   function renderRunHead() {
     var r = P.run || {};
     var counts = P.counts || {};
-    var statusCls = r.status === 'completed' ? 'pass' : (r.status === 'running' ? 'warn' : 'fail');
+    var statusCls = RUN_STATUS_CLASS[r.status] || 'fail';
 
     var chips = [];
     chips.push(raw(tpl`<span class="pill ${statusCls}">${r.status}</span>`));
     if (r.dataset_name) {
-      chips.push(raw(tpl`<span class="chip">dataset <b>${r.dataset_name}${r.dataset_version ? '@' + r.dataset_version : ''}</b></span>`));
+      chips.push(raw(tpl`<span class="chip">dataset <b>${r.dataset_name}</b></span>`));
     }
     if (r.dataset_hash) chips.push(raw(tpl`<span class="chip">revision <b class="mono-sm">${r.dataset_hash.slice(0, 18)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">agent <b>${r.agent_kind || '-'}</b></span>`));
     if (r.agent_model) chips.push(raw(tpl`<span class="chip">model <b>${r.agent_model}</b></span>`));
-    /* The mode says who acted. An oracle or baseline run stores a result with
-     * exactly the shape of an agent run, so this chip is the only thing on the
-     * page that stops "the reference solution passes" from being read as "the
-     * model passes". It gets an emphatic class when it is not the default. */
-    if (r.mode) {
-      chips.push(raw(tpl`<span class="chip${r.mode === 'agent' ? '' : ' mode-alert'}">mode <b>${r.mode}</b></span>`));
+    chips.push(raw(tpl`<span class="chip">backend <b>${r.backend || '-'}</b></span>`));
+    /* The sweep coordinates are rendered because a run that is one point of a
+     * sweep reads very differently from a standalone one: its numbers are only
+     * meaningful next to the control level's. */
+    if (r.factor_axis) {
+      chips.push(raw(tpl`<span class="chip mode-alert">sweep <b>${r.factor_axis}=${r.factor_level || '?'}</b></span>`));
     }
-    chips.push(raw(tpl`<span class="chip">backend <b>${r.sandbox_backend || '-'}</b></span>`));
-    if (r.sandbox_image) chips.push(raw(tpl`<span class="chip">image <b class="mono-sm">${r.sandbox_image}</b></span>`));
     chips.push(raw(tpl`<span class="chip">k=<b>${r.samples_per_task}</b> · concurrency <b>${r.concurrency}</b></span>`));
-    chips.push(raw(tpl`<span class="chip">started <b>${clock(r.created_at)}</b></span>`));
+    chips.push(raw(tpl`<span class="chip">started <b>${clock(r.started_at)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">duration <b>${dur(r.duration_ms)}</b></span>`));
-    if (r.host_arch) chips.push(raw(tpl`<span class="chip">host <b>${r.host_arch}</b></span>`));
     if (r.tool_version) chips.push(raw(tpl`<span class="chip">tool <b>${r.tool_version}</b></span>`));
-
-    var actions = [];
-    actions.push(raw(tpl`<a class="btn ghost" href="#tasks">Tasks</a>`));
 
     var head = el(tpl`
       <div class="card runhead">
@@ -245,15 +278,15 @@
             <h1>${r.name || r.id || 'Evaluation run'}</h1>
             <div class="subtitle mono-sm">${r.id || ''}</div>
           </div>
-          <div class="runhead-actions">${actions}</div>
         </div>
         <div class="chips">${chips}</div>
         <div class="chips">
-          <span class="chip"><b>${int(counts.passed)}</b> / <b>${int(counts.samples)}</b> cells passed</span>
-          <span class="chip"><b>${int(counts.tasks_passed)}</b> / <b>${int(counts.tasks)}</b> tasks resolved</span>
+          <span class="chip"><b>${int(counts.passed)}</b> / <b>${int(counts.graded)}</b> graded cells passed</span>
+          <span class="chip"><b>${int(counts.cells)}</b> cells over <b>${int(counts.tasks)}</b> tasks</span>
           ${counts.failed ? raw(tpl`<span class="chip">failed <b>${int(counts.failed)}</b></span>`) : ''}
-          ${counts.errored ? raw(tpl`<span class="chip">errored <b>${int(counts.errored)}</b></span>`) : ''}
-          ${counts.skipped ? raw(tpl`<span class="chip">skipped <b>${int(counts.skipped)}</b></span>`) : ''}
+          ${counts.timeouts ? raw(tpl`<span class="chip">timed out <b>${int(counts.timeouts)}</b></span>`) : ''}
+          ${counts.ungraded ? raw(tpl`<span class="chip">ungraded <b>${int(counts.ungraded)}</b></span>`) : ''}
+          ${counts.harness_errors ? raw(tpl`<span class="chip">harness errors <b>${int(counts.harness_errors)}</b></span>`) : ''}
         </div>
       </div>`);
     return head;
@@ -266,7 +299,12 @@
       frag.appendChild(el(tpl`<div class="notice err"><b>Run error.</b> ${r.error}</div>`));
     }
     if (P.warnings && P.warnings.length) {
-      var items = P.warnings.map(function (w) { return tpl`<li>${w}</li>`; });
+      /* raw(), because these are interpolated into another template below:
+       * an unwrapped tpl result reaches that template as a string and is
+       * escaped a second time, which prints the markup instead of rendering
+       * it. Every value that a template interpolates has to arrive either
+       * escaped already or wrapped. */
+      var items = P.warnings.map(function (w) { return raw(tpl`<li>${w}</li>`); });
       frag.appendChild(el(tpl`<div class="notice warn"><b>Report notes.</b><ul>${items}</ul></div>`));
     }
     if (r.notes) {
@@ -277,49 +315,29 @@
 
   /* --------------------------------------------------------------- metrics */
 
-  function metricExtra(m) {
-    var e = m.extra;
-    if (!e) return '';
-    if (e.reason) return e.reason;
-    var parts = [];
-    Object.keys(e).sort().forEach(function (k) {
-      var v = e[k];
-      if (v == null || typeof v === 'object') return;
-      var s = typeof v === 'number' ? (Number.isInteger(v) ? int(v) : num(v, 3)) : String(v);
-      if (/^(passed|total|count|resolved|cost|tokens|k)$/.test(k)) parts.push(k + '=' + s);
-    });
-    return parts.slice(0, 3).join(' · ');
-  }
-
+  /* Metrics are a flat list, not a grouped one: the grouping that used to be
+   * here came from a metric registry this build does not have, and inventing
+   * groups for seven run-level numbers would be decoration.
+   *
+   * The direction hint is spelled out rather than left to colour. A value is
+   * not good or bad on its own -- what makes 400k tokens good is that the last
+   * run used 600k -- so the card says which way is better and leaves the
+   * judgement to the reader. */
   function renderMetrics() {
     var metrics = P.metrics || [];
     if (!metrics.length) return null;
-    var groups = {};
-    var order = [];
-    metrics.forEach(function (m) {
-      var g = m.group || 'other';
-      if (!groups[g]) { groups[g] = []; order.push(g); }
-      groups[g].push(m);
+    var cards = metrics.map(function (m) {
+      var info = m.note ? raw(tpl` <span class="infobtn" title="${m.note}">ⓘ</span>`) : raw('');
+      var hint = m.direction === 'down' ? 'lower is better'
+        : (m.direction === 'up' ? 'higher is better' : '');
+      return raw(tpl`
+        <div class="metric">
+          <div class="name">${m.label || m.key}${info}${hint ? raw(tpl`<span class="dirhint"> · ${hint}</span>`) : ''}</div>
+          <div class="value">${m.display}</div>
+          ${m.unit ? raw(tpl`<div class="extra">${m.unit}</div>`) : ''}
+        </div>`);
     });
-    var wrap = el('<div></div>');
-    order.forEach(function (g) {
-      var cards = groups[g].map(function (m) {
-        var info = m.description ? raw(tpl` <span class="infobtn" title="${m.description}">ⓘ</span>`) : raw('');
-        var extra = metricExtra(m);
-        return raw(tpl`
-          <div class="metric">
-            <div class="name">${m.label || m.name}${info}</div>
-            <div class="value">${m.display}</div>
-            ${extra ? raw(tpl`<div class="extra">${extra}</div>`) : ''}
-          </div>`);
-      });
-      wrap.appendChild(el(tpl`
-        <div class="metric-group">
-          <h3>${g}</h3>
-          <div class="metrics">${cards}</div>
-        </div>`));
-    });
-    return wrap;
+    return el(tpl`<div class="metrics">${cards}</div>`);
   }
 
   /* ------------------------------------------------------------ breakdowns */
@@ -354,28 +372,54 @@
 
   /* ------------------------------------------------------------ task table */
 
-  /* The reward column answers "what would a trainer have been paid", which is a
-   * different question from the score column. A dense contract pays the score; a
-   * sparse one pays 0 or 1; and an attempt rejected by a guard pays 0 whatever it
-   * scored. An empty reward_kind means the row was written before the column
-   * existed, so the cell says nothing rather than printing a 0 that would read
-   * as a measurement. */
-  function rewardCell(t) {
-    if (t.violations && t.violations.length) {
-      return raw(tpl`<span class="v fail" title="${t.violations.join('; ')}">0 · rejected</span>`);
+  /* The baseline column answers "what did this cost against the attempt that
+   * is on record", which is a different question from the score column. The
+   * time delta is measured against the recorded session's *busy* time, not its
+   * wall clock: that session had a human in the loop and spent most of its wall
+   * time waiting for one, so a wall-clock comparison would flatter every run. */
+  function baselineCell(t) {
+    var b = t.baseline;
+    if (!b) return raw('<span class="muted" title="this task declares no recorded baseline">-</span>');
+    /* A recording keeps what it knows and omits the rest. A delta against a
+     * number that was never captured is not zero, it is unknown, and printing
+     * "+0s" would read as "no change" rather than as "never measured". */
+    var parts = [];
+    if (b.has_tokens) {
+      parts.push(raw(tpl`<span class="delta ${signClass(b.token_delta, true)}" title="${int(b.tokens)} tokens in the recorded attempt">${signedInt(b.token_delta)} tok</span>`));
     }
-    if (!t.reward_kind) {
-      return raw('<span class="muted" title="this run did not record which reward contract produced the value">-</span>');
+    if (b.has_time) {
+      parts.push(raw(tpl`<span class="delta ${signClass(b.ms_delta, true)}" title="${dur(b.ms)} busy time in the recorded attempt">${signedDur(b.ms_delta)}</span>`));
     }
-    var label = t.reward > 0 ? 'pass' : 'fail';
-    return raw(tpl`<span class="scorebar"><span class="track ${label}"><i style="width:${Math.max(0, Math.min(1, t.reward || 0)) * 100}%"></i></span><span class="num">${num(t.reward, 3)}</span></span><span class="tmeta muted"> ${t.reward_kind}</span>`);
+    if (!parts.length) {
+      return raw('<span class="muted" title="the recorded attempt carries neither a token total nor a busy time to compare against">-</span>');
+    }
+    return raw(tpl`<span class="baseline">${parts}</span>`);
+  }
+
+  /* Lower is better for everything a baseline is compared on, so the class is
+   * chosen by sign rather than by a caller-supplied flag. */
+  function signClass(v, lowerIsBetter) {
+    if (!v) return 'same';
+    var good = lowerIsBetter ? v < 0 : v > 0;
+    return good ? 'better' : 'worse';
+  }
+
+  function signedInt(v) {
+    if (v == null || isNaN(v)) return '-';
+    return (v > 0 ? '+' : '') + int(v);
+  }
+
+  function signedDur(v) {
+    if (v == null || isNaN(v)) return '-';
+    if (!v) return '0s';
+    return (v > 0 ? '+' : '-') + dur(Math.abs(v));
   }
 
   var COLUMNS = [
     { key: 'task', label: 'Task', sortable: true },
     { key: 'status', label: 'Status', sortable: true },
     { key: 'score', label: 'Score', sortable: true, num: true },
-    { key: 'reward', label: 'Reward', sortable: true, num: true },
+    { key: 'baseline', label: 'vs baseline', sortable: false, num: true },
     { key: 'duration_ms', label: 'Duration', sortable: true, num: true },
     { key: 'cost_usd', label: 'Cost', sortable: true, num: true },
     { key: 'total_tokens', label: 'Tokens', sortable: true, num: true },
@@ -388,15 +432,16 @@
   function filteredTasks() {
     var q = S.query.trim().toLowerCase();
     var out = (P.tasks || []).filter(function (t) {
-      if (S.status === 'failed' && t.passed) return false;
+      if (S.status === 'failed' && !(t.graded && !t.passed)) return false;
       if (S.status === 'passed' && !t.passed) return false;
-      if (S.status === 'errored' && t.status !== 'failed') return false;
-      if (S.status === 'skipped' && t.status !== 'skipped') return false;
+      if (S.status === 'ungraded' && t.graded) return false;
+      if (S.status === 'timeout' && t.status !== 'timeout') return false;
+      if (S.status === 'error' && t.status !== 'error') return false;
       if (S.category && t.category !== S.category) return false;
       if (S.reason && t.stop_reason !== S.reason) return false;
       if (q) {
-        var hay = [t.id, t.category, t.difficulty, t.stop_reason, t.model, (t.tags || []).join(' '),
-          t.error || '', (t.graders || []).map(function (g) { return g.grader; }).join(' ')].join(' ').toLowerCase();
+        var hay = [t.id, t.category, t.stop_reason, (t.tags || []).join(' '),
+          t.error || '', (t.graders || []).map(function (g) { return g.name; }).join(' ')].join(' ').toLowerCase();
         if (hay.indexOf(q) < 0) return false;
       }
       return true;
@@ -425,10 +470,11 @@
     function count(fn) { return all.filter(fn).length; }
     var defs = [
       ['all', 'All', all.length],
-      ['failed', 'Not passed', count(function (t) { return !t.passed; })],
+      ['failed', 'Failed', count(function (t) { return t.graded && !t.passed; })],
       ['passed', 'Passed', count(function (t) { return t.passed; })],
-      ['errored', 'Errored', count(function (t) { return t.status === 'failed'; })],
-      ['skipped', 'Skipped', count(function (t) { return t.status === 'skipped'; })]
+      ['ungraded', 'Not graded', count(function (t) { return !t.graded; })],
+      ['timeout', 'Timed out', count(function (t) { return t.status === 'timeout'; })],
+      ['error', 'Harness error', count(function (t) { return t.status === 'error'; })]
     ];
     var btns = defs.map(function (d) {
       return raw(tpl`<button type="button" class="fbtn ${S.status === d[0] ? 'on' : ''}" data-status="${d[0]}">${d[1]}<span class="n">${int(d[2])}</span></button>`);
@@ -481,16 +527,16 @@
     var rows = shown.map(function (t) {
       var detail = t.detail ? raw(tpl`<span class="v warn" title="${t.detail}">partial</span>`) : raw('<span class="muted">full</span>');
       return raw(tpl`
-        <tr data-key="${t.key}" class="${S.selected === t.key ? 'selected' : ''}${t.status === 'skipped' ? ' gone' : ''}">
+        <tr data-key="${t.key}" class="${S.selected === t.key ? 'selected' : ''}">
           <td class="task">
             ${t.id}${(P.counts && P.counts.samples_per_task > 1) ? raw(tpl`<span class="muted mono-sm"> #${t.sample_index}</span>`) : ''}
-            <span class="tmeta">${[t.category, t.difficulty].filter(Boolean).join(' · ')}${t.tags && t.tags.length ? (([t.category, t.difficulty].filter(Boolean).length) ? ' · ' : '') + t.tags.join(', ') : ''}</span>
+            <span class="tmeta">${[t.category].concat(t.tags || []).filter(Boolean).join(' · ')}</span>
           </td>
-          <td>${statusPill(t)}${errorFlag(t)}${t.model ? raw(tpl`<span class="tmeta muted mono-sm">${t.model}</span>`) : ''}</td>
+          <td>${statusPill(t)}${errorFlag(t)}</td>
           <td class="num">${scoreCell(t)}</td>
-          <td class="num">${rewardCell(t)}</td>
+          <td class="num">${baselineCell(t)}</td>
           <td class="num">${dur(t.duration_ms)}</td>
-          <td class="num">${t.cost_usd ? money(t.cost_usd) : raw('<span class="muted">-</span>')}${t.cost_usd && !t.cost_reliable ? raw('<span class="muted" title="endpoint did not report a price">*</span>') : ''}</td>
+          <td class="num">${t.cost_usd ? money(t.cost_usd) : raw('<span class="muted">-</span>')}</td>
           <td class="num">${t.total_tokens ? tokens(t.total_tokens) : raw('<span class="muted">-</span>')}</td>
           <td class="num">${int(t.turns)}</td>
           <td class="num">${t.tool_calls ? int(t.tool_calls) + (t.tool_errors ? raw(tpl`<span class="v fail" title="${t.tool_errors} tool error(s)">!</span>`) : '') : '-'}</td>
@@ -561,13 +607,16 @@
       return raw(tpl`<button type="button" class="tab ${S.tab === name ? 'on' : ''}" data-tab="${name}">${name}${tabCount(name, t)}</button>`);
     });
 
-    var body = el(tpl`<div>${tabBody(S.tab, t)}</div>`);
+    /* Each tab returns a node; append it. Interpolating the node here is the
+     * mistake that broke every tab -- a template stringifies it. */
+    var body = document.createElement('div');
+    body.appendChild(tabBody(S.tab, t));
 
     var head = el(tpl`
       <div class="drawer-head">
         <div>
           <h2>${t.id}${(P.counts && P.counts.samples_per_task > 1) ? raw(tpl` <span class="muted">#${t.sample_index}</span>`) : ''}</h2>
-          <div class="sub">${[t.category, t.difficulty, t.status, t.stop_reason].filter(Boolean).join(' · ')}</div>
+          <div class="sub">${[t.category, t.status, t.stop_reason].filter(Boolean).join(' · ')}</div>
         </div>
         <div class="runhead-actions">
           <button type="button" class="btn ghost" id="drawer-close">Close</button>
@@ -615,66 +664,98 @@
     return raw(tpl`<dl class="kv">${items}</dl>`);
   }
 
-  function overviewTab(t) {
-    var def = t.definition;
-    var parts = [];
-
-    if (t.error) parts.push(raw(tpl`<div class="notice err"><b>Error.</b> ${t.error}</div>`));
-    if (t.detail) parts.push(raw(tpl`<div class="notice warn"><b>Partial detail.</b> ${t.detail}</div>`));
-    if (t.parse_errors && t.parse_errors.length) {
-      parts.push(raw(tpl`<div class="notice warn"><b>${t.parse_errors.length} unparsable stream line(s).</b> The trajectory below is incomplete.</div>`));
+  function baselineRows(t) {
+    var b = t.baseline;
+    if (!b) return [];
+    var rows = [
+      ['baseline', b.id ? raw(tpl`<span class="mono-sm">${b.id}</span>${b.ref ? raw(tpl` <span class="muted">${b.ref}</span>`) : ''}`) : '']
+    ];
+    if (b.has_tokens) {
+      rows.push(['tokens', raw(tpl`${int(t.total_tokens)} now vs ${int(b.tokens)} recorded → <span class="delta ${signClass(b.token_delta, true)}">${signedInt(b.token_delta)}</span>`)]);
+    } else {
+      rows.push(['tokens', int(t.total_tokens) + ' now; the recording carries no token total to compare against']);
     }
+    if (b.has_time) {
+      rows.push(['busy time', raw(tpl`${dur(t.duration_ms)} now vs ${dur(b.ms)} recorded → <span class="delta ${signClass(b.ms_delta, true)}">${signedDur(b.ms_delta)}</span>`)]);
+    } else {
+      rows.push(['busy time', dur(t.duration_ms) + ' now; the recording carries no busy time to compare against']);
+    }
+    rows.push(
+      ['turns', int(t.turns) + ' now vs ' + int(b.turns) + ' recorded'],
+      ['note', 'the recorded time is the session\u2019s busy time (API plus tool), not its wall clock: it had a human in the loop']
+    );
+    return rows;
+  }
 
-    parts.push(el(tpl`
+  /* Returns a node, like every other tab, and the drawer appends it. This tab
+   * used to return an array mixing raw strings with nodes built by el(), which
+   * the caller interpolated into a template -- and a template stringifies what
+   * it is given, so two of the three cards rendered as "[object
+   * HTMLDivElement]" and the one that survived was the one that happened to be
+   * a string. Appending cannot have that failure mode. */
+  function overviewTab(t) {
+    var frag = document.createDocumentFragment();
+
+    if (t.error) frag.appendChild(el(tpl`<div class="notice err"><b>Error.</b> ${t.error}</div>`));
+    if (t.detail) frag.appendChild(el(tpl`<div class="notice warn"><b>Partial detail.</b> ${t.detail}</div>`));
+
+    frag.appendChild(el(tpl`
       <div class="card" style="padding:14px 16px;margin-bottom:14px">
         ${kv([
-          ['status', t.status + (t.passed ? ' (passed)' : '')],
+          ['status', t.status + (t.graded ? (t.passed ? ' · passed' : ' · failed') : ' · nothing to score against')],
           ['stop reason', t.stop_reason],
-          ['score', num(t.score, 4) + ' / threshold ' + num(t.threshold, 2)],
-          ['reward', t.reward_kind ? raw(tpl`<span class="mono-sm">${num(t.reward, 4)}</span> <span class="muted">${t.reward_kind} contract</span>`) : ''],
-          ['violations', (t.violations || []).length ? raw(tpl`<span class="v fail">${t.violations.join('; ')}</span>`) : ''],
-          ['restored', (t.restored || []).length ? raw(tpl`<span class="mono-sm">${t.restored.join(', ')}</span> <span class="muted">reset to the baseline before grading</span>`) : ''],
-          ['model', t.model],
-          ['session', t.session_id ? raw(tpl`<span class="mono-sm">${t.session_id}</span>`) : ''],
-          ['started / ended', clock(t.started_at) + ' → ' + clock(t.ended_at)],
+          ['score', t.graded ? num(t.score, 4) + ' / threshold ' + num(t.threshold, 2) : ''],
           ['duration', dur(t.duration_ms)],
-          ['cost', money(t.cost_usd) + (t.cost_reliable ? '' : ' (not reported by the endpoint)')],
+          ['cost', money(t.cost_usd)],
           ['tokens', 'in ' + int(t.input_tokens) + ' · out ' + int(t.output_tokens) + ' · cache read ' + int(t.cache_read_tokens) + ' · cache write ' + int(t.cache_create_tokens)],
           ['turns / tools', int(t.turns) + ' turns · ' + int(t.tool_calls) + ' calls · ' + int(t.tool_errors) + ' errored'],
-          ['ttft / api', dur(t.ttft_ms) + ' / ' + dur(t.api_duration_ms)],
-          ['exit code', t.exit_code == null ? '' : String(t.exit_code) + (t.timed_out ? ' (timed out)' : '') + (t.turns_exceeded ? ' (turn budget exceeded)' : '')],
-          ['tags', (t.tags || []).join(', ')],
-          ['command', t.command_line ? raw(tpl`<span class="mono-sm">${t.command_line}</span>`) : ''],
-          ['artifacts', t.artifact_dir ? raw(tpl`<span class="mono-sm">${t.artifact_dir}</span>`) : ''],
-          ['workspace', t.workspace_dir ? raw(tpl`<span class="mono-sm">${t.workspace_dir}</span>`) : '']
+          ['tags', (t.tags || []).join(', ')]
         ])}
       </div>`));
 
-    if (t.answer) {
-      parts.push(raw(tpl`<h3 class="small muted">Final answer</h3>`));
-      parts.push(raw(tpl`<pre class="code">${t.answer}</pre>`));
+    var brows = baselineRows(t);
+    if (brows.length) {
+      frag.appendChild(el(tpl`<h3 class="small muted mt">Against the recorded baseline</h3>`));
+      frag.appendChild(el(tpl`<div class="card" style="padding:14px 16px">${kv(brows)}</div>`));
     }
-    if (t.stderr) {
-      parts.push(raw(tpl`<h3 class="small muted mt">stderr</h3>`));
-      parts.push(raw(tpl`<pre class="code">${t.stderr}</pre>`));
+
+    var answers = answerSection(t);
+    if (answers) frag.appendChild(answers);
+    return frag;
+  }
+
+  /* The two conclusions, side by side. Comparing what each attempt *cost* is
+   * only half the question; the half a reader actually cares about is whether
+   * they concluded the same thing, and that answer lives in prose that the
+   * numbers do not carry. So when the recording kept a final answer the two are
+   * shown as columns, and when it did not, the absence is stated instead of
+   * being rendered as an empty box that reads like a rendering bug. */
+  function answerSection(t) {
+    var b = t.baseline;
+    var recorded = b && b.output ? String(b.output) : '';
+    if (!t.answer && !recorded) return null;
+
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el(tpl`<h3 class="small muted mt">Final answer</h3>`));
+    if (!recorded) {
+      frag.appendChild(el(tpl`<pre class="code">${t.answer}</pre>`));
+      if (b) {
+        frag.appendChild(el(tpl`<p class="small muted">The recorded attempt kept no final answer to compare against${b.id ? raw(tpl` (<span class="mono-sm">${b.id}</span>)`) : ''}.</p>`));
+      }
+      return frag;
     }
-    if (def) {
-      var rows = [
-        ['prompt', def.prompt ? raw(tpl`<pre class="code">${def.prompt}</pre>`) : ''],
-        ['system prompt', def.system_prompt ? raw(tpl`<pre class="code">${def.system_prompt}</pre>`) : ''],
-        ['workspace', def.workspace],
-        ['output contract', def.output],
-        ['limits', def.limits],
-        ['graders', (def.graders || []).join(' · ')],
-        ['baseline', def.baseline ? raw(tpl`<span class="mono-sm">${def.baseline}</span>`) : ''],
-        ['metadata', def.metadata ? raw(tpl`<pre class="code">${JSON.stringify(def.metadata, null, 2)}</pre>`) : '']
-      ];
-      parts.push(raw(tpl`<h3 class="small muted mt">Task definition</h3>`));
-      parts.push(el(tpl`<div class="card" style="padding:14px 16px">${kv(rows)}</div>`));
-    } else {
-      parts.push(el(tpl`<div class="notice info">The task definition is not available: the artifact bundle is not reachable from this machine. The prompt lives in <code>task.json</code>, which stays under the run's working directory.</div>`));
-    }
-    return parts;
+    frag.appendChild(el(tpl`
+      <div class="grid2">
+        <div>
+          <div class="small muted">this attempt</div>
+          ${t.answer ? raw(tpl`<pre class="code">${t.answer}</pre>`) : raw('<div class="muted small">produced no final answer</div>')}
+        </div>
+        <div>
+          <div class="small muted">recorded (baseline)</div>
+          <pre class="code">${recorded}</pre>
+        </div>
+      </div>`));
+    return frag;
   }
 
   function trajectoryTab(t) {
@@ -813,7 +894,7 @@
       else if (/^@@/.test(line)) cls = 'hunk';
       else if (/^\+/.test(line)) cls = 'add';
       else if (/^-/.test(line)) cls = 'del';
-      return tpl`<span class="dl ${cls}">${line === '' ? ' ' : line}</span>`;
+      return raw(tpl`<span class="dl ${cls}">${line === '' ? ' ' : line}</span>`);
     });
     return raw(tpl`<div class="diff">${html}</div>`);
   }
@@ -828,12 +909,11 @@
         <div class="card" style="padding:12px 14px;margin-bottom:10px">
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
             <span class="v ${cls}">${g.passed ? 'pass' : 'fail'}</span>
-            <b>${g.grader}</b>
+            <b>${g.name}</b>
             <span class="muted small mono-sm">${g.type}</span>
             <span class="chip">score <b>${num(g.score, 3)}</b></span>
             <span class="chip">weight <b>${num(g.weight, 2)}</b></span>
             ${g.required ? raw('<span class="chip tag">required</span>') : ''}
-            <span class="chip">${dur(g.duration_ms)}</span>
           </div>
           ${g.reason ? raw(tpl`<div class="mt small">${g.reason}</div>`) : ''}
           ${g.error ? raw(tpl`<div class="notice err mt"><b>Grader error.</b> ${g.error}</div>`) : ''}
@@ -866,42 +946,46 @@
   }
 
   function rawTab(t) {
-    var parts = [];
-    parts.push(raw(tpl`<div class="card" style="padding:14px 16px">${kv([
-      ['raw stream', t.raw_stream_path ? raw(tpl`<span class="mono-sm">${t.raw_stream_path}</span>`) : 'not stored'],
-      ['artifact dir', t.artifact_dir ? raw(tpl`<span class="mono-sm">${t.artifact_dir}</span>`) : ''],
-      ['workspace dir', t.workspace_dir ? raw(tpl`<span class="mono-sm">${t.workspace_dir}</span>`) : '']
+    var frag = document.createDocumentFragment();
+    frag.appendChild(el(tpl`<div class="card" style="padding:14px 16px">${kv([
+      ['status', t.status],
+      ['stop reason', t.stop_reason],
+      ['error', t.error]
     ])}</div>`));
-    parts.push(raw(tpl`<h3 class="small muted mt">Stored cell record</h3>`));
+    frag.appendChild(el(`<h3 class="small muted mt">Stored cell record</h3>`));
+    /* The bulk fields are excluded because they are already on their own tabs;
+     * repeating them here would duplicate megabytes of text in the DOM. */
     var clone = {};
     Object.keys(t).forEach(function (k) {
-      if (k === 'events' || k === 'tools' || k === 'diff' || k === 'answer' || k === 'definition') return;
+      if (k === 'events' || k === 'tools' || k === 'diff' || k === 'answer' || k === 'graders') return;
       clone[k] = t[k];
     });
-    parts.push(raw(tpl`<pre class="code">${JSON.stringify(clone, null, 2)}</pre>`));
-    if (t.definition && t.definition.raw) {
-      parts.push(raw(tpl`<h3 class="small muted mt">task.json</h3><pre class="code">${t.definition.raw}</pre>`));
-    }
-    return el(tpl`<div>${parts}</div>`);
+    frag.appendChild(el(tpl`<pre class="code">${JSON.stringify(clone, null, 2)}</pre>`));
+    return frag;
   }
 
   /* --------------------------------------------------------- index (list) */
 
+  /* Mirrors report.FileName on the Go side. The two must agree or the index
+   * links to files that are not there, and an id comes from a dataset file, so
+   * it is sanitised rather than trusted. */
+  function reportFileName(id) {
+    var name = String(id || '').replace(/[^A-Za-z0-9_-]/g, '-').replace(/^-+|-+$/g, '');
+    if (!name) name = 'run';
+    if (name.length > 80) name = name.slice(0, 80);
+    return 'report-' + name + '.html';
+  }
+
   function renderIndex() {
     var runs = P.runs || [];
-    var canDelete = !!(P.capabilities && P.capabilities.delete);
     var frag = document.createDocumentFragment();
 
-    var stats = P.stats ? Object.keys(P.stats).map(function (k) {
-      return raw(tpl`<span class="chip">${k} <b>${int(P.stats[k])}</b></span>`);
-    }) : [];
     frag.appendChild(el(tpl`
       <div class="card runhead">
         <div class="row1"><div>
-          <h1>Evaluation runs</h1>
-          <div class="subtitle">${runs.length} run(s) · generated ${P.generated}${P.live_refresh_seconds ? raw(tpl` · refreshing every ${P.live_refresh_seconds}s`) : ''}</div>
+          <h1>${P.title || 'Evaluation runs'}</h1>
+          <div class="subtitle">${runs.length} run(s) · generated ${clock(P.generated)}</div>
         </div></div>
-        <div class="chips">${stats}</div>
       </div>`));
 
     if (!runs.length) {
@@ -910,24 +994,20 @@
     }
 
     var rows = runs.map(function (r) {
-      var statusCls = r.status === 'completed' ? 'pass' : (r.status === 'running' ? 'warn' : 'fail');
-      var rr = r.task_count ? (r.passed_count / r.task_count) : 0;
-      var cost = (r.metrics && r.metrics.total_cost_usd) || r.total_cost_usd || 0;
-      var href = '/runs/' + encodeURIComponent(r.id);
+      var statusCls = RUN_STATUS_CLASS[r.status] || 'fail';
+      var href = reportFileName(r.id);
       return raw(tpl`
-        <tr data-run="${r.id}" data-href="${href}">
+        <tr data-href="${href}">
           <td class="task">${r.name || r.id}<span class="tmeta mono-sm">${r.id}</span></td>
           <td><span class="pill ${statusCls}">${r.status}</span></td>
-          <td>${r.dataset_name}${r.dataset_version ? raw(tpl`<span class="muted small"> @${r.dataset_version}</span>`) : ''}</td>
-          <td class="mono-sm">${r.agent_kind}${r.agent_model ? ' / ' + r.agent_model : ''}<span class="tmeta muted">${r.sandbox_backend}</span>${r.mode && r.mode !== 'agent' ? raw(tpl`<span class="tmeta mode-alert">${r.mode}</span>`) : ''}</td>
-          <td class="num">${int(r.passed_count)} / ${int(r.task_count)}<span class="tmeta">${pct(rr)}</span></td>
-          <td class="num">${cost ? money(cost) : '-'}</td>
+          <td>${r.dataset_name}</td>
+          <td class="mono-sm">${r.agent_kind}${r.agent_model ? ' / ' + r.agent_model : ''}${r.factor_axis ? raw(tpl`<span class="tmeta mode-alert">${r.factor_axis}=${r.factor_level}</span>`) : ''}</td>
+          <td class="num">${int(r.counts.passed)} / ${int(r.counts.graded)}<span class="tmeta">${r.pass_rate == null ? 'not graded' : pct(r.pass_rate)}</span></td>
+          <td class="num">${tokens(r.tokens)}</td>
+          <td class="num">${r.cost_usd ? money(r.cost_usd) : '-'}</td>
           <td class="num">${dur(r.duration_ms)}</td>
-          <td class="mono-sm">${clockShort(r.created_at)}</td>
-          <td class="num nowrap">
-            <a class="btn ghost" href="${href}">Report</a>
-            ${canDelete ? raw(tpl`<button type="button" class="btn danger" data-delete="${r.id}">Delete</button>`) : ''}
-          </td>
+          <td class="mono-sm">${clockShort(r.started_at)}</td>
+          <td class="num nowrap"><a class="btn ghost" href="${href}">Report</a></td>
         </tr>`);
     });
 
@@ -937,8 +1017,9 @@
           <table>
             <thead><tr>
               <th class="nosort">Run</th><th class="nosort">Status</th><th class="nosort">Dataset</th>
-              <th class="nosort">Agent</th><th class="nosort num">Resolved</th><th class="nosort num">Cost</th>
-              <th class="nosort num">Duration</th><th class="nosort">Started</th><th class="nosort"></th>
+              <th class="nosort">Agent</th><th class="nosort num">Passed</th><th class="nosort num">Tokens</th>
+              <th class="nosort num">Cost</th><th class="nosort num">Duration</th><th class="nosort">Started</th>
+              <th class="nosort"></th>
             </tr></thead>
             <tbody>${rows}</tbody>
           </table>
@@ -947,24 +1028,8 @@
 
     table.querySelectorAll('tbody tr').forEach(function (tr) {
       tr.addEventListener('click', function (e) {
-        if (e.target.closest('button')) return;
+        if (e.target.closest('a')) return;
         window.location.href = tr.getAttribute('data-href');
-      });
-    });
-    table.querySelectorAll('[data-delete]').forEach(function (b) {
-      b.addEventListener('click', function (e) {
-        e.stopPropagation();
-        var id = b.getAttribute('data-delete');
-        if (!window.confirm('Delete run ' + id + ' and every result recorded under it?\n\nThis cannot be undone.')) return;
-        b.disabled = true;
-        fetch('/api/runs/' + encodeURIComponent(id) + '/delete', { method: 'POST' })
-          .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
-          .then(function (out) {
-            if (!out.ok) { toast(out.body.error || 'Delete failed'); b.disabled = false; return; }
-            toast('Deleted ' + id);
-            setTimeout(function () { window.location.reload(); }, 400);
-          })
-          .catch(function (err) { b.disabled = false; toast('Delete failed: ' + err); });
       });
     });
 
@@ -1001,13 +1066,14 @@
 
     var mrows = (c.metrics || []).map(function (m) {
       var cls = m.verdict === 'better' ? 'better' : (m.verdict === 'worse' ? 'worse' : 'same');
+      var hint = m.direction === 'down' ? ' (lower is better)' : (m.direction === 'up' ? ' (higher is better)' : '');
       return raw(tpl`
-        <tr title="${m.description || ''}">
-          <td class="task">${m.label || m.name}<span class="tmeta">${m.name}${m.direction === 'down' ? ' (lower is better)' : (m.direction === 'up' ? ' (higher is better)' : '')}</span></td>
+        <tr>
+          <td class="task">${m.label || m.key}<span class="tmeta">${m.key}${hint}</span></td>
           <td class="num">${m.left_text}</td>
           <td class="num">${m.right_text}</td>
-          <td class="num delta ${cls}">${m.only_left || m.only_right ? 'n/a' : m.delta_text}</td>
-          <td><span class="v ${cls === 'better' ? 'pass' : (cls === 'worse' ? 'fail' : 'skip')}">${m.verdict}</span></td>
+          <td class="num delta ${cls}">${m.delta_text}</td>
+          <td><span class="v ${cls === 'better' ? 'pass' : (cls === 'worse' ? 'fail' : 'skip')}">${String(m.verdict).replace('_', ' ')}</span></td>
         </tr>`);
     });
 
@@ -1023,16 +1089,24 @@
 
     var trows = (c.tasks || []).map(function (d) {
       var cls = d.verdict === 'fixed' ? 'pass' : (d.verdict === 'regressed' ? 'fail' : 'skip');
+      function side(ref) {
+        if (!ref.present) return [raw('<span class="v skip">absent</span>'), '-', '-', '-'];
+        var label = !ref.graded ? 'ungraded' : (ref.passed ? 'pass' : 'fail');
+        var v = !ref.graded ? 'skip' : (ref.passed ? 'pass' : 'fail');
+        return [
+          raw(tpl`<span class="v ${v}">${label}</span>`),
+          dur(ref.duration_ms),
+          ref.cost_usd ? money(ref.cost_usd) : '-',
+          tokens(ref.total_tokens)
+        ];
+      }
+      var L = side(d.left), R = side(d.right);
       return raw(tpl`
         <tr data-key="${d.key}">
           <td class="task">${d.id}${d.category ? raw(tpl`<span class="tmeta">${d.category}</span>`) : ''}</td>
-          <td><span class="v ${d.left.present ? (d.left.passed ? 'pass' : 'fail') : 'skip'}">${d.left.present ? (d.left.passed ? 'pass' : 'fail') : 'absent'}</span></td>
-          <td class="num">${d.left.present ? dur(d.left.duration_ms) : '-'}</td>
-          <td class="num">${d.left.present && d.left.cost_usd ? money(d.left.cost_usd) : '-'}</td>
-          <td><span class="v ${d.right.present ? (d.right.passed ? 'pass' : 'fail') : 'skip'}">${d.right.present ? (d.right.passed ? 'pass' : 'fail') : 'absent'}</span></td>
-          <td class="num">${d.right.present ? dur(d.right.duration_ms) : '-'}</td>
-          <td class="num">${d.right.present && d.right.cost_usd ? money(d.right.cost_usd) : '-'}</td>
-          <td><span class="v ${cls}">${d.verdict.replace('_', ' ')}</span></td>
+          <td>${L[0]}</td><td class="num">${L[1]}</td><td class="num">${L[2]}</td><td class="num">${L[3]}</td>
+          <td>${R[0]}</td><td class="num">${R[1]}</td><td class="num">${R[2]}</td><td class="num">${R[3]}</td>
+          <td><span class="v ${cls}">${d.verdict}</span></td>
         </tr>`);
     });
 
@@ -1041,12 +1115,113 @@
         <div class="card"><div class="tablewrap">
           <table><thead><tr>
             <th class="nosort">Task</th>
-            <th class="nosort">A</th><th class="nosort num">A time</th><th class="nosort num">A cost</th>
-            <th class="nosort">B</th><th class="nosort num">B time</th><th class="nosort num">B cost</th>
+            <th class="nosort">A</th><th class="nosort num">A time</th><th class="nosort num">A cost</th><th class="nosort num">A tokens</th>
+            <th class="nosort">B</th><th class="nosort num">B time</th><th class="nosort num">B cost</th><th class="nosort num">B tokens</th>
             <th class="nosort">Verdict</th>
           </tr></thead><tbody>${trows}</tbody></table>
         </div></div>
       </div>`));
+
+    return frag;
+  }
+
+  /* -------------------------------------------------------------- sweep */
+
+  /* A sweep's answer is a set of paired differences, so the page leads with the
+   * findings and puts the raw pairs underneath. The caveats are not hidden
+   * behind a disclosure: the single most likely misreading of this page is that
+   * it measured more than one factor at a time, and a footnote does not stop
+   * that. */
+  function renderSweep() {
+    var sw = P.sweep;
+    var frag = document.createDocumentFragment();
+    if (!sw) {
+      frag.appendChild(el('<div class="empty">No attribution payload.</div>'));
+      return frag;
+    }
+
+    var caveats = (sw.caveats || []).map(function (c) { return raw(tpl`<li>${c}</li>`); });
+    frag.appendChild(el(tpl`
+      <div class="card runhead">
+        <div class="row1"><div>
+          <h1>${sw.name || sw.sweep_id}</h1>
+          <div class="subtitle">one axis varied: <b>${sw.axis}</b> · control <b>${sw.control}</b></div>
+        </div></div>
+        ${caveats.length ? raw(tpl`<div class="notice warn"><b>What this sweep cannot show.</b><ul>${caveats}</ul></div>`) : ''}
+      </div>`));
+
+    var lrows = (sw.levels || []).map(function (l) {
+      var s = l.summary || {};
+      // "varies nothing" on a non-control level is not a cosmetic detail: that
+      // level is measuring run-to-run variance, not a factor, and a reader who
+      // cannot see it will read movement into noise.
+      var varies = (l.changed && l.changed.length)
+        ? 'varies ' + l.changed.join(', ')
+        : (l.is_control ? 'the shared configuration, unchanged' : 'varies nothing');
+      return raw(tpl`
+        <tr>
+          <td class="task">${l.name}${l.is_control ? raw(' <span class="chip tag">control</span>') : ''}<span class="tmeta">${varies}</span>${l.notes ? raw(tpl`<span class="tmeta">${l.notes}</span>`) : ''}</td>
+          <td><span class="pill ${RUN_STATUS_CLASS[l.status] || 'fail'}">${l.status}</span></td>
+          <td class="num">${l.pass_rate == null ? '-' : pct(l.pass_rate)}<span class="tmeta">${int(s.passed)} / ${int(s.graded)}</span></td>
+          <td class="num">${tokens(s.tokens)}</td>
+          <td class="num">${money(s.cost_usd)}</td>
+          <td class="num">${dur(s.duration_ms)}</td>
+          <td class="num">${int(s.timeouts)} / ${int(s.harness_errors)}</td>
+        </tr>`);
+    });
+    frag.appendChild(el(tpl`
+      <div class="section"><h2>Levels</h2>
+        <div class="card"><div class="tablewrap" style="max-height:none">
+          <table><thead><tr>
+            <th class="nosort">Level</th><th class="nosort">Status</th><th class="nosort num">Pass rate</th>
+            <th class="nosort num">Tokens</th><th class="nosort num">Cost</th><th class="nosort num">Wall clock</th>
+            <th class="nosort num">Timeouts / errors</th>
+          </tr></thead><tbody>${lrows}</tbody></table>
+        </div></div>
+      </div>`));
+
+    (sw.comparisons || []).forEach(function (cmp) {
+      var srows = (cmp.stats || []).map(function (s) {
+        return raw(tpl`
+          <tr class="${s.primary ? 'primary-metric' : ''}">
+            <td class="task">${s.label}${s.primary ? raw(' <span class="chip tag">correctness</span>') : ''}
+              <span class="tmeta">${s.metric}${s.lower_is_better ? ' · lower is better' : ' · higher is better'}</span></td>
+            <td class="num">${num(s.control_mean, 2)}</td>
+            <td class="num">${num(s.level_mean, 2)}</td>
+            <td class="num delta ${s.mean_delta === 0 ? 'same' : (s.lower_is_better === (s.mean_delta < 0) ? 'better' : 'worse')}">${s.mean_delta > 0 ? '+' : ''}${num(s.mean_delta, 2)} ${s.unit || ''}</td>
+            <td class="num">${int(s.wins)} / ${int(s.losses)} / ${int(s.ties)}</td>
+            <td class="num">${s.testable ? num(s.p, 3) : 'n/a'}</td>
+          </tr>`);
+      });
+      var pairs = (cmp.pairs || []).filter(function (p) { return p.verdict !== 'same'; });
+      var prows = pairs.map(function (p) {
+        return raw(tpl`
+          <tr>
+            <td class="task">${p.task_id}${p.category ? raw(tpl`<span class="tmeta">${p.category}</span>`) : ''}</td>
+            <td class="num">${p.control && p.control.pass_rate != null ? num(p.control.pass_rate, 0) + '%' : '-'}</td>
+            <td class="num">${p.level && p.level.pass_rate != null ? num(p.level.pass_rate, 0) + '%' : '-'}</td>
+            <td class="num delta ${p.verdict === 'fixed' ? 'better' : 'worse'}">${p.delta && p.delta.tokens != null ? signedInt(Math.round(p.delta.tokens)) + ' tok' : '-'}</td>
+            <td><span class="v ${p.verdict === 'fixed' ? 'pass' : (p.verdict === 'broke' ? 'fail' : 'skip')}">${p.verdict}</span></td>
+          </tr>`);
+      });
+      frag.appendChild(el(tpl`
+        <div class="section">
+          <h2>${cmp.level} against ${cmp.control}</h2>
+          <div class="card"><div class="tablewrap" style="max-height:none">
+            <table><thead><tr>
+              <th class="nosort">Metric</th><th class="nosort num">${cmp.control}</th><th class="nosort num">${cmp.level}</th>
+              <th class="nosort num">Mean delta</th><th class="nosort num">win / loss / tie</th><th class="nosort num">p</th>
+            </tr></thead><tbody>${srows}</tbody></table>
+          </div></div>
+          ${prows.length ? raw(tpl`
+            <div class="card" style="margin-top:12px"><div class="tablewrap">
+              <table><thead><tr>
+                <th class="nosort">Task</th><th class="nosort num">pass rate (${cmp.control})</th>
+                <th class="nosort num">pass rate (${cmp.level})</th><th class="nosort num">tokens delta</th><th class="nosort">Verdict</th>
+              </tr></thead><tbody>${prows}</tbody></table>
+            </div></div>`) : ''}
+        </div>`));
+    });
 
     return frag;
   }
@@ -1062,6 +1237,8 @@
       root.appendChild(renderIndex());
     } else if (MODE === 'compare') {
       root.appendChild(renderCompare());
+    } else if (MODE === 'sweep') {
+      root.appendChild(renderSweep());
     } else {
       root.appendChild(renderRunHead());
       var m = renderMetrics();

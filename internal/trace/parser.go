@@ -296,13 +296,23 @@ func (t *Trace) joinToolResult(id, output string, isErr bool, ts time.Time) {
 	}
 }
 
+// applyResult folds a result event into the trace.
+//
+// A stream may carry more than one, and the two kinds of field want opposite
+// treatment. Fields that describe the *answer* -- subtype, result text, stop
+// reason -- come from the last event, which is the one that ends the run.
+// Fields that describe the *work* -- per-model tokens, cost -- are cumulative
+// snapshots of the same session, so the largest wins and a later, smaller
+// snapshot cannot erase what an earlier one measured.
 func (t *Trace) applyResult(l *rawLine, raw json.RawMessage) {
 	t.sawResult = true
 	t.Result.Subtype = l.Subtype
 	t.Result.IsError = l.IsError
 	t.Result.ResultText = l.Result
 	t.Result.NumTurns = l.NumTurns
-	t.Result.TotalCostUSD = l.TotalCostUSD
+	if l.TotalCostUSD > t.Result.TotalCostUSD {
+		t.Result.TotalCostUSD = l.TotalCostUSD
+	}
 	t.Result.DurationMs = l.DurationMs
 	t.Result.APIDurationMs = l.DurationAPIMs
 	t.Result.TTFTMs = l.TTFTMs
@@ -325,9 +335,9 @@ func (t *Trace) applyResult(l *rawLine, raw json.RawMessage) {
 		}
 	}
 	if len(l.ModelUsage) > 0 {
-		t.Result.ModelUsage = make(map[string]ModelUsage, len(l.ModelUsage))
+		next := make(map[string]ModelUsage, len(l.ModelUsage))
 		for name, mu := range l.ModelUsage {
-			t.Result.ModelUsage[name] = ModelUsage{
+			next[name] = ModelUsage{
 				InputTokens:              mu.InputTokens,
 				OutputTokens:             mu.OutputTokens,
 				CacheReadInputTokens:     mu.CacheReadInputTokens,
@@ -340,6 +350,16 @@ func (t *Trace) applyResult(l *rawLine, raw json.RawMessage) {
 				Provider:                 mu.Provider,
 				CostBasis:                mu.CostBasis,
 			}
+		}
+		// A stream can carry more than one result event -- a run that fans out
+		// to a background subagent produced two -- and each one repeats the
+		// session's running per-model totals. They are snapshots of the same
+		// work, not additions to it, so the most complete snapshot wins and
+		// repeated events stay idempotent. Last-one-wins would let a smaller
+		// snapshot overwrite a larger one, which is exactly what the `usage`
+		// field does on those streams.
+		if modelUsageTotal(next) > modelUsageTotal(t.Result.ModelUsage) {
+			t.Result.ModelUsage = next
 		}
 	}
 	t.Events = append(t.Events, Event{
@@ -400,6 +420,17 @@ func decodeToolResultContent(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+// modelUsageTotal is the size of a per-model snapshot, used to decide which of
+// several snapshots is the most complete one. A missing map totals zero, so the
+// first snapshot always wins over nothing.
+func modelUsageTotal(m map[string]ModelUsage) int {
+	n := 0
+	for _, mu := range m {
+		n += mu.Total()
+	}
+	return n
 }
 
 func parseTime(s string) time.Time {

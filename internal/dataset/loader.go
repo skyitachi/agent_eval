@@ -78,7 +78,7 @@ func LoadManifest(manifestPath string) (*Dataset, error) {
 		if err := resolvePrompt(&tasks[i]); err != nil {
 			return nil, err
 		}
-		if err := resolveOracle(&tasks[i]); err != nil {
+		if err := resolveBaseline(&tasks[i]); err != nil {
 			return nil, err
 		}
 		applyDefaults(&tasks[i], m.Defaults)
@@ -147,26 +147,34 @@ func resolvePrompt(t *TaskSpec) error {
 	return nil
 }
 
-// resolveOracle folds oracle.patch_file into oracle.patch.
+// resolveBaseline loads the recorded reference attempt a task is compared
+// against.
 //
-// Doing it here rather than at audit time means the patch is part of the
-// resolved task, and therefore part of dataset_hash: a run can be traced back to
-// the exact reference solution it was validated against. An inline patch wins,
-// matching how prompt_file behaves.
-func resolveOracle(t *TaskSpec) error {
-	o := t.Oracle
-	if o == nil || o.PatchFile == "" || o.Patch != "" {
+// It is resolved here, rather than lazily at run time, for the same reason the
+// prompt is: the comparison a run makes is part of what the run means, so it
+// belongs in the resolved task and therefore in dataset_hash. Two runs that
+// report the same hash were measured against the same reference.
+func resolveBaseline(t *TaskSpec) error {
+	b := t.Baseline
+	if b == nil || b.File == "" {
 		return nil
 	}
-	p := o.PatchFile
+	p := b.File
 	if !filepath.IsAbs(p) {
 		p = filepath.Join(t.DatasetDir, p)
 	}
-	b, err := os.ReadFile(p)
+	raw, err := os.ReadFile(p)
 	if err != nil {
-		return fmt.Errorf("task %s: oracle.patch_file: %w", t.ID, err)
+		return fmt.Errorf("task %s: baseline.file: %w", t.ID, err)
 	}
-	o.Patch = strings.TrimRight(string(b), "\n")
+	var sb Baseline
+	if err := json.Unmarshal(raw, &sb); err != nil {
+		return fmt.Errorf("task %s: baseline.file: %s: %w", t.ID, filepath.Base(p), err)
+	}
+	if sb.TaskID == "" {
+		sb.TaskID = t.ID
+	}
+	t.ResolvedBaseline = &sb
 	return nil
 }
 
@@ -194,10 +202,6 @@ func applyDefaults(t *TaskSpec, d *TaskDefaults) {
 	}
 	if t.SystemPrompt == "" {
 		t.SystemPrompt = d.SystemPrompt
-	}
-	if t.Reward == nil && d.Reward != nil {
-		cp := *d.Reward
-		t.Reward = &cp
 	}
 }
 
@@ -345,10 +349,7 @@ func (d *Dataset) computeHash() (string, error) {
 		Output     *Output        `json:"output,omitempty"`
 		Graders    []GraderSpec   `json:"graders,omitempty"`
 		Limits     *Limits        `json:"limits,omitempty"`
-		Reward     *RewardSpec    `json:"reward,omitempty"`
-		Oracle     *Oracle        `json:"oracle,omitempty"`
-		Restore    []string       `json:"restore_paths,omitempty"`
-		Forbid     []string       `json:"forbid_changed_paths,omitempty"`
+		Baseline   *Baseline      `json:"baseline,omitempty"`
 		Metadata   map[string]any `json:"metadata,omitempty"`
 	}
 	wrapped := struct {
@@ -362,8 +363,7 @@ func (d *Dataset) computeHash() (string, error) {
 			ID: t.ID, Version: t.Version, Category: t.Category, Difficulty: t.Difficulty,
 			Tags: t.Tags, Prompt: t.ResolvedPrompt, System: t.SystemPrompt,
 			Workspace: t.Workspace, Output: t.Output, Graders: t.Graders,
-			Limits: t.Limits, Reward: t.Reward, Oracle: t.Oracle,
-			Restore: t.RestorePaths, Forbid: t.ForbidChangedPaths,
+			Limits: t.Limits, Baseline: t.ResolvedBaseline,
 			Metadata: t.Metadata,
 		}
 		wrapped.Tasks = append(wrapped.Tasks, h)
@@ -423,39 +423,6 @@ var validOutputTypes = map[OutputType]struct{}{
 	OutputPatch: {}, OutputFiles: {}, OutputStdout: {}, OutputNone: {},
 }
 
-// validRewardTypes mirrors RewardType. The empty value is accepted and means the
-// dense score, so a dataset that never mentions reward stays valid.
-var validRewardTypes = map[RewardType]struct{}{
-	"": {}, RewardScore: {}, RewardPass: {},
-}
-
-// validateGuards checks the two anti-gaming path lists.
-//
-// The overlap check only compares patterns literally. Deciding whether two
-// globs intersect in general is a different problem, and pretending to solve it
-// would produce false confidence; the literal case catches the mistake people
-// actually make, which is listing the same path in both.
-func validateGuards(t TaskSpec, add func(id, field, format string, args ...any), id string) {
-	for i, p := range t.RestorePaths {
-		if strings.TrimSpace(p) == "" {
-			add(id, fmt.Sprintf("restore_paths[%d]", i), "pattern is empty")
-		}
-	}
-	for i, p := range t.ForbidChangedPaths {
-		if strings.TrimSpace(p) == "" {
-			add(id, fmt.Sprintf("forbid_changed_paths[%d]", i), "pattern is empty")
-		}
-	}
-	forbidden := toSet(t.ForbidChangedPaths)
-	for i, p := range t.RestorePaths {
-		if _, dup := forbidden[p]; dup {
-			add(id, fmt.Sprintf("restore_paths[%d]", i),
-				"%q is also in forbid_changed_paths; a path can either be reset "+
-					"before grading or treated as a violation, not both", p)
-		}
-	}
-}
-
 // Validate checks the resolved dataset and returns every problem it finds.
 func (d *Dataset) Validate() error {
 	var issues []ValidationIssue
@@ -497,8 +464,17 @@ func (d *Dataset) Validate() error {
 		if _, ok := validOutputTypes[t.Output.Type]; !ok {
 			add(id, "output.type", "unknown type %q (want patch|files|stdout|none)", t.Output.Type)
 		}
-		if len(t.Graders) == 0 {
-			add(id, "graders", "at least one grader is required")
+		// A task with no grader is legal only when it carries a baseline.
+		//
+		// Two different things can be missing here. A prompt with neither a
+		// grader nor a baseline is just an unmeasured prompt: nothing can ever
+		// pass or fail it and no comparison exists, so it contributes nothing
+		// but runtime. A prompt with a baseline is a real measurement -- the
+		// attempt's cost and time are compared against a recorded one -- and it
+		// is exactly what `aeval collect` produces, because a transcript has no
+		// ground truth to build a grader from.
+		if len(t.Graders) == 0 && t.Baseline == nil {
+			add(id, "graders", "at least one grader is required (or declare a baseline for a cost-only task)")
 		}
 		totalWeight := 0.0
 		for i, g := range t.Graders {
@@ -516,24 +492,12 @@ func (d *Dataset) Validate() error {
 		if t.Limits.TimeoutS < 0 {
 			add(id, "limits.timeout_s", "must be >= 0")
 		}
-		if _, ok := validRewardTypes[t.Reward.EffectiveType()]; !ok {
-			add(id, "reward.type", "unknown type %q (want %s|%s)",
-				t.Reward.EffectiveType(), RewardScore, RewardPass)
+		if t.Baseline != nil && strings.TrimSpace(t.Baseline.File) == "" {
+			// A baseline block that points at nothing is worse than none: the
+			// report would render a comparison against a reference that was
+			// never recorded.
+			add(id, "baseline.file", "declared but empty")
 		}
-		if o := t.Oracle; o != nil {
-			// An oracle that applies nothing is worse than none at all: audit
-			// would report the task as solvable on the strength of the
-			// untouched baseline, which is exactly the check it is meant to be.
-			if strings.TrimSpace(o.Patch) == "" && len(o.Files) == 0 && len(o.Apply) == 0 {
-				add(id, "oracle", "declared but empty (set patch, patch_file, files or apply)")
-			}
-			for i, c := range o.Apply {
-				if strings.TrimSpace(c.Run) == "" {
-					add(id, fmt.Sprintf("oracle.apply[%d].run", i), "command is empty")
-				}
-			}
-		}
-		validateGuards(t, add, id)
 		for i, c := range t.Workspace.Setup {
 			if strings.TrimSpace(c.Run) == "" {
 				add(id, fmt.Sprintf("workspace.setup[%d].run", i), "command is empty")

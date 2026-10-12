@@ -1,0 +1,43 @@
+# A model sweep: the harness is pinned and only the model moves.
+#
+#   aeval matrix --file examples/matrix-model.yaml --db agenteval.db
+#   aeval matrix --file examples/matrix-model.yaml --dry-run
+#
+# The control is NOT the recorded session. A dataset's baseline is a reference
+# point -- it was produced by a different harness (the operator's own Claude
+# Code, with their CLAUDE.md, their skills, their hooks) and by a session that
+# ran for twelve minutes. Comparing a clean-room run against it mixes three
+# changes together: the model, the harness, and the shape of the session. The
+# attribution would be about all three and therefore about none of them.
+#
+# A model sweep fixes that by running every level under the same harness and
+# subtracting level from control, task by task.
+#
+# Caveat: this dataset has a single task, so there is exactly one pair. The
+# sign test cannot reach p < 0.05 on one pair however large the difference is,
+# so the attribution below will report the deltas and decline to call them
+# real. That is the intended behaviour; add tasks to get verdicts.
+name: local-model-sweep
+notes: |
+  Two SiliconFlow models under one identical harness, so that the difference
+  between them is the only thing that changed.
+dataset: ../datasets/local_claude_code
+axis: model
+control: flash
+
+samples: 1
+concurrency: 1
+
+agent:
+  kind: claude_code
+  bin: claude
+  model: deepseek-ai/DeepSeek-V4-Flash
+
+levels:
+  - name: flash
+    notes: the model the recorded session used
+
+  - name: pro
+    notes: same family, one tier up
+    agent:
+      model: deepseek-ai/DeepSeek-V4-Pro

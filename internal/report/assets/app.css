@@ -301,6 +301,19 @@ main {
   border: none; background: none; color: var(--muted); cursor: help;
   font-size: 11px; padding: 0; line-height: 1;
 }
+/* Direction is shown as a word next to the label rather than as a colour on the
+   value. The value is not good or bad on its own -- what makes it good is which
+   way it moved -- and colouring it would suggest otherwise. */
+.metric .dirhint { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; }
+
+/* The per-cell baseline comparison: two signed deltas side by side, small
+   enough to sit in a table cell without wrapping. */
+.baseline { display: inline-flex; gap: 8px; align-items: baseline; }
+.baseline .delta { font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* The correctness row in an attribution table, singled out because a reader
+   scanning for a token saving should not be able to miss the pass rate. */
+tbody tr.primary-metric td { background: var(--panel-2); font-weight: 560; }
 .metric-group { margin-bottom: 16px; }
 .metric-group > h3 {
   font-size: 11.5px; letter-spacing: .07em; text-transform: uppercase;
@@ -411,7 +424,13 @@ td.task .tmeta { display: block; color: var(--muted); font-size: 11.5px; font-we
 .drawer-head h2 { margin: 0; font-size: 16px; letter-spacing: -.01em; word-break: break-word; }
 .drawer-head .sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
 .drawer-body { overflow: auto; padding: 16px 18px 60px; flex: 1; }
-.drawer.cmp, .drawer-left, .drawer-right { }
+/* `hidden` cannot hide the drawer on its own, and the failure is silent: the
+ * UA stylesheet gives [hidden] `display: none`, but any author rule that sets
+ * `display` outranks it, and the rule above sets `flex`. Until something is
+ * opened the drawer is empty, so the visible result is not "a stray panel" but
+ * "the report is cut off two-thirds of the way across" -- the empty drawer is
+ * opaque and sits on top of the content. Re-assert the attribute explicitly. */
+.drawer[hidden] { display: none; }
 @media (max-width: 860px) { .drawer { width: 100%; } }
 
 .tabs { display: flex; gap: 2px; margin-bottom: 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
@@ -521,6 +540,16 @@ pre.code.nowrap { white-space: pre; word-break: normal; }
 .mt { margin-top: 14px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+
+/* A value the client could not render -- a node interpolated where a string
+ * belonged, say. It is a bug in the shell, not payload, so it is loud and
+ * names itself instead of passing for content. */
+.bad {
+  font-family: var(--mono); font-size: 11.5px;
+  background: var(--fail-soft); color: var(--fail);
+  border: 1px dashed color-mix(in srgb, var(--fail) 45%, transparent);
+  border-radius: 4px; padding: 1px 6px; white-space: nowrap;
+}
 
 .toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
