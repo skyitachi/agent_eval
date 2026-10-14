@@ -107,6 +107,7 @@ export ANTHROPIC_API_KEY=...
 | `aeval run` | Evaluate a dataset and record the result. |
 | `aeval matrix` | Run a sweep over one factor axis, or attribute one that already ran. |
 | `aeval report` | Render a run, a comparison, a sweep, or the whole index as HTML. |
+| `aeval hook` | Record what a directory looked like when a session started. |
 | `aeval list` | List recorded runs, filtered by sweep or axis. |
 | `aeval version` | Print the build, schema and payload versions and the registered agents. |
 
@@ -387,6 +388,74 @@ Without the flag, an empty replay carries a note naming the recorded directory �
 so the gap is visible in the report rather than implied by an empty page, and
 `collect` prints the same thing to stderr.
 
+### Replaying in place
+
+An empty workspace is the honest reading of a transcript that carries no files,
+and a clone is the honest reading of one that carries no uncommitted files —
+neither is the environment the recording ran in. To get that, the directory has
+to be described **before** the session runs, and the only thing that runs at
+that moment is a hook:
+
+```sh
+# ~/.claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "aeval hook start" } ] }
+    ]
+  }
+}
+```
+
+`aeval hook start` reads the session id and the directory off the hook payload
+(stdin; `--session`/`--dir` and `$CLAUDE_SESSION_ID`/`$CLAUDE_PROJECT_DIR` also
+work), and writes one record under `~/.aeval` (`$AEVAL_HOME` overrides it). It
+prints nothing and never fails the session unless you pass `--strict`: a
+recording problem must not stop somebody working, and the record is for later.
+
+```sh
+aeval hook start --verbose       # what was recorded: dir, kind, commit, snapshot
+aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
+aeval run --dataset datasets/mine --concurrency 1 --samples 1
+```
+
+What the record buys is that `--workspace-cwd` can bind the task to the
+directory it actually ran in, as `workspace.type: inplace` pinned to the commit
+the session saw — not to the branch as it stands now, which may already contain
+that session's own commits. A directory that is not a repository is handled the
+same way, from a content snapshot. The task stays in your dataset as JSON; the
+directory is the only thing that is not a copy.
+
+`aeval run` then:
+
+- **checks the directory first** — same commit, clean working tree (or the same
+  files, for a non-git directory). If it has moved, the cell is refused, the
+  difference is listed by name, and nothing is touched. A check that refuses and
+  then resets anyway is worse than no check: it destroys the evidence it refused
+  on.
+- **runs the agent *there***, in your directory, with whatever was already in it.
+- **saves the patch, then puts the directory back** — `git reset --hard` to the
+  recorded commit, and the files the agent created are *moved* to
+  `~/.aeval/discarded/<session>/` rather than deleted. Nothing is pushed onto
+  your stash stack.
+
+Two things this mode refuses, both at the flag layer with exit code 2: more than
+one cell in flight (two cells in one directory would write over each other
+somewhere nobody could undo) and more than one sample (the second would measure
+what the first left behind).
+
+The run records how many of its tasks replayed in place, and the report says so
+in the header — a patch taken in your own tree reads exactly like one taken in a
+checkout the harness built, so nothing else on the page can tell the two apart.
+`report --compare` names it as a difference too.
+
+The cost is stated rather than hidden: an agent that can see an ignored
+`node_modules`, a scratch directory, or your uncommitted edits is not the same
+agent as one that cannot. That is the point of the mode, and it is also why the
+result is not comparable with a sandboxed run of the same task.
+
+`docs/isolation.md` has the full design record.
+
 ## Reports
 
 `aeval report` writes a self-contained `.html` file — CSS and JS inlined — that
@@ -504,9 +573,15 @@ Stated here rather than discovered later:
   "restore the test files before grading, so an agent that edits the tests is
   scored on its actual work" — and it has no caller, no test and no dataset
   field.
+- **An in-place rollback leaves empty directories and ignored files alone.** Git
+  does not track directories, so a directory the agent created stays behind once
+  its contents have been moved out; and a file that `status --porcelain` reports
+  as clean cannot be attributed to the agent, so ignored files are left where
+  they are. Both are stated in `docs/isolation.md` rather than papered over.
 
 `docs/real-repo-eval.md` is the design for evaluating agents against a real
 repository rather than a three-file demo, and its §1 tables are kept current.
+`docs/isolation.md` records how a replay is put back where it ran.
 `docs/design.md` is the original brief this implementation answers.
 
 ## License

@@ -91,6 +91,7 @@ export ANTHROPIC_API_KEY=...
 | `aeval run`      | 评测一份数据集并记录结果。                             |
 | `aeval matrix`   | 对一条因子轴跑一次 sweep，或对已跑过的 sweep 做归因。         |
 | `aeval report`   | 把一次 run、一次对比、一次 sweep，或整个索引渲染成 HTML。      |
+| `aeval hook`     | 记录会话开始时目录是什么样子。                           |
 | `aeval list`     | 列出已记录的 run，可按 sweep 或轴过滤。                 |
 | `aeval version`  | 打印构建、schema、payload 版本与已注册的 agent。        |
 
@@ -327,6 +328,62 @@ aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
 不带这个 flag 时，空回放会带一条注记点出录制所在的目录 —— 让这个缺口在报告里可见，而不是靠一  
 张空白页去暗示；`collect` 也会把同样的话打到 stderr。
 
+### 就地回放：在录制时那个目录里跑
+
+空工作区是「转录里没带文件」的诚实读法，clone 是「转录里没带未提交内容」的诚实读法 —— 两者都  
+不是录制当时所在的环境。要拿到那个环境，目录必须在**会话开始之前**被描述一次，而那个时刻唯一  
+会跑的东西是 hook：
+
+```json
+// ~/.claude/settings.json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "aeval hook start" } ] }
+    ]
+  }
+}
+```
+
+`aeval hook start` 从 hook 的 payload（stdin）里取 session id 和目录，也接受  
+`--session`/`--dir` 与 `$CLAUDE_SESSION_ID`/`$CLAUDE_PROJECT_DIR`，然后在 `~/.aeval`  
+（`$AEVAL_HOME` 可覆盖）下写一条记录。它默认什么都不打印、也绝不打断会话（除非给 `--strict`）：  
+记录出问题不该拦住正在干活的人，而这条记录是给以后用的。
+
+```sh
+aeval hook start --verbose       # 记了什么：目录、kind、commit、快照
+aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
+aeval run --dataset datasets/mine --concurrency 1 --samples 1
+```
+
+这条记录的价值是让 `--workspace-cwd` 能把任务绑回它真正跑过的目录，写成  
+`workspace.type: inplace`，并钉在**那次会话看到的那个 commit** 上 —— 而不是绑「这个分支现在的  
+样子」，那可能已经包含那次会话自己做的提交。不是仓库的目录一样处理，靠的是内容快照。数据集里  
+保持是普通 JSON；唯一不是拷贝的东西就是那个目录本身。
+
+之后 `aeval run` 会：
+
+- **先检查目录** —— commit 相同、工作区干净（非 git 目录则逐文件同内容）。对不上就拒绝该 cell、  
+  **逐条列出差异**，并且**一个字节都不动**。一个「拒绝了还顺手还原」的检查比没有检查更糟：它毁掉  
+  的正是它据以拒绝的证据。
+- **在那里跑 agent** —— 就在你的目录里，连同里面本来就有的一切。
+- **先存 patch，再把目录还回去** —— `git reset --hard` 回到记录的 commit，agent 新建的文件被  
+  **移**到 `~/.aeval/discarded/<session>/` 而不是删掉。**不会往你的 stash 栈里堆任何东西。**
+
+有两种情况这一模式会拒绝，都在 flag 层以退出码 2 报出：同时跑多个 cell（两个 cell 在一个目录里  
+会互相覆盖，而且是在一个没人能撤销的地方），以及多于一个 sample（第二个测的是第一个留下的状态，  
+不是记录的起点）。
+
+run 行会记下这次有几个任务是就地跑的，报告头部会把这件事写出来 —— 在你自己的目录树里取到的  
+patch，和 harness 造出来的干净检出里取到的 patch **长得一模一样**，页面上没有别的东西能把两者  
+分开。`report --compare` 也会把它列进差异。
+
+代价是写明的而不是藏起来的：一个能看见 ignored 的 `node_modules`、临时目录、或者你未提交改动的  
+agent，和一个看不见的 agent 不是同一个 agent。这正是这个模式的意义，也正是为什么它的结果不能和  
+同一个任务的沙箱回放直接比。
+
+完整的设计记录在 `docs/isolation.md`。
+
 ## 报告
 
 `aeval report` 写出一份自包含的 `.html` —— CSS 与 JS 全部内联 —— 能从 `file://` 打开、  
@@ -421,9 +478,14 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" go 
   于是 `resolve_rate` 无法被解释：分不清是任务难还是任务坏。
 - **`Baseline.RestorePaths` 写了但没人用。** 它正是「判分前把测试文件还原，让改了测试的  
   agent 按真实水平计分」那条语义的原语 —— 而它没有调用方、没有测试、数据集里也没有字段。
+- **就地回滚会留下空目录，也不动 ignored 文件。** git 不跟踪目录，所以 agent 建的目录在内容  
+  被移走之后会留在原地；而被 `status --porcelain` 判为干净的那部分里，ignored 文件无从区分  
+  是 agent 写的还是本来就在的，所以不动它们。两条都写在 `docs/isolation.md` 里，而不是含糊  
+  过去。
 
 `docs/real-repo-eval.md` 是「在真实仓库而不是三文件 demo 上评测 agent」的设计，  
-它的 §1 表格保持与代码同步。`docs/design.md` 是本实现所回答的最初需求。
+它的 §1 表格保持与代码同步。`docs/isolation.md` 记录了「回放怎么被放回它跑过的地方」。  
+`docs/design.md` 是本实现所回答的最初需求。
 
 ## 许可
 
