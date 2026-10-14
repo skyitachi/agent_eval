@@ -1,0 +1,54 @@
+cmd/aeval/main.go
+  h_5a1c62fd74efa2 31,55,93-94,119,416-482,815,1135-1273,1344-1347,1351-1353,1358-1367,1370-1371,1373,1375,1377,1382,1406
+internal/dataset/inplace_test.go
+  h_5a1c62fd74efa2 1-177
+internal/dataset/loader.go
+  h_5a1c62fd74efa2 238-246,428,465,473-496
+internal/dataset/spec.go
+  h_5a1c62fd74efa2 37-47,79-91
+internal/report/assets/app.js
+  h_5a1c62fd74efa2 322-332
+internal/report/load.go
+  h_5a1c62fd74efa2 362-366,433-446,1112-1123
+internal/report/model.go
+  h_5a1c62fd74efa2 168-178
+internal/report/report_test.go
+  h_5a1c62fd74efa2 62-66,104,804-831,1168-1189
+internal/runner/inplace_test.go
+  h_5a1c62fd74efa2 1-184
+internal/runner/runner.go
+  h_5a1c62fd74efa2 213-215,240-249,380-435,560-565,567-569,789-797,799,808-815,822-825,829-851,874,890-892,1030-1069
+internal/sandbox/inplace_test.go
+  h_5a1c62fd74efa2 1-526
+internal/sandbox/workspace.go
+  h_5a1c62fd74efa2 11,16,32-40,175-581,624-645,720,723,752,769,809,822,832,877-887,912
+internal/session/collect.go
+  h_5a1c62fd74efa2 16,234,396-409,443-524
+internal/startstate/snapshot.go
+  h_5a1c62fd74efa2 1-289
+internal/startstate/startstate.go
+  h_5a1c62fd74efa2 1-556
+internal/startstate/startstate_test.go
+  h_5a1c62fd74efa2 1-638
+internal/store/schema.sql
+  h_5a1c62fd74efa2 70-85
+internal/store/store.go
+  h_5a1c62fd74efa2 91-101,211-224,511,578-588,660,681-682,702,930-931
+internal/store/store_test.go
+  h_5a1c62fd74efa2 43-46,146-147,157,244,335,405,485-604
+tests/e2e_test.go
+  h_5a1c62fd74efa2 251-256,1036-1435,2937-2941,2957
+tests/render_test.go
+  h_5a1c62fd74efa2 470-516
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d105a29fff9ae043fdb921026d88cfe47981f414",
+  "prompts": {},
+  "humans": {
+    "h_5a1c62fd74efa2": {
+      "author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}

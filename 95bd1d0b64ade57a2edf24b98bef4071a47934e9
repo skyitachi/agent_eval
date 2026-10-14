@@ -1,0 +1,30 @@
+.workbuddy/memory/2026-10-14.md
+  h_5a1c62fd74efa2 1-67
+.workbuddy/memory/MEMORY.md
+  h_5a1c62fd74efa2 3-6,10,12-14,18-50,56-59,66-67,77-79,81-87,90-99,103-120,125-126,130-138,140,142-143
+.workbuddy/memory/topics/attribution.md
+  h_5a1c62fd74efa2 1-16
+.workbuddy/memory/topics/claude-cli.md
+  h_5a1c62fd74efa2 1-38
+.workbuddy/memory/topics/collect.md
+  h_5a1c62fd74efa2 1-103
+.workbuddy/memory/topics/dataset.md
+  h_5a1c62fd74efa2 1-19
+.workbuddy/memory/topics/isolation.md
+  h_5a1c62fd74efa2 1-127
+.workbuddy/memory/topics/report.md
+  h_5a1c62fd74efa2 1-53
+.workbuddy/memory/topics/testing.md
+  h_5a1c62fd74efa2 1-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "95bd1d0b64ade57a2edf24b98bef4071a47934e9",
+  "prompts": {},
+  "humans": {
+    "h_5a1c62fd74efa2": {
+      "author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}

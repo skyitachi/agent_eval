@@ -1,0 +1,19 @@
+docs/isolation.md
+  h_5a1c62fd74efa2 1-13
+  h_5a1c62fd74efa2 14-197
+README.md
+  h_5a1c62fd74efa2 110,391-458,576-580,584
+README.zh-CN.md
+  h_5a1c62fd74efa2 94,331-386,481-484,487-488
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "592b94576f2672a18303248d397087c3ffc81f35",
+  "prompts": {},
+  "humans": {
+    "h_5a1c62fd74efa2": {
+      "author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
