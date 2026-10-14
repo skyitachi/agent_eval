@@ -1,0 +1,23 @@
+.workbuddy/memory/MEMORY.md
+  s_7bc19e1c740b1e::t_8a9b7fd7fca3f6 191-216
+README.md
+  s_7bc19e1c740b1e::t_8bc1edb814d74f 422-452
+.workbuddy/memory/2026-10-12.md
+  s_7bc19e1c740b1e::t_8d0df7a7a6310d 532-583
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.49-trip",
+  "base_commit_sha": "f9bfcf6e664d4239dbdeefe009db1a91405451ad",
+  "prompts": {},
+  "sessions": {
+    "s_7bc19e1c740b1e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7ce5399f-b2ed-456e-9620-9fb6a4cb703e",
+        "model": "deepseek-v4-1-flash-260910"
+      },
+      "human_author": "yaosp <yaosp@trip.com>"
+    }
+  }
+}
