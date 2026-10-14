@@ -359,6 +359,11 @@ func runInfo(run store.Run, attempts []store.Attempt, s runner.Summary) RunInfo 
 		// a set of independent samples -- the one reading that is certainly
 		// wrong about a chain.
 		ChainSessions: run.ChainSessions,
+		// Also taken straight off the row, and for the same reason: an attempt
+		// carries no marker saying its workspace was the user's own directory.
+		// Its diff reads exactly like one taken in a fresh checkout, so the
+		// only place this fact can be stated is here.
+		InplaceTasks: run.InplaceTasks,
 	}
 	if run.EndedAt != nil {
 		info.EndedAt = run.EndedAt.UTC().Format(time.RFC3339)
@@ -423,6 +428,20 @@ func chainedLabel(chained bool) string {
 		return "chained"
 	}
 	return "not chained"
+}
+
+// inplaceLabel names how many of a run's tasks were replayed in the
+// recording's own directory.
+//
+// The unit is spelled out because the comparison sentence reads "(1 task vs 0
+// tasks)": a bare pair of numbers would leave the reader guessing whether they
+// are being told about tasks or cells, and those differ as soon as a run has
+// more than one sample.
+func inplaceLabel(n int) string {
+	if n == 1 {
+		return "1 task"
+	}
+	return fmt.Sprintf("%d tasks", n)
 }
 
 func sameSkills(a, b []string) bool {
@@ -1089,6 +1108,18 @@ func comparisonWarnings(left, right store.Run, seenLeft, seenRight []string) []s
 		differing = append(differing, fmt.Sprintf(
 			"whether a session's tasks were chained into one workspace (%s vs %s)",
 			chainedLabel(left.ChainSessions), chainedLabel(right.ChainSessions)))
+	}
+	// Replaying in place is the other half of that fact, and a sharper one.
+	// Both sides may have run the same agent on the same task, but one of them
+	// handed the agent the recording's own directory -- with whatever the user
+	// had left in it -- and the other built a workspace from the dataset. The
+	// paired cells are then not the same question, whatever the labels say.
+	// Older rows read 0, which is correct for them, so there is no "unknown"
+	// arm here either.
+	if left.InplaceTasks != right.InplaceTasks {
+		differing = append(differing, fmt.Sprintf(
+			"whether the cells ran in the recording's own directory (%s vs %s)",
+			inplaceLabel(left.InplaceTasks), inplaceLabel(right.InplaceTasks)))
 	}
 
 	var out []string

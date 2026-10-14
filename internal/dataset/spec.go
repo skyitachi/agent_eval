@@ -34,6 +34,17 @@ const (
 	WorkspaceFiles WorkspaceType = "files"
 	// WorkspaceGit clones (or copies) a repository at a specific ref.
 	WorkspaceGit WorkspaceType = "git"
+	// WorkspaceInplace replays in the directory the recording ran in, on the
+	// machine that recorded it. Nothing is copied: the agent runs where the
+	// recorded session ran, which is the only way to reproduce a directory whose
+	// starting state was not a commit.
+	//
+	// It is the one type that does not produce a disposable workspace, and the
+	// constraints that follow belong to whoever runs it: the directory must
+	// still match the state that was recorded, only one cell may use it at a
+	// time, and what an attempt leaves behind is rolled back -- with the patch
+	// kept first -- rather than thrown away with the directory.
+	WorkspaceInplace WorkspaceType = "inplace"
 )
 
 // Command is a single setup or verification command executed inside the sandbox.
@@ -64,6 +75,19 @@ type Workspace struct {
 	Ref string `json:"ref,omitempty" yaml:"ref,omitempty"`
 	// Subdir restricts the working directory to a subdirectory of the repo.
 	Subdir string `json:"subdir,omitempty" yaml:"subdir,omitempty"`
+
+	// Dir is the directory an inplace replay runs in. It is absolute on
+	// purpose: the type names one directory on one machine, and resolving it
+	// against the dataset would let a moved dataset quietly point somewhere
+	// else. Ref, when set, is the commit the directory must be on.
+	Dir string `json:"dir,omitempty" yaml:"dir,omitempty"`
+	// Snapshot is the directory contents captured before the recording started,
+	// for an inplace replay whose directory was not a repository. Without one, a
+	// non-git replay has no definition of where it starts.
+	Snapshot string `json:"snapshot,omitempty" yaml:"snapshot,omitempty"`
+	// Session names the recorded session this workspace was built from, so a
+	// reader can find the start-of-session record behind it.
+	Session string `json:"session,omitempty" yaml:"session,omitempty"`
 
 	// Files are written into the workspace verbatim (path -> content).
 	Files map[string]string `json:"files,omitempty" yaml:"files,omitempty"`

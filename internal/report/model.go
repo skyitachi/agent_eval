@@ -165,6 +165,17 @@ type RunInfo struct {
 	// them side by side without saying so invites the reader to average them.
 	ChainSessions bool `json:"chain_sessions,omitempty"`
 
+	// InplaceTasks is how many of the run's tasks were replayed in the
+	// recording's own directory rather than in one the harness built.
+	//
+	// It is on the page because it changes what the agent could see. An inplace
+	// cell ran where the transcript ran, beside the user's own uncommitted
+	// edits and ignored build output, and the directory was put back
+	// afterwards. Nothing in a cell row distinguishes that from a cell that
+	// started in an empty workspace -- the patch reads the same either way --
+	// so a page that stays silent presents the two as the same measurement.
+	InplaceTasks int `json:"inplace_tasks,omitempty"`
+
 	// Skills is what this run's own configuration says about the agent's
 	// skills. Nil means the run recorded no configuration -- it predates the
 	// harness storing one -- which the page states rather than rendering as

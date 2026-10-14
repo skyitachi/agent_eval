@@ -248,6 +248,12 @@ type runInfo struct {
 	// continuation rather than independent samples.
 	ChainSessions bool `json:"chain_sessions"`
 
+	// InplaceTasks is how many of the run's tasks replayed in the recording's
+	// own directory. It is a count rather than a flag because a dataset can be
+	// part in place, and 0 is also how a row written before schema v6 reads --
+	// which is the answer there rather than a gap.
+	InplaceTasks int `json:"inplace_tasks"`
+
 	// Model is which model the agent used, as far as the record goes. The label
 	// above is only what the command line asked for, and it is empty on every
 	// run that did not pass --model.
@@ -1024,6 +1030,406 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 	}
 	if _, ok := metricByKey(p, "baseline_tokens"); !ok {
 		t.Error("a run with a baseline should headline its token delta, not bury it in the task")
+	}
+}
+
+// runCLIEnv executes aeval with extra environment variables.
+//
+// It exists for the tests that need AEVAL_HOME pointed somewhere disposable.
+// Everything this file does that touches the start-state store has to be
+// redirected: the store lives in the user's home directory by default, and a
+// test that recorded there would be writing into the real records of the real
+// sessions on this machine.
+func runCLIEnv(t *testing.T, env []string, args ...string) result {
+	t.Helper()
+	cmd := exec.Command(cliPath, args...)
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), env...)
+	if python != "" {
+		cmd.Env = append(cmd.Env, "AGENTEVAL_PYTHON="+python)
+	}
+	var out, errBuf strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errBuf
+	err := cmd.Run()
+
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run %v: %v", args, err)
+		}
+	}
+	return result{stdout: out.String(), stderr: errBuf.String(), exitCode: code}
+}
+
+// gitIn runs one git command inside dir and returns its trimmed stdout.
+//
+// The environment is pinned rather than inherited: a global commit.gpgsign or a
+// global init.defaultBranch would otherwise decide whether this fixture can be
+// built at all, and "the test failed because of the machine's git config" is
+// the kind of failure that costs an afternoon.
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{
+		"-c", "commit.gpgsign=false",
+		"-c", "init.defaultBranch=main",
+		"-c", "user.name=e2e",
+		"-c", "user.email=e2e@example.invalid",
+	}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	var out, errBuf strings.Builder
+	cmd.Stdout, cmd.Stderr = &out, &errBuf
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, errBuf.String())
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// gitOut runs one git command and returns its stdout even when it fails, which
+// is what the assertions below need: "is the directory clean" is answered by an
+// empty string and not by an error.
+func gitOut(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	var out strings.Builder
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("git %s in %s: %v", strings.Join(args, " "), dir, err)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+// inplaceFixture is the smallest end-to-end setup of the inplace mode: a real
+// git repository with one commit, a start-of-session record of it, and a
+// dataset collected from a transcript that says it ran there.
+//
+// It is shared by the CLI test and the browser test because both need exactly
+// this and neither is about how it is built: the first asks what a run does to
+// the directory, the second asks whether the page says what it did.
+type inplaceFixture struct {
+	work    string
+	home    string
+	env     []string
+	repo    string
+	commit  string
+	session string
+	ds      string
+	agent   string
+	task    struct {
+		ID        string `json:"id"`
+		Session   string `json:"session"`
+		Workspace struct {
+			Type string `json:"type"`
+			Dir  string `json:"dir"`
+			Ref  string `json:"ref"`
+		} `json:"workspace"`
+		Output struct {
+			Type string `json:"type"`
+		} `json:"output"`
+	}
+}
+
+// newInplaceFixture builds the fixture and walks steps 1 and 2 of the CLI test:
+// the hook records the directory, and collect binds the recording to it.
+func newInplaceFixture(t *testing.T, work string) *inplaceFixture {
+	t.Helper()
+	f := &inplaceFixture{work: work}
+	// AEVAL_HOME goes to a temporary directory for the whole fixture. The
+	// record, the snapshot and the quarantine all live under it, and none of
+	// them may touch the real ~/.aeval of whoever is running this.
+	f.home = filepath.Join(work, "aeval-home")
+	f.env = []string{"AEVAL_HOME=" + f.home}
+	f.agent = filepath.Join(agents, "chain.sh")
+
+	f.repo = filepath.Join(work, "recorded")
+	if err := os.MkdirAll(f.repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, f.repo, "init")
+	write := func(rel, body string) {
+		t.Helper()
+		path := filepath.Join(f.repo, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("calc.py", "def sub(a, b):\n    return a + b\n")
+	write("README.md", "the project the recording ran in\n")
+	gitIn(t, f.repo, "add", "-A")
+	gitIn(t, f.repo, "commit", "-m", "the state the session started from")
+	f.commit = gitIn(t, f.repo, "rev-parse", "HEAD")
+
+	f.session = "7c9d1a2b-3e4f-4a5b-8c9d-0e1f2a3b4c5d"
+	// The prompt says WRITE because the stand-in agent only touches the
+	// filesystem when it is asked to. A run that changes nothing is a run whose
+	// rollback cannot be observed: the directory looks the same either way.
+	transcript := filepath.Join(work, "session.jsonl")
+	if err := os.WriteFile(transcript, []byte(strings.Join([]string{
+		`{"type":"user","uuid":"u1","sessionId":"` + f.session + `","timestamp":"2026-01-02T03:04:05.000Z",` +
+			`"cwd":"` + f.repo + `","gitBranch":"main","version":"2.1.291","origin":{"kind":"human"},` +
+			`"promptSource":"typed","message":{"role":"user","content":"WRITE the handoff file"}}`,
+		`{"type":"assistant","uuid":"a1","timestamp":"2026-01-02T03:04:06.000Z","message":{"id":"m1",` +
+			`"role":"assistant","model":"test-model-1","content":[{"type":"text","text":"wrote it"}],` +
+			`"usage":{"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":0,` +
+			`"cache_creation_input_tokens":0}}}`,
+		`{"type":"result","subtype":"success","is_error":false,"durationMs":1000,"numTurns":1,` +
+			`"totalCostUSD":0.01,"totalDuration":1000,"uuid":"r1"}`,
+	}, "\n")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. The hook records the directory as it is now, which is the only moment
+	// it can be recorded: by the time collect reads the transcript the
+	// directory is whatever the session made of it.
+	hook := runCLIEnv(t, f.env, "hook", "start", "--session", f.session, "--dir", f.repo, "--verbose")
+	if hook.exitCode != 0 {
+		t.Fatalf("hook start exited %d\nstdout:\n%s\nstderr:\n%s", hook.exitCode, hook.stdout, hook.stderr)
+	}
+	for _, want := range []string{f.session, f.commit[:12], f.repo, f.home} {
+		if !strings.Contains(hook.stdout, want) {
+			t.Errorf("hook start should name %q, got:\n%s", want, hook.stdout)
+		}
+	}
+	// A hook that printed nothing would be the other failure mode: a record is
+	// only useful if somebody can tell it happened.
+	if !strings.Contains(hook.stdout, "commit") {
+		t.Errorf("hook start should say what it recorded, got:\n%s", hook.stdout)
+	}
+
+	// 2. Collect binds the recording to that directory. With a start-of-session
+	// record in hand that is an inplace workspace pinned to the commit the
+	// session saw -- not a clone of the branch as it stands now, which would
+	// already contain the session's own commits.
+	f.ds = filepath.Join(work, "ds")
+	collect := runCLIEnv(t, f.env, "collect",
+		"--session", transcript,
+		"--out", f.ds,
+		"--name", "in-place",
+		"--workspace-cwd",
+	)
+	if collect.exitCode != 0 {
+		t.Fatalf("collect exited %d\nstdout:\n%s\nstderr:\n%s", collect.exitCode, collect.stdout, collect.stderr)
+	}
+	if !strings.Contains(collect.stderr, "replay in place") {
+		t.Errorf("collect should say the task replays in place, got:\n%s", collect.stderr)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(f.ds, "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(raw))), &f.task); err != nil {
+		t.Fatalf("the collected task does not decode: %v\n%s", err, raw)
+	}
+	if f.task.Workspace.Type != "inplace" {
+		t.Fatalf("workspace.type = %q, want inplace: a recorded start state is the whole reason "+
+			"--workspace-cwd can bind the session's own directory", f.task.Workspace.Type)
+	}
+	if f.task.Workspace.Dir != f.repo || f.task.Workspace.Ref != f.commit {
+		t.Errorf("workspace = %+v, want the recorded directory %s at %s",
+			f.task.Workspace, f.repo, f.commit)
+	}
+	// The task keeps the session it came from, which is the key the record and
+	// the quarantine are both looked up by.
+	if f.task.Session != f.session {
+		t.Errorf("task session = %q, want %q", f.task.Session, f.session)
+	}
+	if f.task.Output.Type != "patch" {
+		t.Errorf("output.type = %q, want patch: the deliverable of a replay that runs in a "+
+			"directory is what it changed there", f.task.Output.Type)
+	}
+	if v := runCLIEnv(t, f.env, "validate", "--dataset", f.ds); v.exitCode != 0 {
+		t.Fatalf("the collected dataset does not validate (%d):\n%s\n%s", v.exitCode, v.stdout, v.stderr)
+	}
+	return f
+}
+
+// TestCLIReplaysInPlaceAndPutsTheDirectoryBack is the end-to-end of the
+// isolation design: a session's directory is recorded before the session runs,
+// the dataset is bound to it, the replay happens *there*, and the directory is
+// put back exactly as it was.
+//
+// It is one test rather than five because the claim is a chain and every link
+// is invisible in the next one's result: a record nobody reads still writes a
+// file, a workspace nobody checks still has the right shape in tasks.jsonl, and
+// a rollback that does not happen still leaves a patch in the database. The
+// directory is the only witness to the last of those, so the assertions are
+// made against the real directory and a real git repository.
+func TestCLIReplaysInPlaceAndPutsTheDirectoryBack(t *testing.T) {
+	fx := newInplaceFixture(t, t.TempDir())
+	work, home, env := fx.work, fx.home, fx.env
+	repo, recorded, sid, ds, task := fx.repo, fx.commit, fx.session, fx.ds, fx.task
+
+	// 3. Run it. The agent is a stand-in that writes a file, which is what
+	// makes the rollback observable at all: a directory with nothing new in it
+	// looks the same rolled back as not.
+	db := filepath.Join(work, "runs.db")
+	report := filepath.Join(work, "inplace.html")
+	agent := fx.agent
+	run := runCLIEnv(t, env, "run",
+		"--dataset", ds,
+		"--agent", "mock",
+		"--bin", agent,
+		"--model", "stand-in",
+		"--name", "in-place",
+		"--run-id", "in-place",
+		"--db", db,
+		"--work-root", filepath.Join(work, "work"),
+		"--report", report,
+	)
+	if run.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", run.exitCode, run.stdout, run.stderr)
+	}
+	// The banner names the mode before it happens, and names where the agent's
+	// leftovers go. A reader is owed both sentences before a command edits
+	// their working tree, not after.
+	for _, want := range []string{repo, filepath.Join(home, "discarded")} {
+		if !strings.Contains(run.stdout, want) {
+			t.Errorf("the run should name %q before it starts, got:\n%s", want, run.stdout)
+		}
+	}
+
+	p := payloadFromHTML(t, report)
+	if p.Run.InplaceTasks != 1 {
+		t.Errorf("inplace_tasks = %d, want 1: the page cannot otherwise tell a run that had the "+
+			"recording's own tree in front of the agent from one that had a checkout", p.Run.InplaceTasks)
+	}
+	cell := p.taskByID(t, task.ID)
+	if cell.Diff == "" {
+		t.Error("the cell recorded no patch, so the replay's own deliverable was lost")
+	}
+	if !strings.Contains(cell.Diff, "handoff.txt") {
+		t.Errorf("the patch does not mention what the agent wrote:\n%s", cell.Diff)
+	}
+
+	// 4. The directory is the witness. Every one of these is a way the run
+	// could have looked right in the database and still have destroyed somebody
+	// else's working tree.
+	if head := gitIn(t, repo, "rev-parse", "HEAD"); head != recorded {
+		t.Errorf("HEAD is %s after the replay, want the recorded %s back", head, recorded)
+	}
+	if status := gitOut(t, repo, "status", "--porcelain"); status != "" {
+		t.Errorf("the directory is not clean after the replay:\n%s", status)
+	}
+	if body, err := os.ReadFile(filepath.Join(repo, "calc.py")); err != nil || !strings.Contains(string(body), "a + b") {
+		t.Errorf("the tracked file was not restored: %v\n%s", err, body)
+	}
+	// The agent's own creation is not deleted, it is moved somewhere the user
+	// can find it: a rollback that discards work is one nobody dares run twice.
+	handoff := filepath.Join(home, "discarded", sid, "handoff.txt")
+	if body, err := os.ReadFile(handoff); err != nil {
+		t.Errorf("the file the agent created is not in %s: %v", handoff, err)
+	} else if !strings.Contains(string(body), "the-first-turn-wrote-this") {
+		t.Errorf("the quarantined file holds %q, want what the agent wrote", body)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "handoff.txt")); !os.IsNotExist(err) {
+		t.Error("the agent's file is still in the directory the replay was supposed to put back")
+	}
+	// Rollback must not touch the user's stash. This is the difference between
+	// a mode that can be run on a working tree somebody cares about and one
+	// that quietly moves their uncommitted work into a stack they never open.
+	if stash := gitOut(t, repo, "stash", "list"); stash != "" {
+		t.Errorf("the replay left something on the user's stash stack:\n%s", stash)
+	}
+
+	// 5. The same command over a directory that has moved must refuse, name the
+	// difference, and leave the directory alone. A dirty directory means the
+	// replay would not start where the recording started, which is the one
+	// thing this whole mode exists to reproduce.
+	if err := os.WriteFile(filepath.Join(repo, "calc.py"), []byte("def sub(a, b):\n    return a - b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refused := runCLIEnv(t, env, "run",
+		"--dataset", ds,
+		"--agent", "mock",
+		"--bin", agent,
+		"--model", "stand-in",
+		"--name", "in-place-dirty",
+		"--run-id", "in-place-dirty",
+		"--db", db,
+		"--work-root", filepath.Join(work, "work-dirty"),
+		"--report", filepath.Join(work, "dirty.html"),
+	)
+	// The command itself succeeded: one task could not be measured, and this
+	// harness records that as a failed cell rather than as a malfunction.
+	if refused.exitCode != 0 {
+		t.Fatalf("a refused task must still exit 0, got %d\nstdout:\n%s\nstderr:\n%s",
+			refused.exitCode, refused.stdout, refused.stderr)
+	}
+	dirty := payloadFromHTML(t, filepath.Join(work, "dirty.html"))
+	if dirty.Counts.HarnessErrors != 1 {
+		t.Errorf("harness errors = %d, want the refused cell counted as one", dirty.Counts.HarnessErrors)
+	}
+	refusedCell := dirty.taskByID(t, task.ID)
+	for _, want := range []string{"calc.py", "uncommitted", "no longer matches the state this replay starts from"} {
+		if !strings.Contains(refusedCell.Error, want) {
+			t.Errorf("the refusal should mention %q, got:\n%s", want, refusedCell.Error)
+		}
+	}
+	// And nothing was touched: a check that refuses and then resets anyway is
+	// worse than no check, because it destroys the very evidence it refused on.
+	if status := gitOut(t, repo, "status", "--porcelain"); !strings.Contains(status, "calc.py") {
+		t.Errorf("the user's uncommitted change is gone:\n%s", status)
+	}
+	if body, err := os.ReadFile(filepath.Join(repo, "calc.py")); err != nil || !strings.Contains(string(body), "a - b") {
+		t.Errorf("the refused replay modified the file it refused to run beside: %v\n%s", err, body)
+	}
+
+	// 6. Finally, the two ways of running one task are not the same measurement,
+	// and the comparison has to say so. The dataset here is the collected one
+	// with its workspace taken away -- the same prompt, the same agent, the same
+	// rows, and an agent that never saw the recorded directory.
+	plain := filepath.Join(work, "plain-ds")
+	if err := os.MkdirAll(plain, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plain, "dataset.yaml"),
+		[]byte("name: plain\ndescription: the same task, in a workspace the harness built\ntasks_file: tasks.jsonl\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(plain, "tasks.jsonl"),
+		[]byte(`{"id":"plain","prompt":"WRITE the handoff file","workspace":{"type":"empty"},`+
+			`"output":{"type":"stdout"},"graders":[{"type":"exact_match",`+
+			`"config":{"expected":"wrote handoff.txt","match_mode":"contains"}}]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if r := runCLIEnv(t, env, "run",
+		"--dataset", plain,
+		"--agent", "mock",
+		"--bin", agent,
+		"--model", "stand-in",
+		"--name", "sandboxed",
+		"--run-id", "sandboxed",
+		"--db", db,
+		"--work-root", filepath.Join(work, "work-plain"),
+		"--report", filepath.Join(work, "plain.html"),
+	); r.exitCode != 0 {
+		t.Fatalf("the sandboxed run exited %d\n%s\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	cmp := filepath.Join(work, "cmp.html")
+	if r := runCLIEnv(t, env, "report",
+		"--compare", "in-place", "sandboxed",
+		"--db", db, "-o", cmp,
+	); r.exitCode != 0 {
+		t.Fatalf("report --compare exited %d\n%s\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+	cp := payloadFromHTML(t, cmp)
+	if cp.Compare == nil {
+		t.Fatal("the comparison page carries no comparison")
+	}
+	if !strings.Contains(strings.Join(cp.Warnings, "\n"), "the recording's own directory") {
+		t.Errorf("the comparison does not name the one thing that differs, so its deltas read as "+
+			"one agent beating another\ngot:\n%s", strings.Join(cp.Warnings, "\n"))
 	}
 }
 
@@ -2528,11 +2934,11 @@ func TestCLIReadsADatabaseFromBeforeTheRecordedAnswer(t *testing.T) {
 // downgradeToV1 rewrites a database into the shape v1 had: the columns every
 // later revision added gone, the version stamped back.
 //
-// It removes what v2, v3 and v4 added rather than writing out a v1 DDL, so the
-// fixture cannot drift away from what v1 actually was. Dropping only the column
-// named in the test's title is how it did drift: the result was a database
-// labelled v1 that already carried the columns the upgrade steps exist to add,
-// which passes whether or not those steps work.
+// It removes what v2, v3, v4, v5 and v6 added rather than writing out a v1 DDL,
+// so the fixture cannot drift away from what v1 actually was. Dropping only the
+// column named in the test's title is how it did drift: the result was a
+// database labelled v1 that already carried the columns the upgrade steps exist
+// to add, which passes whether or not those steps work.
 func downgradeToV1(t *testing.T, path string) {
 	t.Helper()
 	db, err := sql.Open("sqlite", path)
@@ -2548,6 +2954,7 @@ func downgradeToV1(t *testing.T, path string) {
 		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
 		`UPDATE schema_meta SET value='1' WHERE key='version'`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {

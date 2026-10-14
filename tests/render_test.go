@@ -467,6 +467,53 @@ func TestReportHeaderSaysTheCellsWereChained(t *testing.T) {
 	}
 }
 
+// TestReportHeaderSaysTheCellsRanInTheRecordingDirectory covers the claim the
+// header has to make about a run whose cells worked in somebody else's
+// directory.
+//
+// The chip is drawn by the client from run.inplace_tasks, so finding the number
+// in the payload proves nothing about the page -- the same blind spot that let
+// every drawer tab render "[object HTMLDivElement]" while the file, the payload
+// and the exit code all stayed correct.
+//
+// It matters because a cell's patch reads the same either way. An agent that
+// worked in the recording's own tree -- beside the user's uncommitted edits and
+// ignored build output -- leaves a diff that is indistinguishable from one
+// taken in a checkout the harness built a moment earlier. The chip is the only
+// thing on the page that says which of the two a reader is looking at.
+func TestReportHeaderSaysTheCellsRanInTheRecordingDirectory(t *testing.T) {
+	requireBrowser(t)
+	fx := newInplaceFixture(t, t.TempDir())
+	report := filepath.Join(fx.work, "inplace.html")
+
+	r := runCLIEnv(t, fx.env, "run",
+		"--dataset", fx.ds,
+		"--agent", "mock",
+		"--bin", fx.agent,
+		"--model", "stand-in",
+		"--name", "in-place",
+		"--run-id", "in-place",
+		"--db", filepath.Join(fx.work, "runs.db"),
+		"--work-root", filepath.Join(fx.work, "work"),
+		"--report", report,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	res := browserRender(t, report)
+	if res.Cells == 0 {
+		t.Fatal("the inplace run drew no cells, so there is no page to read")
+	}
+	if !strings.Contains(res.Header, "the recording's own directory") {
+		t.Errorf("the header does not say where the cells ran, so a patch against the user's own "+
+			"tree reads as one against a fresh checkout\n%s", res.Header)
+	}
+	if strings.Contains(res.Header, "[object ") {
+		t.Errorf("the header shows a stringified object instead of its chips\n%s", res.Header)
+	}
+}
+
 // TestReportDrawerShowsTheRecordedBaseline covers the card a reader compares
 // against, which the checked-in demo dataset cannot reach: it has no baseline.
 func TestReportDrawerShowsTheRecordedBaseline(t *testing.T) {

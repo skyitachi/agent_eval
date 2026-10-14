@@ -28,6 +28,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -51,6 +52,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
 	"github.com/skyitachi/agenteval/internal/session"
+	"github.com/skyitachi/agenteval/internal/startstate"
 	"github.com/skyitachi/agenteval/internal/store"
 )
 
@@ -88,6 +90,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdMatrix(rest, stdout, stderr)
 	case "report":
 		return cmdReport(rest, stdout, stderr)
+	case "hook":
+		return cmdHook(rest, stdout, stderr)
 	case "list", "ls":
 		return cmdList(rest, stdout, stderr)
 	case "version", "--version", "-v":
@@ -112,6 +116,7 @@ usage: aeval <command> [flags]
   run       run a dataset against one agent
   matrix    sweep one axis, or attribute a sweep that already ran
   report    render an HTML report, comparison, attribution or run list
+  hook      record what a directory looked like when a session started
   list      list recorded runs
   version   print version and schema information
 
@@ -406,6 +411,73 @@ func shortID(id string) string {
 		return id[:8]
 	}
 	return id
+}
+
+// bindNotice says which of the two bindings --workspace-cwd produced.
+//
+// One sentence would be wrong for one of them. A task bound from a
+// start-of-session record replays in place at the commit the session actually
+// saw; a task with no record falls back to a clone of the branch as it stands
+// now, which may already contain that session's own commits. Those are different
+// measurements, and a reader who took one note for both would be reading a
+// difference in binding as a difference in the agent.
+func bindNotice(w io.Writer, items []session.Item) {
+	var inplace, onBranch int
+	for _, it := range items {
+		switch it.Task.Workspace.Type {
+		case dataset.WorkspaceInplace:
+			inplace++
+		case dataset.WorkspaceGit:
+			onBranch++
+		}
+	}
+	if inplace > 0 {
+		fmt.Fprintf(w, "note: %d task(s) replay in place, pinned to the commit the session saw\n", inplace)
+	}
+	if onBranch > 0 {
+		fmt.Fprintf(w, "note: %d task(s) have no start-of-session record, so they bind to the branch "+
+			"as it stands now; a transcript records the branch and not the commit\n", onBranch)
+	}
+}
+
+// inplaceNotice says what running this dataset will do to directories that are
+// not the harness's to create.
+//
+// The mode is unusual enough to be worth naming at the moment it happens rather
+// than only when the dataset is written: a replay that edits somebody's working
+// tree and then puts it back is something a reader should be told before it
+// runs, not left to work out from the directory afterwards.
+func inplaceNotice(w io.Writer, ds *dataset.Dataset) {
+	dirs := map[string]bool{}
+	for _, t := range ds.Tasks {
+		if t.Workspace.Type == dataset.WorkspaceInplace && t.Workspace.Dir != "" {
+			dirs[t.Workspace.Dir] = true
+		}
+	}
+	if len(dirs) == 0 {
+		return
+	}
+	names := make([]string, 0, len(dirs))
+	for d := range dirs {
+		names = append(names, d)
+	}
+	sort.Strings(names)
+	shown, more := names, ""
+	if len(shown) > 2 {
+		more = fmt.Sprintf(" and %d more", len(shown)-2)
+		shown = shown[:2]
+	}
+	fmt.Fprintf(w, "inplace %d task(s) run in the recording's own directory (%s%s)\n",
+		len(names), strings.Join(shown, ", "), more)
+	// Naming where the changes go is the difference between a rollback a reader
+	// can follow and one they have to take on trust.
+	root, err := startstate.Root()
+	if err != nil {
+		root = "the aeval home directory"
+	}
+	fmt.Fprintf(w, "  each attempt is checked against the recorded state before the agent "+
+		"runs and rolled back afterwards; files it creates are moved to %s/discarded/<session>/, "+
+		"not deleted\n\n", root)
 }
 
 func warnUnboundReplays(w io.Writer, items []session.Item) {
@@ -740,8 +812,7 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	if !*wsCwd {
 		warnUnboundReplays(stderr, plan.Added)
 	} else {
-		fmt.Fprintln(stderr, "note: --workspace-cwd binds each recording's repository at the branch it ran on; "+
-			"a transcript records the branch and not the commit, so that is the branch as it stands now")
+		bindNotice(stderr, items)
 	}
 	fmt.Fprintf(stdout, "\nNext: aeval validate --dataset %s\n", filepath.Join(dir, "dataset.yaml"))
 	return exitOK
@@ -1062,6 +1133,145 @@ func issueStrings(issues []dataset.ValidationIssue) []string {
 }
 
 // ---------------------------------------------------------------------------
+// hook: what a session started from
+// ---------------------------------------------------------------------------
+
+// cmdHook is what a Claude Code SessionStart hook calls.
+//
+// The state a session starts from has to be captured before the session runs: by
+// the time collect reads the transcript the directory is whatever the session
+// made of it, and neither the commit nor the contents can be recovered
+// afterwards. A hook is the only thing that runs at the right moment, so this
+// command is deliberately small and deliberately quiet -- it writes one record
+// and prints nothing, because a chat client starting up is not a place for
+// progress lines.
+func cmdHook(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		return usageFail(stderr, "hook: expected a subcommand (start)")
+	}
+	switch args[0] {
+	case "start":
+		return cmdHookStart(args[1:], stdout, stderr)
+	default:
+		return usageFail(stderr, "hook: unknown subcommand %q (want start)", args[0])
+	}
+}
+
+// hookStartPayload is what a SessionStart hook receives on stdin.
+//
+// A payload that is not JSON, or that omits fields, is not an error: the flags
+// and the environment can carry the same facts. A hook that stopped recording
+// because a client changed the shape of its payload would fail in the worst
+// possible way -- silently, and noticed much later, when a comparison turns out
+// to have been measuring the wrong thing.
+type hookStartPayload struct {
+	SessionID string `json:"session_id"`
+	Cwd       string `json:"cwd"`
+	Event     string `json:"hook_event_name"`
+	Source    string `json:"source"`
+}
+
+func cmdHookStart(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("hook start", flag.ContinueOnError)
+	var (
+		session = fs.String("session", "", "session id (default: the hook payload's)")
+		dir     = fs.String("dir", "", "directory to capture (default: the hook payload's cwd)")
+		maxMB   = fs.Int64("max-snapshot-mb", 512, "cap on a non-git snapshot, in MiB")
+		verbose = fs.Bool("verbose", false, "describe what was recorded")
+		strict  = fs.Bool("strict", false, "fail when the state cannot be recorded")
+	)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if *maxMB <= 0 {
+		return usageFail(stderr, "hook start: --max-snapshot-mb must be positive")
+	}
+
+	var payload hookStartPayload
+	// Reading the payload is best-effort by design: a hook invoked by hand, or
+	// by a client that says nothing, still has the flags and the environment.
+	if raw, err := io.ReadAll(io.LimitReader(os.Stdin, 1<<20)); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		_ = json.Unmarshal(raw, &payload)
+	}
+
+	id := firstNonEmpty(*session, payload.SessionID, os.Getenv("CLAUDE_SESSION_ID"))
+	target := firstNonEmpty(*dir, payload.Cwd, os.Getenv("CLAUDE_PROJECT_DIR"))
+	if target == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			target = cwd
+		}
+	}
+
+	// Without an id there is no key to look the record up by, and a record
+	// nobody can look up is a file rather than a record.
+	if id == "" {
+		return hookTrouble(stderr, *strict, "hook start: no session id on stdin, in --session or "+
+			"in $CLAUDE_SESSION_ID, so there would be no key to look this record up by")
+	}
+	if target == "" {
+		return hookTrouble(stderr, *strict, "hook start: no directory to capture")
+	}
+
+	rec, err := startstate.Capture(target)
+	if err != nil {
+		return hookTrouble(stderr, *strict, "hook start: %v", err)
+	}
+	rec.SessionID = id
+	if err := startstate.Save(rec, startstate.Options{
+		MaxSnapshotBytes: *maxMB << 20,
+		ToolVersion:      version,
+	}); err != nil {
+		return hookTrouble(stderr, *strict, "hook start: %v", err)
+	}
+
+	if *verbose {
+		where, _ := startstate.Root()
+		fmt.Fprintf(stdout, "recorded session %s\n", id)
+		fmt.Fprintf(stdout, "  dir      %s\n", rec.Cwd)
+		fmt.Fprintf(stdout, "  kind     %s\n", rec.Kind)
+		if rec.Commit != "" {
+			fmt.Fprintf(stdout, "  commit   %s\n", rec.Commit)
+		}
+		if rec.Branch != "" {
+			fmt.Fprintf(stdout, "  branch   %s\n", rec.Branch)
+		}
+		if len(rec.Dirty) > 0 {
+			fmt.Fprintf(stdout, "  dirty    %d change(s) already there\n", len(rec.Dirty))
+		}
+		if rec.Snapshot != "" {
+			fmt.Fprintf(stdout, "  snapshot %d file(s), %d byte(s)\n", rec.Files, rec.Bytes)
+		}
+		fmt.Fprintf(stdout, "  store    %s\n", where)
+	}
+	return exitOK
+}
+
+// hookTrouble reports a capture problem without stopping the session that
+// triggered it, unless the caller asked for strictness.
+//
+// A hook runs before the user's first keystroke, so failing hard would let a
+// recording problem stop somebody working -- the wrong way round, since the
+// record is for later and the session is happening now. The message still goes
+// to stderr: a capture that did not happen is not something to be quiet about.
+func hookTrouble(stderr io.Writer, strict bool, format string, args ...any) int {
+	fmt.Fprintf(stderr, "aeval: "+format+"\n", args...)
+	if strict {
+		return exitError
+	}
+	return exitOK
+}
+
+// firstNonEmpty returns the first argument that is not blank.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------
 
@@ -1131,28 +1341,45 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 	}
 	// Asking the configuration rather than restating its rules: a flag mistake
 	// is a usage error, which is a different exit code from a run that started
-	// and failed.
+	// and failed. The dataset goes in as well, because whether an inplace
+	// workspace can run at all depends on it, and getting that wrong is a flag
+	// mistake of the same kind -- --samples 3 over a directory the harness does
+	// not own.
 	if err := cfg.Validate(); err != nil {
+		return usageFail(stderr, "run: %v", err)
+	}
+	if err := cfg.ValidateDataset(ds); err != nil {
 		return usageFail(stderr, "run: %v", err)
 	}
 	if !*quiet && !*asJSON {
 		cfg.Progress = progressLogger(stdout)
 	}
 
+	// Everything human-readable goes to stderr under --json, which is the same
+	// stream the per-cell progress already uses. Without this the banner and the
+	// report path land on stdout ahead of the summary, and `run --json | jq`
+	// fails on the text in front of the object -- the flag says "print the
+	// summary as JSON", and every other subcommand honours that.
+	chatter := stdout
+	if *asJSON {
+		chatter = stderr
+	}
+
 	warnUnresolvableCommands(stderr, ds, cfg.Agent)
 
-	fmt.Fprintf(stdout, "running %d task(s) × %d sample(s) from %s\n", len(ds.Tasks), cfg.Samples, ds.Dir)
-	fmt.Fprintf(stdout, "harness %s\n\n", summarizeAgent(cfg.Agent))
+	fmt.Fprintf(chatter, "running %d task(s) × %d sample(s) from %s\n", len(ds.Tasks), cfg.Samples, ds.Dir)
+	fmt.Fprintf(chatter, "harness %s\n\n", summarizeAgent(cfg.Agent))
 	if cfg.ChainSessions {
-		fmt.Fprintln(stdout, "chained: each session's tasks share one workspace and run in order, "+
+		fmt.Fprintln(chatter, "chained: each session's tasks share one workspace and run in order, "+
 			"so the cells of a chain are a sequence rather than independent samples")
-		fmt.Fprintln(stdout)
+		fmt.Fprintln(chatter)
 	}
+	inplaceNotice(chatter, ds)
 
 	res, err := runner.Run(ctx, ds, cfg)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			fmt.Fprintln(stdout, "\ninterrupted; what was measured is recorded")
+			fmt.Fprintln(chatter, "\ninterrupted; what was measured is recorded")
 			return exitCtlC
 		}
 		return fail(stderr, "run: %v", err)
@@ -1176,7 +1403,7 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		if err := report.RenderRunFile(absFlagPath(*reportTo), data, report.RenderOptions{}); err != nil {
 			return fail(stderr, "run: write report: %v", err)
 		}
-		fmt.Fprintf(stdout, "\nreport  %s\n", absFlagPath(*reportTo))
+		fmt.Fprintf(chatter, "\nreport  %s\n", absFlagPath(*reportTo))
 	}
 	return exitOK
 }

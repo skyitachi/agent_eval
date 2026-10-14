@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/startstate"
 )
 
 // Split selects how much of a session one task covers.
@@ -230,7 +231,7 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 	var boundNote string
 	if opts.WorkspaceCwd {
 		var err error
-		ws, boundNote, err = bindCwd(s, opts)
+		ws, boundNote, err = bindCwd(s)
 		if err != nil {
 			return Item{}, err
 		}
@@ -392,7 +393,20 @@ func workspace(opts Options) dataset.Workspace {
 // --workspace-cwd means "use the directory the recording ran in", and quietly
 // falling back to an empty workspace would produce a task that looks bound and
 // measures nothing.
-func bindCwd(s *Session, opts Options) (dataset.Workspace, string, error) {
+//
+// A start-of-session record, when there is one, is preferred over everything
+// above. It was written before the session ran and so knows the commit, which
+// the transcript does not, and it is the only description that exists at all for
+// a directory that was not a repository. What it produces is an inplace
+// workspace rather than a clone; bindRecord says why.
+func bindCwd(s *Session) (dataset.Workspace, string, error) {
+	if rec, ok, err := startstate.Read(s.ID); err != nil {
+		return dataset.Workspace{}, "", fmt.Errorf(
+			"read the start-of-session record for %s: %w", shortID(s.ID), err)
+	} else if ok {
+		return bindRecord(s, rec)
+	}
+
 	cwd := s.Cwd
 	if cwd == "" {
 		return dataset.Workspace{}, "", fmt.Errorf(
@@ -424,6 +438,88 @@ func bindCwd(s *Session, opts Options) (dataset.Workspace, string, error) {
 	}
 	note += "; the transcript records the branch and not the commit, so this is that branch as it stands now"
 	return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: ref}, note, nil
+}
+
+// bindRecord turns a captured start state into an inplace workspace.
+//
+// The record describes the directory as it was before the session ran, which is
+// what makes a faithful replay possible at all: a directory that was not a
+// repository has no other description, and reading it now would describe what
+// the session made of it rather than what it started from.
+//
+// An inplace workspace is not a clone, and that difference is the point. A clone
+// carries committed content only, so it drops the untracked and uncommitted
+// files the agent could see; it also puts the replay in a directory of the
+// harness's making, which cannot be the environment the recording ran in.
+// Running where the session ran is the only way to reproduce that, and it is
+// also why the runner has to check the directory before it starts and put it
+// back afterwards.
+func bindRecord(s *Session, rec *startstate.Record) (dataset.Workspace, string, error) {
+	if info, err := os.Stat(rec.Cwd); err != nil {
+		return dataset.Workspace{}, "", fmt.Errorf(
+			"session %s has a start-of-session record for %s, which is not there any more: an "+
+				"inplace replay has to run in that directory, so restore it, or collect with "+
+				"--workspace-repo to name a different starting point: %w",
+			shortID(s.ID), rec.Cwd, err)
+	} else if !info.IsDir() {
+		return dataset.Workspace{}, "", fmt.Errorf(
+			"the start-of-session record for %s names %s, which is not a directory",
+			shortID(s.ID), rec.Cwd)
+	}
+
+	ws := dataset.Workspace{
+		Type:    dataset.WorkspaceInplace,
+		Dir:     rec.Cwd,
+		Session: s.ID,
+	}
+	note := "replays in place in " + rec.Cwd + ", the directory the recording ran in"
+
+	switch rec.Kind {
+	case startstate.KindGit:
+		if rec.Commit == "" {
+			return dataset.Workspace{}, "", fmt.Errorf(
+				"the start-of-session record for %s names %s but no commit, so there is nothing "+
+					"to pin the replay to (collect with --workspace-repo to name a starting point)",
+				shortID(s.ID), rec.Cwd)
+		}
+		ws.Ref = rec.Commit
+		note += ", pinned to commit " + shortenSHA(rec.Commit)
+		if rec.Branch != "" {
+			note += " on " + rec.Branch
+		}
+		if len(rec.Dirty) > 0 {
+			note += fmt.Sprintf("; the directory was already dirty when the session started "+
+				"(%d change(s) recorded), and those changes are not reproduced -- the replay "+
+				"starts from the commit, so anything the session read out of them it will not find",
+				len(rec.Dirty))
+		}
+	case startstate.KindDir:
+		if rec.Snapshot == "" {
+			return dataset.Workspace{}, "", fmt.Errorf(
+				"the start-of-session record for %s has no snapshot, so nothing says what %s "+
+					"looked like at the start", shortID(s.ID), rec.Cwd)
+		}
+		if _, err := os.Stat(rec.Snapshot); err != nil {
+			return dataset.Workspace{}, "", fmt.Errorf(
+				"the start-of-session snapshot for %s (%s) is gone, so a replay of %s has no "+
+					"definition of where it starts", shortID(s.ID), rec.Snapshot, rec.Cwd)
+		}
+		ws.Snapshot = rec.Snapshot
+		note += fmt.Sprintf("; it was not a repository, so its contents at the time (%d file(s)) "+
+			"were captured and are what the replay starts from", rec.Files)
+	default:
+		return dataset.Workspace{}, "", fmt.Errorf(
+			"the start-of-session record for %s has unknown kind %q", shortID(s.ID), rec.Kind)
+	}
+	return ws, note, nil
+}
+
+// shortenSHA abbreviates a commit for a note a human reads.
+func shortenSHA(sha string) string {
+	if len(sha) <= 12 {
+		return sha
+	}
+	return sha[:12]
 }
 
 // hasCommit reports whether dir is a git repository with at least one commit.

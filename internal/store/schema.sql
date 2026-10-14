@@ -67,6 +67,22 @@ CREATE TABLE IF NOT EXISTS runs (
     -- no earlier build could chain, so the two readings agree here and there is
     -- no third state to keep apart.
     chain_sessions INTEGER NOT NULL DEFAULT 0,
+    -- How many of the run's tasks were replayed in the recording's own
+    -- directory instead of one the harness built.
+    --
+    -- This is the strongest of the three "how was it driven" columns, because
+    -- it is the one that changes what the agent could see: an inplace cell ran
+    -- where the transcript ran, with whatever was already there -- the user's
+    -- uncommitted edits, ignored build output, untracked scratch files -- and
+    -- the directory was rolled back afterwards. A page that omits it shows a
+    -- patch against a real tree as a patch against a fresh checkout.
+    --
+    -- A count, not a flag: --workspace-cwd binds a task only when its
+    -- start-of-session record survived, so one run can be part in place.
+    --
+    -- 0 means the row predates this column, which is the same as not in place:
+    -- no earlier build could replay in place.
+    inplace_tasks INTEGER NOT NULL DEFAULT 0,
     error        TEXT NOT NULL DEFAULT ''
 );
 

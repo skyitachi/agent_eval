@@ -235,6 +235,15 @@ func mergeWorkspace(dst, src *Workspace) {
 	if dst.Subdir == "" {
 		dst.Subdir = src.Subdir
 	}
+	if dst.Dir == "" {
+		dst.Dir = src.Dir
+	}
+	if dst.Snapshot == "" {
+		dst.Snapshot = src.Snapshot
+	}
+	if dst.Session == "" {
+		dst.Session = src.Session
+	}
 	if dst.Assets == "" {
 		dst.Assets = src.Assets
 	}
@@ -416,7 +425,7 @@ func (e *ValidationError) Error() string {
 }
 
 var validWorkspaceTypes = map[WorkspaceType]struct{}{
-	WorkspaceEmpty: {}, WorkspaceFiles: {}, WorkspaceGit: {},
+	WorkspaceEmpty: {}, WorkspaceFiles: {}, WorkspaceGit: {}, WorkspaceInplace: {},
 }
 
 var validOutputTypes = map[OutputType]struct{}{
@@ -453,13 +462,37 @@ func (d *Dataset) Validate() error {
 			add(id, "prompt", "prompt is empty (set prompt or prompt_file)")
 		}
 		if _, ok := validWorkspaceTypes[t.Workspace.Type]; !ok {
-			add(id, "workspace.type", "unknown type %q (want empty|files|git)", t.Workspace.Type)
+			add(id, "workspace.type", "unknown type %q (want empty|files|git|inplace)", t.Workspace.Type)
 		}
 		if t.Workspace.Type == WorkspaceGit && t.Workspace.Repo == "" {
 			add(id, "workspace.repo", "required when workspace.type=git")
 		}
 		if t.Workspace.Type == WorkspaceFiles && len(t.Workspace.Files) == 0 && t.Workspace.Assets == "" {
 			add(id, "workspace", "type=files requires files or assets")
+		}
+		if t.Workspace.Type == WorkspaceInplace {
+			// An inplace replay names one directory on one machine, so the path
+			// is required and has to be absolute. Resolving a relative one
+			// against the dataset is exactly the mistake the type exists to
+			// avoid: the dataset moves, the directory does not.
+			switch {
+			case t.Workspace.Dir == "":
+				add(id, "workspace.dir", "required when workspace.type=inplace")
+			case !filepath.IsAbs(t.Workspace.Dir):
+				add(id, "workspace.dir", "must be absolute, got %q", t.Workspace.Dir)
+			}
+			if t.Workspace.Repo != "" || t.Workspace.Assets != "" {
+				add(id, "workspace", "type=inplace runs in a directory that is already there, "+
+					"so repo and assets do not apply")
+			}
+			if len(t.Workspace.Setup) > 0 {
+				// Setup would run in somebody's own working tree, and whatever it
+				// changed would then have to be rolled back along with the
+				// agent's work -- which would make the patch claim the attempt
+				// did things it did not do.
+				add(id, "workspace.setup", "setup commands are not allowed when type=inplace: "+
+					"they would run in a directory that is not the harness's to change")
+			}
 		}
 		if _, ok := validOutputTypes[t.Output.Type]; !ok {
 			add(id, "output.type", "unknown type %q (want patch|files|stdout|none)", t.Output.Type)

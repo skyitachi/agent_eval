@@ -40,6 +40,10 @@ func sampleRun(id string) Run {
 		// distinguishable after the fact, because its cells are a sequence and
 		// not independent samples and nothing on an attempt row says so.
 		ChainSessions: true,
+		// Non-zero here for the same reason, and because the column is a count
+		// rather than a flag: a run that bound one of its tasks and not the
+		// other has to come back as one, not as "in place".
+		InplaceTasks: 2,
 	}
 }
 
@@ -139,8 +143,8 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The database is built by taking today's schema and deleting what v2, v3,
-	// v4 and v5 added, rather than by pasting in an old DDL file: a copy of the
-	// old schema would drift from the migrations and stop testing them.
+	// v4, v5 and v6 added, rather than by pasting in an old DDL file: a copy of
+	// the old schema would drift from the migrations and stop testing them.
 	for _, stmt := range []string{
 		string(body),
 		`ALTER TABLE attempts DROP COLUMN baseline_output`,
@@ -150,6 +154,7 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','1')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id, baseline_tokens)
@@ -236,6 +241,7 @@ func TestOpenUpgradesAV2Database(t *testing.T) {
 		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','2')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id,
@@ -326,6 +332,7 @@ func TestOpenUpgradesAV3Database(t *testing.T) {
 		string(body),
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','3')`,
 		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model)
 		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet')`,
@@ -395,6 +402,7 @@ func TestOpenUpgradesAV4Database(t *testing.T) {
 	for _, stmt := range []string{
 		string(body),
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','4')`,
 		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model, agent_spec_json)
 		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet',
@@ -471,6 +479,126 @@ func TestRunRecordsWhetherItChainedASession(t *testing.T) {
 	}
 	if back.ChainSessions {
 		t.Error("rewriting a run did not update whether it chained")
+	}
+}
+
+// TestOpenUpgradesAV5Database covers the v5 -> v6 step, which adds the count of
+// tasks a run replayed in the recording's own directory.
+//
+// Like the v4 -> v5 step this is a column whose default is the answer rather
+// than a gap: no build that wrote a v5 row could replay in place, so 0 needs no
+// "unknown" reading beside it. What the test is really guarding is the other
+// half -- that the step adds the column without disturbing what v5 had already
+// recorded about how the run was driven.
+func TestOpenUpgradesAV5Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE runs DROP COLUMN inplace_tasks`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','5')`,
+		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model,
+		                  agent_spec_json, chain_sessions)
+		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet',
+		        '{"kind":"claude_code","model":"sonnet"}',1)`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v5 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v5 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	run, err := s.GetRun(ctx, "r1")
+	if err != nil {
+		t.Fatalf("get the run that was already in the database: %v", err)
+	}
+	if run.InplaceTasks != 0 {
+		t.Errorf("inplace_tasks = %d for a row written before v6, want 0: no earlier build could "+
+			"replay in place", run.InplaceTasks)
+	}
+	if !run.ChainSessions {
+		t.Error("the upgrade disturbed what v5 had already recorded about the run")
+	}
+	if _, ok := run.AgentSpec(); !ok {
+		t.Error("the upgrade disturbed what v4 had already recorded about the run")
+	}
+	if err := s.CreateRun(ctx, run); err != nil {
+		t.Fatalf("write into an upgraded database: %v", err)
+	}
+}
+
+// TestRunRecordsHowManyTasksReplayedInPlace is the round trip the report
+// depends on.
+//
+// A cell that ran in the recording's own directory leaves no trace on its own
+// row: its diff is a patch like any other, and the directory is put back
+// afterwards, so nothing downstream can recover the fact that the agent had the
+// user's real tree in front of it. That makes this column the only place the
+// page can learn it, and a count rather than a flag because a dataset can be
+// part in place -- --workspace-cwd binds a task only when its start-of-session
+// record survived.
+func TestRunRecordsHowManyTasksReplayedInPlace(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	r := sampleRun("inplace")
+	r.InplaceTasks = 3
+	if err := s.CreateRun(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetRun(ctx, "inplace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.InplaceTasks != 3 {
+		t.Errorf("inplace_tasks = %d, want the 3 that were written", got.InplaceTasks)
+	}
+
+	// Not a latch, and not a flag: a second sample of the same run that bound
+	// fewer tasks has to come back saying so.
+	got.InplaceTasks = 1
+	if err := s.CreateRun(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	back, err := s.GetRun(ctx, "inplace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.InplaceTasks != 1 {
+		t.Errorf("inplace_tasks = %d after a rewrite, want the updated 1", back.InplaceTasks)
+	}
+
+	// And a run that never went near a real directory is distinct from one
+	// whose count the upgrade could not know: both read 0, which is why the
+	// report words the absence as a fact rather than as silence.
+	plain := sampleRun("plain")
+	plain.InplaceTasks = 0
+	if err := s.CreateRun(ctx, plain); err != nil {
+		t.Fatal(err)
+	}
+	none, err := s.GetRun(ctx, "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none.InplaceTasks != 0 {
+		t.Errorf("inplace_tasks = %d for a run that did not replay in place", none.InplaceTasks)
 	}
 }
 

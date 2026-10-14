@@ -319,6 +319,17 @@
     if (r.chain_sessions) {
       chips.push(raw('<span class="chip mode-alert">sessions <b>chained in order</b></span>'));
     }
+    /* Where the cells ran, which is the other half of what k means. An inplace
+     * cell's agent had the recording's own directory in front of it -- the
+     * user's uncommitted edits, ignored build output, untracked scratch files
+     * -- and the harness rolled it back afterwards. Its diff reads exactly like
+     * one taken in a fresh checkout, so this chip is the only thing on the page
+     * that says which of the two a reader is looking at. */
+    if (r.inplace_tasks) {
+      var inplaceN = int(r.inplace_tasks);
+      var inplaceSuffix = inplaceN > 1 ? ' · ' + inplaceN + ' tasks' : '';
+      chips.push(raw(tpl`<span class="chip mode-alert">workspace <b>the recording's own directory</b>${inplaceSuffix}</span>`));
+    }
     chips.push(raw(tpl`<span class="chip">started <b>${clock(r.started_at)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">duration <b>${dur(r.duration_ms)}</b></span>`));
     if (r.tool_version) chips.push(raw(tpl`<span class="chip">tool <b>${r.tool_version}</b></span>`));

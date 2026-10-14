@@ -59,6 +59,11 @@ type runOpts struct {
 	// ran them in order. False is also how every row written before schema v5
 	// reads, and there that is the answer rather than a gap.
 	chained bool
+	// inplace is how many of the run's tasks replayed in the recording's own
+	// directory rather than in a workspace the harness built. 0 is also how
+	// every row written before schema v6 reads, and there that is the answer
+	// rather than a gap.
+	inplace int
 }
 
 func addRun(t *testing.T, st *store.Store, o runOpts) {
@@ -96,6 +101,7 @@ func addRun(t *testing.T, st *store.Store, o runOpts) {
 		FactorAxis: o.factor[0], FactorLevel: o.factor[1], SweepID: o.sweep,
 		Notes: o.notes, ConfigJSON: o.config, AgentSpecJSON: specJSON,
 		ChainSessions: o.chained,
+		InplaceTasks:  o.inplace,
 	})
 	if err != nil {
 		t.Fatalf("create run %s: %v", o.id, err)
@@ -795,6 +801,34 @@ func TestCompareSaysWhatItsDeltasBundle(t *testing.T) {
 				"that one difference and nothing else",
 			},
 		},
+		{
+			// The other half of the same fact, and the sharper one: both runs
+			// drove the same agent on the same dataset, but one of them handed
+			// it the directory the recording was made in -- with the user's
+			// uncommitted edits, ignored build output and untracked scratch
+			// files already in it -- and then put it back. The cells pair up by
+			// name and the deltas read as a like-for-like comparison of two
+			// agents, which is what silence here would assert.
+			name:  "an inplace replay and a sandboxed one are not the same measurement",
+			left:  runOpts{id: "a", model: "m"},
+			right: runOpts{id: "b", model: "m", inplace: 1},
+			want: []string{
+				"whether the cells ran in the recording's own directory (0 tasks vs 1 task)",
+				"that one difference and nothing else",
+			},
+		},
+		{
+			// A count, not a flag: two runs can both be in place and still not
+			// be the same measurement, because --workspace-cwd binds a task
+			// only when its start-of-session record survived.
+			name:  "two inplace runs that bound different numbers of tasks differ",
+			left:  runOpts{id: "a", model: "m", inplace: 1},
+			right: runOpts{id: "b", model: "m", inplace: 3},
+			want: []string{
+				"whether the cells ran in the recording's own directory (1 task vs 3 tasks)",
+				"that one difference and nothing else",
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1127,6 +1161,28 @@ func TestTheRunHeaderSaysWhetherTheCellsWereChained(t *testing.T) {
 		}
 		if d.Run.ChainSessions != chained {
 			t.Errorf("chain_sessions = %v, want %v", d.Run.ChainSessions, chained)
+		}
+	}
+}
+
+// TestTheRunHeaderSaysTheCellsRanInTheRecordingDirectory covers the other fact
+// that changes what the cell list means, and the one with no trace on any cell.
+//
+// An inplace cell's diff is an ordinary patch and the directory is rolled back
+// afterwards, so nothing below this header can tell a run that had the user's
+// own tree in front of the agent from one that had a fresh checkout. The header
+// is the only place the page can say it, and the count is carried rather than a
+// flag because a dataset can be part in place.
+func TestTheRunHeaderSaysTheCellsRanInTheRecordingDirectory(t *testing.T) {
+	for _, n := range []int{0, 1, 3} {
+		st := newStore(t)
+		addRun(t, st, runOpts{id: "r1", dataset: "d", inplace: n})
+		d, err := Load(context.Background(), st, "r1", Options{})
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if d.Run.InplaceTasks != n {
+			t.Errorf("inplace_tasks = %d, want %d", d.Run.InplaceTasks, n)
 		}
 	}
 }

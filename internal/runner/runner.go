@@ -210,6 +210,9 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateDataset(ds); err != nil {
+		return nil, err
+	}
 
 	drive, err := agent.New(cfg.Agent.Kind)
 	if err != nil {
@@ -234,12 +237,16 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 		// starts from what its predecessor left, so a page that shows them as
 		// independent samples is describing a sequence as a set.
 		ChainSessions: cfg.ChainSessions,
-		FactorAxis:    cfg.FactorAxis,
-		FactorLevel:   cfg.FactorLevel,
-		SweepID:       cfg.SweepID,
-		Notes:         cfg.Notes,
-		ToolVersion:   cfg.ToolVersion,
-		ConfigJSON:    cfg.ConfigJSON,
+		// Recorded for the same reason, and it is the sharper case: an inplace
+		// cell worked in a directory that already held the user's files, so
+		// its patch is against that tree and not against a fresh checkout.
+		InplaceTasks: inplaceTasks(ds),
+		FactorAxis:   cfg.FactorAxis,
+		FactorLevel:  cfg.FactorLevel,
+		SweepID:      cfg.SweepID,
+		Notes:        cfg.Notes,
+		ToolVersion:  cfg.ToolVersion,
+		ConfigJSON:   cfg.ConfigJSON,
 	}
 	// The whole configuration, not just the labels above. The skill set is
 	// plugin_dirs plus the isolation flags that decide whether it survives, and
@@ -370,6 +377,62 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// ValidateDataset reports a dataset that must not be run with this configuration.
+//
+// It is a second method rather than part of Validate because it needs the
+// dataset, and it is checked before a run starts rather than in the middle of
+// one. The invariant is this package's, like the chain one above: an inplace cell
+// works in a directory that already exists and is not the harness's to copy, so
+// two of them at once would write over each other somewhere nobody could undo,
+// and a second sample of one task would measure what the first one left behind
+// rather than the recorded starting state.
+func (c Config) ValidateDataset(ds *dataset.Dataset) error {
+	if ds == nil {
+		return nil
+	}
+	for _, t := range ds.Tasks {
+		if t.Workspace.Type != dataset.WorkspaceInplace {
+			continue
+		}
+		if c.Concurrency > 1 {
+			return fmt.Errorf("task %s replays in place in %s, a directory that already exists and "+
+				"is not the harness's to copy, so it cannot keep %d cells in flight at once "+
+				"(use --concurrency 1)", t.ID, t.Workspace.Dir, c.Concurrency)
+		}
+		if c.Samples > 1 {
+			return fmt.Errorf("task %s replays in place in %s, so a second sample would start from "+
+				"what the first one left behind rather than from the recorded state "+
+				"(use --samples 1)", t.ID, t.Workspace.Dir)
+		}
+	}
+	return nil
+}
+
+// inplaceTasks counts the tasks that will be replayed in the recording's own
+// directory.
+//
+// Counted from the dataset rather than from the planned cells because the run
+// row is written before the plan is made, and because the plan multiplies a
+// task by its samples -- which for an inplace task is fixed at one and would
+// make a count of cells read as a count of tasks in every case but the ones it
+// exists for.
+//
+// It counts tasks and not a flag because a dataset can be part in place:
+// --workspace-cwd binds a task only when its start-of-session record was found,
+// and leaves the rest replaying in an empty workspace.
+func inplaceTasks(ds *dataset.Dataset) int {
+	if ds == nil {
+		return 0
+	}
+	n := 0
+	for _, t := range ds.Tasks {
+		if t.Workspace.Type == dataset.WorkspaceInplace {
+			n++
+		}
+	}
+	return n
+}
+
 // withDefaults fills in what a Config may leave out.
 func withDefaults(cfg Config) Config {
 	if cfg.Agent.Kind == "" {
@@ -494,7 +557,16 @@ func plan(ds *dataset.Dataset, cfg Config) ([]cell, error) {
 			}
 			// A subdirectory per run, so two concurrent runs over one dataset
 			// do not share a workspace and silently observe each other's files.
+			//
+			// An inplace task is the exception, and the reason the constraint on
+			// concurrency exists: its workspace is a directory that is already
+			// there, so the cell does not get one of its own. Pointing the cell
+			// at the real directory is what makes the environment "the same" as
+			// the recording's rather than "a copy of the same commit".
 			dir := filepath.Join(root, cfg.RunID, key, fmt.Sprintf("s%d", s))
+			if t.Workspace.Type == dataset.WorkspaceInplace {
+				dir = t.Workspace.Dir
+			}
 			groups[gk] = append(groups[gk], cell{task: t, sample: s, dir: dir, chain: key})
 		}
 	}
@@ -714,9 +786,17 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 // agent that crashed or timed out tells you something, while a workspace that
 // was never built leaves the rest of the chain with nothing to start from, and
 // the cells after it would be measuring that absence rather than the agent.
-func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) (store.Attempt, string) {
+// runCell runs one cell and reports the row it produced.
+//
+// The results are named because the deferred function below writes to them: an
+// inplace cell settles its row -- the patch and any rollback failure -- after
+// the agent has finished, and with unnamed results `return att, broke` would
+// have copied the row into the return slots before that ran, throwing the
+// rollback's outcome away. A rollback that failed is exactly the thing the row
+// exists to report.
+func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) (att store.Attempt, broke string) {
 	t := c.task
-	att := store.Attempt{
+	att = store.Attempt{
 		RunID:    cfg.RunID,
 		TaskID:   t.ID,
 		Sample:   c.sample,
@@ -724,19 +804,51 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		Tags:     t.Tags,
 		Status:   store.CellOK,
 	}
-	var broke string
 
-	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err)), err.Error()
+	inplace := t.Workspace.Type == dataset.WorkspaceInplace
+	if !inplace {
+		// An inplace cell's directory is not the harness's to create. If it is
+		// missing, that is a fact about the machine the recording ran on, and
+		// materialisation is the place that says so.
+		if err := os.MkdirAll(c.dir, 0o755); err != nil {
+			return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err)), err.Error()
+		}
 	}
 	sb, err := newSandbox(c.dir, t)
 	if err != nil {
 		return fail(att, err), err.Error()
 	}
 
+	var (
+		baseline *sandbox.Baseline
+		ran      bool
+	)
 	started := time.Now()
 	defer func() {
 		_ = sb.Close(context.WithoutCancel(ctx))
+		if inplace {
+			// An inplace directory has to be put back, and the patch has to
+			// exist before it is. Both belong here rather than on the happy
+			// path: an agent that crashed or timed out changed the directory
+			// exactly as much as one that finished.
+			//
+			// Only once the agent has actually run, though. Before that the
+			// attempt has not touched the directory, and rolling back an
+			// untouched directory is not a no-op -- it resets the directory to
+			// the recorded commit, taking whatever the user had there with it.
+			// That is not hypothetical: it is how this code once ate the working
+			// tree it was being written in, when materialisation failed because
+			// the sandbox was rooted somewhere else and the deferred rollback ran
+			// anyway.
+			//
+			// Nothing is removed either. The run did not create this directory,
+			// so the run does not get to take it away -- not even when the cell
+			// broke, which is the case that removes an ordinary cell's.
+			if ran {
+				settleInplace(context.WithoutCancel(ctx), t, baseline, &att)
+			}
+			return
+		}
 		if cfg.KeepWorkspaces {
 			return
 		}
@@ -759,7 +871,7 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 			return fail(att, fmt.Errorf("materialize: %w", err)), broke
 		}
 	}
-	baseline, err := sandbox.CurrentBaseline(ctx, sb)
+	baseline, err = baselineFor(ctx, sb, t.Workspace)
 	if err != nil {
 		broke = err.Error()
 		return fail(att, fmt.Errorf("baseline: %w", err)), broke
@@ -775,6 +887,9 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	defer cancelCell()
 
 	agentCtx, cancel := context.WithTimeout(cellCtx, budget)
+	// From here the directory may have changed, so it is from here that it has
+	// to be put back.
+	ran = true
 	attempt, agentErr := drive.Run(agentCtx, sb, specFor(cfg, t, budget), t.ResolvedPrompt)
 	cancel()
 
@@ -910,6 +1025,46 @@ func specFor(cfg Config, t dataset.TaskSpec, budget time.Duration) agent.Spec {
 		spec.AppendSystemPrompt = joinPrompt(spec.AppendSystemPrompt, t.SystemPrompt)
 	}
 	return spec
+}
+
+// baselineFor returns the commit a cell's work is measured against.
+//
+// An inplace workspace does not take its baseline from the directory's HEAD. The
+// point of pinning a commit is that the reading does not depend on what the
+// directory has been doing since the recording, and for a directory that was
+// never a repository there is no HEAD to read at all.
+func baselineFor(ctx context.Context, sb sandbox.Sandbox, ws dataset.Workspace) (*sandbox.Baseline, error) {
+	if ws.Type == dataset.WorkspaceInplace {
+		return sandbox.InplaceBaseline(ctx, ws)
+	}
+	return sandbox.CurrentBaseline(ctx, sb)
+}
+
+// settleInplace captures what an inplace attempt changed and puts the directory
+// back the way the replay found it.
+//
+// The patch is taken first, so the evidence outlives the changes it describes.
+// A failure to diff does not stop the rollback: leaving somebody's working tree
+// changed after a run is worse than losing the patch. The two failures are
+// reported side by side rather than one hiding the other.
+//
+// It is called from a deferred function, which is why it takes the row by
+// pointer and never returns an error: there is nowhere left to return one to,
+// and a rollback that did not happen has to be visible in the row.
+func settleInplace(ctx context.Context, t dataset.TaskSpec, base *sandbox.Baseline, att *store.Attempt) {
+	if base != nil && att.Diff == "" {
+		if diff, _, err := changedSet(ctx, base, t); err != nil {
+			att.Error = joinMsg(att.Error, "diff before rollback: "+err.Error())
+		} else {
+			att.Diff = diff
+		}
+	}
+	if err := sandbox.RollbackInplace(ctx, t.Workspace); err != nil {
+		att.Error = joinMsg(att.Error, "rollback: "+err.Error())
+		if att.Status == store.CellOK {
+			att.Status = store.CellError
+		}
+	}
 }
 
 func changedSet(ctx context.Context, b *sandbox.Baseline, t dataset.TaskSpec) (string, []string, error) {

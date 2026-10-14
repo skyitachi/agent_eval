@@ -88,7 +88,17 @@ var schemaFS embed.FS
 // earlier row reads back as 0, which here is not a gap in the record: no build
 // that wrote those rows could chain, so "predates the column" and "did not
 // chain" are the same fact and do not need keeping apart.
-const schemaVersion = 5
+//
+// v6 adds runs.inplace_tasks: how many of the run's tasks were replayed in the
+// recording's own directory rather than in a workspace the harness built. Like
+// v4 and v5 it records how the run was driven, and this is the strongest case
+// of the three -- an inplace cell's agent can read and write files the harness
+// never put there, and the directory is put back afterwards, so a page that
+// does not say so presents "the agent had the user's real tree in front of it"
+// as "the agent had a pristine checkout". An earlier row reads back as 0, and
+// that is correct rather than missing: no build that wrote those rows replayed
+// in place.
+const schemaVersion = 6
 
 // ErrNotFound is matched by every missing-record error. It is a sentinel, not a
 // message: the errors that match it carry their own text, which names the record
@@ -198,8 +208,20 @@ type Run struct {
 	// makes the cells of one chain a sequence and not independent samples. A
 	// row written before v5 reads false, and that is correct rather than
 	// missing -- no earlier build could chain.
-	ChainSessions bool   `json:"chain_sessions,omitempty"`
-	Error         string `json:"error,omitempty"`
+	ChainSessions bool `json:"chain_sessions,omitempty"`
+	// InplaceTasks is how many of this run's tasks were replayed in the
+	// recording's own directory instead of one the harness built.
+	//
+	// It is the strongest reason on this row to record how a run was driven:
+	// such a cell's agent saw whatever was already in that directory -- the
+	// user's uncommitted work, its ignored build output, its untracked notes --
+	// and the directory was rolled back afterwards, so the patch beside it is
+	// against a real tree and not a fresh checkout. A row written before v6
+	// reads 0, which is correct rather than a gap: no earlier build could
+	// replay in place.
+	InplaceTasks int `json:"inplace_tasks,omitempty"`
+
+	Error string `json:"error,omitempty"`
 }
 
 // AgentSpec decodes the recorded configuration. ok is false when the row has
@@ -486,6 +508,7 @@ var migrations = []func(*Store) error{
 	upgradeV2ToV3,
 	upgradeV3ToV4,
 	upgradeV4ToV5,
+	upgradeV5ToV6,
 }
 
 // upgrade walks from a database's revision to this build's.
@@ -550,6 +573,17 @@ func upgradeV3ToV4(s *Store) error {
 // document to find.
 func upgradeV4ToV5(s *Store) error {
 	return s.addColumnIfMissing("runs", "chain_sessions", "INTEGER NOT NULL DEFAULT 0")
+}
+
+// upgradeV5ToV6 adds how many of the run's tasks were replayed in the
+// recording's own directory.
+//
+// A count rather than a flag, because a dataset may bind one task and not
+// another -- --workspace-cwd writes an inplace workspace only for tasks whose
+// start-of-session record survived -- and "this run was half in place" is a
+// different thing to explain from "all of it was".
+func upgradeV5ToV6(s *Store) error {
+	return s.addColumnIfMissing("runs", "inplace_tasks", "INTEGER NOT NULL DEFAULT 0")
 }
 
 // addColumnIfMissing is why the steps above can be re-run: ADD COLUMN is not
@@ -623,7 +657,7 @@ const runColumns = `id, name, status, started_at, ended_at, duration_ms,
 	dataset_path, dataset_name, dataset_hash,
 	agent_kind, agent_model, agent_bin, backend,
 	samples, concurrency, factor_axis, factor_level, sweep_id,
-	notes, tool_version, config_json, agent_spec_json, chain_sessions, error`
+	notes, tool_version, config_json, agent_spec_json, chain_sessions, inplace_tasks, error`
 
 // CreateRun inserts a run. The caller sets StartedAt; a run with no status is
 // recorded as running.
@@ -644,7 +678,8 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 		r.DatasetPath, r.DatasetName, r.DatasetHash,
 		r.AgentKind, r.AgentModel, r.AgentBin, r.Backend,
 		r.Samples, r.Concurrency, r.FactorAxis, r.FactorLevel, r.SweepID,
-		r.Notes, r.ToolVersion, r.ConfigJSON, r.AgentSpecJSON, boolInt(r.ChainSessions), r.Error,
+		r.Notes, r.ToolVersion, r.ConfigJSON, r.AgentSpecJSON, boolInt(r.ChainSessions),
+		r.InplaceTasks, r.Error,
 	}
 	if err := checkArity("runs", runColumns, args); err != nil {
 		return err
@@ -664,6 +699,7 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 			notes=excluded.notes, tool_version=excluded.tool_version,
 			config_json=excluded.config_json, agent_spec_json=excluded.agent_spec_json,
 			chain_sessions=excluded.chain_sessions,
+			inplace_tasks=excluded.inplace_tasks,
 			error=excluded.error`,
 		args...)
 	if err != nil {
@@ -891,7 +927,8 @@ func scanRun(sc scanner) (Run, error) {
 		&r.DatasetPath, &r.DatasetName, &r.DatasetHash,
 		&r.AgentKind, &r.AgentModel, &r.AgentBin, &r.Backend,
 		&r.Samples, &r.Concurrency, &r.FactorAxis, &r.FactorLevel, &r.SweepID,
-		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.AgentSpecJSON, &chained, &r.Error)
+		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.AgentSpecJSON, &chained,
+		&r.InplaceTasks, &r.Error)
 	if err != nil {
 		return Run{}, err
 	}
