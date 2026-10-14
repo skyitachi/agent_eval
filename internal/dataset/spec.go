@@ -15,9 +15,12 @@ package dataset
 import (
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/skyitachi/agenteval/internal/machine"
 )
 
 // ---------------------------------------------------------------------------
@@ -77,9 +80,30 @@ type Workspace struct {
 	// Env is applied to setup commands and the agent process.
 	Env []EnvVar `json:"env,omitempty" yaml:"env,omitempty"`
 
-	// KeepGitHistory keeps .git when the workspace is materialized from Files/Assets
-	// into a fresh repo. Defaults to true for Type=git.
+	// KeepGitHistory keeps .git when the workspace is materialized from a git
+	// repository. Nil is not "keep": the materializer strips the history unless
+	// this is explicitly true, because a retained history lets an agent read the
+	// upstream fix out of the repository and answer from it.
 	KeepGitHistory *bool `json:"keep_git_history,omitempty" yaml:"keep_git_history,omitempty"`
+}
+
+// RepoPath is the host path a workspace's repository lives at, or the remote
+// unchanged when it names one.
+//
+// It exists so that the two things which need the answer -- the materializer and
+// a runner deciding whether it can work in the directory directly -- cannot
+// disagree about it. A remote is returned as written rather than as an error:
+// the caller is the one that knows whether a remote is usable, and only one of
+// them has a clone to do.
+func (w Workspace) RepoPath(datasetDir string) string {
+	if w.Repo == "" || looksLikeURL(w.Repo) || filepath.IsAbs(w.Repo) {
+		return w.Repo
+	}
+	return filepath.Join(datasetDir, w.Repo)
+}
+
+func looksLikeURL(s string) bool {
+	return strings.Contains(s, "://") || strings.HasPrefix(s, "git@")
 }
 
 // ---------------------------------------------------------------------------
@@ -192,9 +216,11 @@ type BaselineRef struct {
 // tool calls are evidence, so a new attempt can be set beside them step by step,
 // but nothing here is fed back into the agent.
 //
-// What it cannot promise: the workspace the session started from. Claude Code
-// records the branch it was on but not the commit, so the tool records what it
-// knows (Cwd, GitBranch) and leaves GitHead empty rather than guessing.
+// What it cannot promise: the workspace the session started from. A capture
+// records the commit the session started from and the branch it was on, but not
+// the files that were checked out around them, so the tool records what it knows
+// (Cwd, GitBranch, GitHead) and leaves RecordedDirty to say whether what it
+// knows is the whole of where the session started.
 type Baseline struct {
 	// ID identifies the source session, or whatever else produced this.
 	ID string `json:"id"`
@@ -214,6 +240,24 @@ type Baseline struct {
 	GitHead    string `json:"git_head,omitempty"`
 	AgentName  string `json:"agent_name,omitempty"`
 	AgentModel string `json:"agent_model,omitempty"`
+
+	// RecordedDirty is whether the repository had uncommitted changes when the
+	// session started. It is a fact about the recording and not about the
+	// replay, and it is the one that decides whether GitHead describes where the
+	// session started or merely the commit underneath it: a replay from a dirty
+	// recording starts from a clean tree the session never saw.
+	RecordedDirty bool `json:"recorded_dirty,omitempty"`
+
+	// Machine is the computer the baseline was collected on. A replay checks
+	// it before anything runs and refuses on any other machine: Cwd, the
+	// repository it names and the tools the session used are facts about that
+	// machine, and a replay elsewhere measures a different environment against
+	// numbers that do not say so.
+	//
+	// Nil means the baseline does not say -- written by hand, or collected
+	// before this was recorded -- and such a task is replayed anywhere, as it
+	// always was.
+	Machine *machine.Identity `json:"machine,omitempty"`
 
 	StartedAt time.Time `json:"started_at,omitempty"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`

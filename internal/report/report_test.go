@@ -3,6 +3,8 @@ package report
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,6 +61,9 @@ type runOpts struct {
 	// ran them in order. False is also how every row written before schema v5
 	// reads, and there that is the answer rather than a gap.
 	chained bool
+	// inPlace is whether the run worked in the directories the tasks record.
+	// False is likewise how every row written before schema v7 reads.
+	inPlace bool
 }
 
 func addRun(t *testing.T, st *store.Store, o runOpts) {
@@ -96,6 +101,7 @@ func addRun(t *testing.T, st *store.Store, o runOpts) {
 		FactorAxis: o.factor[0], FactorLevel: o.factor[1], SweepID: o.sweep,
 		Notes: o.notes, ConfigJSON: o.config, AgentSpecJSON: specJSON,
 		ChainSessions: o.chained,
+		InPlace:       o.inPlace,
 	})
 	if err != nil {
 		t.Fatalf("create run %s: %v", o.id, err)
@@ -133,6 +139,10 @@ type cellOpts struct {
 	// announced is the model the stream named at init instead. It is set only
 	// by the tests that are about the two sources disagreeing.
 	announced string
+	// workspaceDir and restoreNotes are what an in-place cell records about the
+	// directory it worked in.
+	workspaceDir string
+	restoreNotes string
 }
 
 func addCell(t *testing.T, st *store.Store, runID string, o cellOpts) {
@@ -148,6 +158,7 @@ func addCell(t *testing.T, st *store.Store, runID string, o cellOpts) {
 		DurationMs: o.ms, CostUSD: o.cost, OutputTokens: o.tokens,
 		Turns: o.turns, ToolCalls: o.tools,
 		Answer: o.answer, Diff: o.diff, Grades: o.grades,
+		WorkspaceDir: o.workspaceDir, RestoreNotes: o.restoreNotes,
 	}
 	if o.base != nil {
 		a.Baseline = *o.base
@@ -166,6 +177,22 @@ func addCell(t *testing.T, st *store.Store, runID string, o cellOpts) {
 	if err := st.SaveAttempt(context.Background(), a); err != nil {
 		t.Fatalf("save cell %s#%d: %v", o.task, o.sample, err)
 	}
+}
+
+// renderPage writes the run's report the way a caller does and returns the
+// document, because the chip and the notices are in the rendered page and not
+// in the payload.
+func renderPage(t *testing.T, d *Data) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "report.html")
+	if err := RenderRunFile(path, d, RenderOptions{}); err != nil {
+		t.Fatalf("RenderRunFile: %v", err)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
 }
 
 func mustLoad(t *testing.T, st *store.Store, runID string, opts Options) *Data {
@@ -1455,6 +1482,10 @@ func TestEachModeRendersInItsOwnShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	listing, err := LoadReports(context.Background(), st, Options{}, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	cases := []struct {
 		name   string
@@ -1466,6 +1497,7 @@ func TestEachModeRendersInItsOwnShell(t *testing.T) {
 		}},
 		{"compare", "compare", func(b *bytes.Buffer) error { return RenderComparison(b, cmp, RenderOptions{}) }},
 		{"index", "index", func(b *bytes.Buffer) error { return RenderIndex(b, idx, RenderOptions{}) }},
+		{"reports", "reports", func(b *bytes.Buffer) error { return RenderReports(b, listing, RenderOptions{}) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1493,6 +1525,9 @@ func TestRenderRejectsMissingInput(t *testing.T) {
 	}
 	if err := RenderIndex(&buf, nil, RenderOptions{}); err == nil {
 		t.Error("rendering a nil index succeeded")
+	}
+	if err := RenderReports(&buf, nil, RenderOptions{}); err == nil {
+		t.Error("rendering a nil report listing succeeded")
 	}
 }
 
@@ -1639,5 +1674,450 @@ func withCells(cells, passed, tokens int, cost float64, ms int64) runner.Summary
 	return runner.Summary{
 		Cells: cells, Graded: cells, Passed: passed,
 		Tokens: tokens, CostUSD: cost, DurationMs: ms,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The registry
+// ---------------------------------------------------------------------------
+
+// sampleRunCell is the smallest run a report can be made about.
+func sampleRunCell(t *testing.T, st *store.Store) {
+	t.Helper()
+	addRun(t, st, runOpts{id: "r1", name: "nightly"})
+	addCell(t, st, "r1", cellOpts{task: "t1", graded: true, passed: true})
+}
+
+// TestTheHashIsOverTheBytesTheEndpointServes is the invariant the whole
+// registry rests on.
+//
+// The stored hash is only worth anything if a reader can check it against
+// something they can fetch. That something is DataJSON, so hashing anything
+// else -- the struct before encoding, the HTML, a pretty-printed form -- would
+// make the hash a private number that happens to be reproducible inside this
+// program and nowhere else.
+func TestTheHashIsOverTheBytesTheEndpointServes(t *testing.T) {
+	st := newStore(t)
+	sampleRunCell(t, st)
+	data := mustLoad(t, st, "r1", Options{})
+
+	hash, size, err := Fingerprint(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := DataJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(raw)
+	if want := hex.EncodeToString(sum[:]); hash != want {
+		t.Errorf("fingerprint = %s, want sha256 of the served bytes %s", hash, want)
+	}
+	if size != len(raw) {
+		t.Errorf("size = %d, want %d", size, len(raw))
+	}
+}
+
+// TestARegistrationRebuildsToItsOwnHash is the claim a recorded report makes,
+// exercised end to end: register a view, rebuild it from the registration
+// alone, and get the same bytes.
+func TestARegistrationRebuildsToItsOwnHash(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	sampleRunCell(t, st)
+
+	opts := Options{Title: "nightly"}.Resolve()
+	data := mustLoad(t, st, "r1", opts)
+	reg, err := Save(ctx, st, Request{
+		Kind: store.ReportKindRun, Title: data.Title, Subject: data.Title,
+		Params: map[string]string{"run": "r1"}, Options: opts,
+	}, data)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if reg.PayloadHash == "" || reg.PayloadBytes == 0 {
+		t.Fatalf("the registration recorded no payload (%+v)", reg)
+	}
+
+	// Rebuild from nothing but the row, exactly as the server does.
+	stored, err := st.GetReport(ctx, reg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayOpts, err := ParseOptions(stored)
+	if err != nil {
+		t.Fatalf("ParseOptions: %v", err)
+	}
+	payload, mode, err := Derive(ctx, st, stored, replayOpts)
+	if err != nil {
+		t.Fatalf("Derive: %v", err)
+	}
+	if mode != ModeRun {
+		t.Errorf("mode = %q, want %q", mode, ModeRun)
+	}
+	again, _, err := Fingerprint(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != reg.PayloadHash {
+		t.Errorf("rebuilding the report hashed to %s, but it was registered as %s\n"+
+			"the registration does not describe the document it was made from", again, reg.PayloadHash)
+	}
+}
+
+// TestARebuiltReportCarriesTheTimeItWasRecorded is why the options are stored
+// rather than re-derived.
+//
+// The generation stamp is part of the document. Rebuilt with today's clock, the
+// payload differs on every read and the stored hash would disagree always --
+// making the drift check useless in exactly the case the feature exists for.
+func TestARebuiltReportCarriesTheTimeItWasRecorded(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	sampleRunCell(t, st)
+
+	recordedAt := time.Date(2026, 5, 6, 7, 8, 9, 0, time.UTC)
+	opts := Options{GeneratedAt: recordedAt}.Resolve()
+	data := mustLoad(t, st, "r1", opts)
+	reg, err := Save(ctx, st, Request{
+		Kind: store.ReportKindRun, Params: map[string]string{"run": "r1"}, Options: opts,
+	}, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := st.GetReport(ctx, reg.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayOpts, err := ParseOptions(stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _, err := Derive(ctx, st, stored, replayOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebuilt, ok := payload.(*Data)
+	if !ok {
+		t.Fatalf("payload is %T", payload)
+	}
+	if rebuilt.Generated != "2026-05-06T07:08:09Z" {
+		t.Errorf("the rebuilt document says it was generated %q, want the time it was recorded",
+			rebuilt.Generated)
+	}
+	if !reg.CreatedAt.Equal(recordedAt) {
+		t.Errorf("created at = %s, want %s", reg.CreatedAt, recordedAt)
+	}
+}
+
+// TestParseOptionsRefusesRatherThanGuessing covers the two ways a stored
+// request can be unusable.
+//
+// Both must refuse. Falling back to the defaults would rebuild a different
+// document and then present the difference as the data having moved -- a wrong
+// diagnosis the reader has no way to check, and worse than an error page.
+func TestParseOptionsRefusesRatherThanGuessing(t *testing.T) {
+	cases := []struct {
+		name string
+		json string
+	}{
+		{"not json", `{`},
+		{"no generation time", `{"max_inline_bytes":1024}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := store.Report{ID: "deadbeefdeadbeef", OptionsJSON: tc.json}
+			opts, err := ParseOptions(reg)
+			if err == nil {
+				t.Fatalf("accepted %q and produced %+v", tc.json, opts)
+			}
+			if !strings.Contains(err.Error(), reg.ID) {
+				t.Errorf("err = %q, want it to name the registration", err)
+			}
+		})
+	}
+}
+
+// TestDeriveRefusesARequestItCannotHonour covers the parameters.
+//
+// An empty projection and a projection of nothing look the same on the page, so
+// a registration that does not say which run it was about has to be an error
+// rather than a run report with no run in it.
+func TestDeriveRefusesARequestItCannotHonour(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	sampleRunCell(t, st)
+	opts := Options{}.Resolve()
+
+	cases := []struct {
+		name string
+		reg  store.Report
+		want string
+	}{
+		{"no parameter", store.Report{ID: "a", Kind: store.ReportKindRun, ParamsJSON: `{}`}, "run"},
+		{"blank parameter", store.Report{ID: "b", Kind: store.ReportKindRun, ParamsJSON: `{"run":"  "}`}, "run"},
+		{"half a comparison", store.Report{ID: "c", Kind: store.ReportKindCompare, ParamsJSON: `{"left":"r1"}`}, "right"},
+		{"unknown kind", store.Report{ID: "d", Kind: "reward", ParamsJSON: `{}`}, "reward"},
+		{"unreadable params", store.Report{ID: "e", Kind: store.ReportKindRun, ParamsJSON: `[1,2]`}, "e"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, err := Derive(ctx, st, tc.reg, opts); err == nil {
+				t.Fatal("Derive accepted a registration it cannot rebuild")
+			} else if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %q, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestAListingShowsStoredFactsAndFlagsOlderFormats covers the registry listing.
+//
+// It deliberately does not rebuild the payloads it lists: that would cost a
+// full projection per row. So the flag for a payload written in another format
+// has to come off the row, and it has to be there -- otherwise such a report
+// reads as one whose data changed, which is a different and much louder claim.
+func TestAListingShowsStoredFactsAndFlagsOlderFormats(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	sampleRunCell(t, st)
+	opts := Options{}.Resolve()
+	data := mustLoad(t, st, "r1", opts)
+	if _, err := Save(ctx, st, Request{
+		Kind: store.ReportKindRun, Title: "nightly", Subject: "nightly",
+		Params: map[string]string{"run": "r1"}, Options: opts,
+	}, data); err != nil {
+		t.Fatal(err)
+	}
+	// A registration from a build with a different payload format.
+	older := saveAs(t, st, store.Report{
+		ID: "oldoldoldoldold1", Kind: store.ReportKindRun, Title: "older",
+		Subject: "r0 / model=opus", ParamsJSON: `{"run":"r0"}`,
+		OptionsJSON: `{}`, CreatedAt: time.Now().Add(-time.Hour),
+		PayloadHash: "beefbeefbeefbeef", PayloadBytes: 4096,
+		DataVersion: DataVersion - 1,
+	})
+
+	listing, err := LoadReports(ctx, st, opts, 0, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Entries) != 2 {
+		t.Fatalf("listing holds %d entries, want 2", len(listing.Entries))
+	}
+	byID := map[string]ReportEntry{}
+	for _, e := range listing.Entries {
+		byID[e.ID] = e
+	}
+	if got := byID[older.ID]; !got.OlderFormat {
+		t.Errorf("entry %+v is not flagged as written in another format", got)
+	}
+	fresh := listing.Entries[0]
+	if fresh.OlderFormat {
+		t.Errorf("this build's own registration is flagged as an older format: %+v", fresh)
+	}
+	if fresh.Href != "/r/"+fresh.ID {
+		t.Errorf("href = %q, want the id appended to /r/", fresh.Href)
+	}
+	if len(fresh.Hash) != 12 {
+		t.Errorf("hash = %q, want it clipped to 12 characters for the listing", fresh.Hash)
+	}
+	if fresh.Bytes == 0 {
+		t.Error("the listing does not say how big the recorded document was")
+	}
+	// The subject survives on its own: this entry names a run that does not
+	// exist, which is exactly when the stored label is the only thing left.
+	if byID[older.ID].Subject != "r0 / model=opus" {
+		t.Errorf("subject = %q, want the label it was registered with", byID[older.ID].Subject)
+	}
+}
+
+// TestAListingCarriesTheLinkPrefixItWasGiven is what lets a listing inlined
+// into a file point somewhere other than at one server's route.
+func TestAListingCarriesTheLinkPrefixItWasGiven(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	saveAs(t, st, store.Report{
+		ID: "aaaaaaaaaaaaaaaa", Kind: store.ReportKindRun, ParamsJSON: `{}`,
+		OptionsJSON: `{}`, CreatedAt: time.Now(), DataVersion: DataVersion,
+	})
+	listing, err := LoadReports(ctx, st, Options{}, 0, "/report/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := listing.Entries[0].Href; got != "/report/aaaaaaaaaaaaaaaa" {
+		t.Errorf("href = %q", got)
+	}
+}
+
+// saveAs stores a row verbatim, so a test can build a shape this build would
+// not write -- an older payload format, an unreadable request.
+func saveAs(t *testing.T, st *store.Store, r store.Report) store.Report {
+	t.Helper()
+	if err := st.SaveReport(context.Background(), r); err != nil {
+		t.Fatalf("SaveReport: %v", err)
+	}
+	return r
+}
+
+// TestTheRecordBannerIsOutsideThePayload is what keeps the hash a claim about
+// the document.
+//
+// The banner describes the page, so it cannot be inside the thing the page is a
+// rendering of: with it in the payload, the document a reader opens would never
+// be the document that was hashed, and the JSON endpoint would have to strip a
+// field to be the same document twice.
+func TestTheRecordBannerIsOutsideThePayload(t *testing.T) {
+	st := newStore(t)
+	sampleRunCell(t, st)
+	data := mustLoad(t, st, "r1", Options{})
+	before, err := DataJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := &Record{ID: "abc", Hash: "aaaa", CurrentHash: "bbbb",
+		Severity: "warn", Head: "Moved.", Note: "it moved"}
+	var buf bytes.Buffer
+	if err := RenderRun(&buf, data, RenderOptions{Record: rec}); err != nil {
+		t.Fatal(err)
+	}
+	doc := buf.String()
+	if !strings.Contains(doc, "it moved") {
+		t.Error("the banner did not reach the page")
+	}
+	if !strings.Contains(doc, `class="recordbar"`) {
+		t.Error("the banner is not in the shell's own container")
+	}
+	// The payload embedded in the page is unchanged by the banner existing.
+	after := extractPayload(t, doc)
+	if after != string(before) {
+		t.Errorf("the banner changed the embedded payload:\n before: %s\n  after: %s", before, after)
+	}
+	if !strings.Contains(doc, `data-mode="run"`) {
+		t.Error("the banner replaced the mode instead of sitting beside it")
+	}
+}
+
+// TestTheFailurePageCarriesNoClientScript covers the error shell.
+//
+// app.js renders "nothing has been recorded yet" when it finds no listing, so
+// shipping it on a failure page would paint that over the reason the page
+// exists.
+func TestTheFailurePageCarriesNoClientScript(t *testing.T) {
+	var buf bytes.Buffer
+	err := RenderError(&buf, ErrorOptions{
+		Title:    "No such report.",
+		Message:  `No report with id "nope" in aeval.db.`,
+		Home:     "/",
+		HomeText: "All recorded reports",
+	}, RenderOptions{})
+	if err != nil {
+		t.Fatalf("RenderError: %v", err)
+	}
+	doc := buf.String()
+	for _, want := range []string{"No such report.", "aeval.db", `href="/"`, "app.css"} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("the failure page does not mention %q:\n%s", want, doc)
+		}
+	}
+	for _, unwanted := range []string{"app.js", "__AEVAL_PAYLOAD__", `data-mode="reports"`} {
+		if strings.Contains(doc, unwanted) {
+			t.Errorf("the failure page carries %q", unwanted)
+		}
+	}
+}
+
+// TestTheFailurePageEscapesWhatItIsGiven covers the one place a failure page
+// renders something a user chose: a run name, which comes from a dataset, ends
+// up inside a message about that run being gone.
+func TestTheFailurePageEscapesWhatItIsGiven(t *testing.T) {
+	var buf bytes.Buffer
+	err := RenderError(&buf, ErrorOptions{
+		Title:   "Gone.",
+		Message: `<script>alert(1)</script> & "quoted"`,
+		Home:    "/",
+	}, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := buf.String()
+	if strings.Contains(doc, "<script>alert(1)</script>") {
+		t.Error("the message reached the page as markup")
+	}
+	if !strings.Contains(doc, "&lt;script&gt;") {
+		t.Errorf("the message was not escaped:\n%s", doc)
+	}
+}
+
+// TestThePageSaysARunWorkedInYourRepositories covers the largest of the
+// facts that change what a cell means.
+//
+// A run that worked in place put an agent inside a working repository: the
+// history was readable, the rest of the tree was around it, and the run put the
+// tree back afterwards. A page that shows it beside a copy-based run without
+// saying so invites the reader to take the pair for the same experiment.
+func TestThePageSaysARunWorkedInYourRepositories(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "r1", dataset: "d", inPlace: true})
+	addCell(t, st, "r1", cellOpts{
+		task: "t1", graded: true, passed: true,
+		workspaceDir: "/work/proj",
+		restoreNotes: "put back at 2d347614 in /work/proj; nothing was left behind",
+	})
+	d := mustLoad(t, st, "r1", Options{})
+	if !d.Run.InPlace {
+		t.Error("the payload must say the run worked in place")
+	}
+	task := taskByID(t, d, "t1")
+	if task.WorkspaceDir != "/work/proj" {
+		t.Errorf("workspace_dir = %q, want the directory the agent worked in", task.WorkspaceDir)
+	}
+	if !strings.Contains(task.RestoreNotes, "nothing was left behind") {
+		t.Errorf("restore_notes = %q", task.RestoreNotes)
+	}
+	// The page renders the chip, which is what a reader actually sees.
+	page := renderPage(t, d)
+	if !strings.Contains(page, "in your repositories") {
+		t.Error("the header must say the agent worked in the reader's repositories")
+	}
+}
+
+// TestARestoreThatFailedIsVisibleOnThePage: the one thing here that is about
+// the reader's own machine rather than about the measurement.
+func TestARestoreThatFailedIsVisibleOnThePage(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "r1", dataset: "d", inPlace: true})
+	addCell(t, st, "r1", cellOpts{
+		task: "t1", graded: true, passed: true,
+		workspaceDir: "/work/proj",
+		restoreNotes: "the repository at /work/proj was NOT fully put back: check the worktree out: " +
+			"error: Your local changes would be overwritten",
+	})
+	page := renderPage(t, mustLoad(t, st, "r1", Options{}))
+	if !strings.Contains(page, "Not put back") {
+		t.Error("a restore that failed must be rendered as a failure, not as a note")
+	}
+}
+
+// TestAnInPlaceRunAndACopyAreNotTheSameMeasurement: the comparison has to name
+// the difference, or the deltas beside it read as one agent beating another.
+func TestAnInPlaceRunAndACopyAreNotTheSameMeasurement(t *testing.T) {
+	st := newStore(t)
+	addRun(t, st, runOpts{id: "a", dataset: "d", inPlace: false})
+	addRun(t, st, runOpts{id: "b", dataset: "d", inPlace: true})
+	addCell(t, st, "a", cellOpts{task: "t1", graded: true, passed: true})
+	addCell(t, st, "b", cellOpts{task: "t1", graded: true, passed: false})
+	d, err := LoadComparison(context.Background(), st, "a", "b", Options{})
+	if err != nil {
+		t.Fatalf("LoadComparison: %v", err)
+	}
+	joined := strings.Join(d.Warnings, "\n")
+	if !strings.Contains(joined, "in the recorded directories themselves") {
+		t.Errorf("the comparison must name the difference, got: %v", d.Warnings)
+	}
+	if !strings.Contains(joined, "in a copy vs in place") {
+		t.Errorf("the comparison must say which side was which, got: %v", d.Warnings)
 	}
 }

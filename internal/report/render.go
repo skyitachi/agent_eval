@@ -2,7 +2,9 @@ package report
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -44,7 +46,42 @@ const (
 	// ModeSweep renders an attribution: one axis varied, one control, and the
 	// paired differences the levels produced.
 	ModeSweep Mode = "sweep"
+	// ModeReports renders the listing of reports that were recorded.
+	ModeReports Mode = "reports"
 )
+
+// Record is what a served page says about the registration it came from.
+//
+// It lives on the page shell rather than in the payload, and that placement is
+// the point. The payload is the document that was hashed, so putting the record
+// inside it would mean the page a reader opens is never byte-identical to the
+// one that was recorded -- and the JSON endpoint would have to strip a field to
+// be the same document twice. The shell sits outside the document, so the hash
+// stays a claim about the page's contents alone.
+type Record struct {
+	// ID, CreatedAt and Hash are the registration's own facts, carried as they
+	// were stored.
+	ID        string
+	CreatedAt string
+	Hash      string
+	// CurrentHash is what rebuilding the payload produced just now, and Match is
+	// whether the two agree.
+	//
+	// Match is not the same claim as "nothing changed": a payload written in an
+	// older format hashes differently with no data having moved at all, which is
+	// why the note below says which of the two happened instead of leaving the
+	// reader to guess.
+	CurrentHash string
+	Match       bool
+	// Severity picks the banner's colour: "info", "warn" or "err".
+	Severity string
+	// Head and Note are the sentence the page shows. Written here because
+	// deciding which combination deserves a warning is a judgement, and a
+	// template that re-derived it would be a second, quieter copy of these
+	// rules.
+	Head string
+	Note string
+}
 
 // NavLink is one header navigation entry.
 type NavLink struct {
@@ -69,6 +106,9 @@ type RenderOptions struct {
 	// MetaRefresh adds a meta refresh, which is how a live index page follows a
 	// run that is still going.
 	MetaRefresh string
+	// Record, when set, renders a banner above the document saying which
+	// registration the page came from and whether it still reproduces.
+	Record *Record
 }
 
 func (o RenderOptions) withDefaults() RenderOptions {
@@ -81,22 +121,44 @@ func (o RenderOptions) withDefaults() RenderOptions {
 	return o
 }
 
-type pageView struct {
+// shellHead is the vocabulary of the shared <head>.
+//
+// It is a type of its own because two pages need the head and only one of them
+// has a payload, a nav or a mode. Sharing the template without sharing its
+// inputs would mean a struct per page carrying fields the template mentions but
+// that page never sets -- the failure page would have a Nav it always leaves
+// empty, and nothing would keep that field honest.
+type shellHead struct {
 	Title       string
-	Mode        string
-	Home        string
-	Nav         []NavLink
 	MetaRefresh string
 	Standalone  bool
 	AssetBase   string
-	// CSS and JS use the context-specific safe types. html/template picks its
-	// escaper from the surrounding element, so a template.HTML injected into
-	// <style> would be re-escaped as CSS text and silently corrupt the
-	// stylesheet -- template.CSS and template.JS are the types it accepts
-	// verbatim there.
-	CSS     template.CSS
+	// CSS uses the context-specific safe type. html/template picks its escaper
+	// from the surrounding element, so a template.HTML injected into <style>
+	// would be re-escaped as CSS text and silently corrupt the stylesheet --
+	// template.CSS is the type it accepts verbatim there.
+	CSS template.CSS
+}
+
+type pageView struct {
+	Head   shellHead
+	Mode   string
+	Home   string
+	Nav    []NavLink
+	Record *Record
+	// JS is the client, inlined when the document is standalone.
 	JS      template.JS
 	Payload template.JS
+}
+
+// errorView is the failure page. It carries no client script: a page that
+// cannot be built has nothing for the client to render, and shipping app.js
+// would have it paint "no reports recorded yet" over the reason why.
+type errorView struct {
+	Head     shellHead
+	Message  string
+	Home     string
+	HomeText string
 }
 
 var pageTemplate = template.Must(template.New("page.html").ParseFS(templateFS, "templates/*.html"))
@@ -136,6 +198,103 @@ func RenderIndex(w io.Writer, idx *Index, opts RenderOptions) error {
 		return fmt.Errorf("report: index is nil")
 	}
 	return render(w, ModeIndex, idx, idx.Title, opts)
+}
+
+// RenderReports writes the listing of recorded reports.
+func RenderReports(w io.Writer, r *Reports, opts RenderOptions) error {
+	if r == nil {
+		return fmt.Errorf("report: report listing is nil")
+	}
+	return render(w, ModeReports, r, r.Title, opts)
+}
+
+// RenderPayload writes a payload in the mode that goes with it.
+//
+// It exists for the server, which derives a payload from a registration and so
+// knows the mode but not the concrete type. The three renderers above type
+// their argument, which is what turns a mismatched payload into a compile error
+// everywhere else; this one cannot, so it checks and says what it got.
+func RenderPayload(w io.Writer, mode Mode, payload any, opts RenderOptions) error {
+	switch mode {
+	case ModeRun:
+		data, ok := payload.(*Data)
+		if !ok {
+			return fmt.Errorf("report: mode %s needs a *Data payload, got %T", mode, payload)
+		}
+		return RenderRun(w, data, opts)
+	case ModeCompare:
+		data, ok := payload.(*Data)
+		if !ok {
+			return fmt.Errorf("report: mode %s needs a *Data payload, got %T", mode, payload)
+		}
+		return RenderComparison(w, data, opts)
+	case ModeSweep:
+		data, ok := payload.(*Data)
+		if !ok {
+			return fmt.Errorf("report: mode %s needs a *Data payload, got %T", mode, payload)
+		}
+		return RenderSweep(w, data, opts)
+	case ModeIndex:
+		idx, ok := payload.(*Index)
+		if !ok {
+			return fmt.Errorf("report: mode %s needs an *Index payload, got %T", mode, payload)
+		}
+		return RenderIndex(w, idx, opts)
+	case ModeReports:
+		listing, ok := payload.(*Reports)
+		if !ok {
+			return fmt.Errorf("report: mode %s needs a *Reports payload, got %T", mode, payload)
+		}
+		return RenderReports(w, listing, opts)
+	}
+	return fmt.Errorf("report: no renderer for mode %q", mode)
+}
+
+// ErrorOptions is one failure page.
+type ErrorOptions struct {
+	// Title is the headline; Status is not shown, because a reader of an HTML
+	// page has no use for a number they cannot act on -- the caller sets it on
+	// the response and the page says what happened in words.
+	Title string
+	// Message explains the failure, and has to name the record: "not found" on
+	// its own reads like a bug in the tool, while "no report with id X in
+	// aeval.db" reads like the wrong database, which is what it usually is.
+	Message string
+	// Home and HomeText are the way back. Empty hides the link.
+	Home     string
+	HomeText string
+}
+
+// RenderError writes a failure page in the report's own shell.
+//
+// It is a page and not a text response because the caller is a browser: a
+// reader who mistyped a link should land somewhere that looks like the tool,
+// says which link was wrong, and offers the list.
+func RenderError(w io.Writer, eo ErrorOptions, opts RenderOptions) error {
+	opts = opts.withDefaults()
+	if strings.TrimSpace(eo.Title) == "" {
+		eo.Title = "Not found"
+	}
+	if eo.Home != "" && strings.TrimSpace(eo.HomeText) == "" {
+		eo.HomeText = "All recorded reports"
+	}
+	view := errorView{
+		Head: shellHead{
+			Title:      eo.Title,
+			Standalone: opts.Standalone,
+			AssetBase:  opts.AssetBase,
+		},
+		Message:  eo.Message,
+		Home:     eo.Home,
+		HomeText: eo.HomeText,
+	}
+	if opts.Standalone {
+		view.Head.CSS = template.CSS(CSS()) //nolint:gosec // embedded at build time, not user input
+	}
+	if err := pageTemplate.ExecuteTemplate(w, "error", view); err != nil {
+		return fmt.Errorf("render error page: %w", err)
+	}
+	return nil
 }
 
 // RenderRunFile writes a standalone report to disk.
@@ -194,18 +353,21 @@ func render(w io.Writer, mode Mode, payload any, title string, opts RenderOption
 		title = "Evaluation report"
 	}
 	view := pageView{
-		Title:       title,
-		Mode:        string(mode),
-		Home:        opts.Home,
-		Nav:         opts.Nav,
-		MetaRefresh: opts.MetaRefresh,
-		Standalone:  opts.Standalone,
-		AssetBase:   opts.AssetBase,
-		Payload:     js,
+		Head: shellHead{
+			Title:       title,
+			MetaRefresh: opts.MetaRefresh,
+			Standalone:  opts.Standalone,
+			AssetBase:   opts.AssetBase,
+		},
+		Mode:    string(mode),
+		Home:    opts.Home,
+		Nav:     opts.Nav,
+		Record:  opts.Record,
+		Payload: js,
 	}
 	if opts.Standalone {
-		view.CSS = template.CSS(CSS()) //nolint:gosec // embedded at build time, not user input
-		view.JS = template.JS(JS())    //nolint:gosec // embedded at build time, not user input
+		view.Head.CSS = template.CSS(CSS()) //nolint:gosec // embedded at build time, not user input
+		view.JS = template.JS(JS())         //nolint:gosec // embedded at build time, not user input
 	}
 	if err := pageTemplate.ExecuteTemplate(w, "page", view); err != nil {
 		return fmt.Errorf("render report: %w", err)
@@ -266,6 +428,24 @@ func payloadJS(payload any) (template.JS, error) {
 		return "", fmt.Errorf("encode payload: %w", err)
 	}
 	return template.JS(neutralize(raw)), nil //nolint:gosec // neutralize removes every HTML-significant byte
+}
+
+// Fingerprint is the identity of a payload: a hash over the exact bytes the
+// JSON endpoint returns, and how many of them there are.
+//
+// It hashes DataJSON rather than a fresh marshal so that the claim and the
+// document cannot disagree. The two are the same bytes by construction, which
+// turns "hashing the endpoint's body reproduces the recorded hash" from a test
+// of the encoder's agreement with itself into a test of the invariant -- and it
+// is the invariant that matters, because the hash is only worth storing if a
+// reader can check it against something they can fetch.
+func Fingerprint(payload any) (string, int, error) {
+	raw, err := DataJSON(payload)
+	if err != nil {
+		return "", 0, err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), len(raw), nil
 }
 
 // neutralize rewrites the three HTML-significant ASCII characters as JSON

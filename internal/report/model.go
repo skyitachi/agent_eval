@@ -39,7 +39,14 @@ import (
 // v2 is the minimal model: the reward, guard and oracle fields are gone, and a
 // task carries what it cost against its recorded baseline instead of what a
 // training loop would have paid for it.
-const DataVersion = 2
+//
+// v3 adds the in-place facts: whether the run worked in the directories its
+// tasks record, and per cell where the agent worked and what happened to that
+// directory afterwards. A v2 renderer reading a v3 payload would draw a page
+// that looks complete and says nothing about the agent having been let loose in
+// someone's repository, which is the one thing this payload was extended to
+// prevent.
+const DataVersion = 3
 
 // Options controls what a report embeds.
 //
@@ -50,34 +57,45 @@ const DataVersion = 2
 // rather than silently producing an unusable file.
 type Options struct {
 	// Title overrides the document title.
-	Title string
+	Title string `json:"title,omitempty"`
 	// GeneratedAt stamps the report; zero means time.Now.
-	GeneratedAt time.Time
+	//
+	// It is part of the document, not of the process: it becomes the payload's
+	// `generated` field, so a recorded report is rebuilt with the time it was
+	// recorded rather than with the time it is being read. That is what makes a
+	// stored hash a claim about a document instead of about a clock.
+	GeneratedAt time.Time `json:"generated_at"`
 
 	// MaxToolCallsPerTask bounds the per-task tool-call table.
-	MaxToolCallsPerTask int
+	MaxToolCallsPerTask int `json:"max_tool_calls_per_task"`
 	// MaxEventsPerTask bounds the per-task trajectory. Both ends are kept: the
 	// opening events carry the task framing and the last ones carry the answer,
 	// and a viewer that shows only the head is a viewer that never shows what
 	// happened.
-	MaxEventsPerTask int
+	MaxEventsPerTask int `json:"max_events_per_task"`
 	// MaxFieldBytes clips a single text field (diff, answer, tool output).
 	// Kept generous: a truncated stack trace is worthless.
-	MaxFieldBytes int
+	MaxFieldBytes int `json:"max_field_bytes"`
 
 	// MaxInlineBytes budgets the whole serialized payload. Once the budget is
 	// exhausted, remaining *passing* tasks lose their trajectory and diff;
 	// failing tasks keep their evidence longest.
-	MaxInlineBytes int
+	MaxInlineBytes int `json:"max_inline_bytes"`
 
 	// NoTaskDetail drops per-task diffs, answers and trajectories entirely,
 	// producing a small summary report rather than a truncated one. This is
 	// what a reader who only wants the numbers is asking for; it is also the
 	// only way to get a bounded document out of a run whose cells are enormous.
-	NoTaskDetail bool
+	NoTaskDetail bool `json:"no_task_detail,omitempty"`
 }
 
-func (o Options) withDefaults() Options {
+// Resolve fills in the defaults, including the generation stamp.
+//
+// Exported because a registration has to store the options that *applied*, not
+// the ones that were typed: a zero MaxInlineBytes means 8 MiB, and recording
+// the zero would let a later build's different default silently rebuild a
+// different document and then report it as the data having moved.
+func (o Options) Resolve() Options {
 	if o.MaxToolCallsPerTask <= 0 {
 		o.MaxToolCallsPerTask = 200
 	}
@@ -98,6 +116,8 @@ func (o Options) withDefaults() Options {
 	}
 	return o
 }
+
+func (o Options) withDefaults() Options { return o.Resolve() }
 
 // ---------------------------------------------------------------------------
 // Payload
@@ -164,6 +184,17 @@ type RunInfo struct {
 	// one continuation and not k independent samples -- and a page that lists
 	// them side by side without saying so invites the reader to average them.
 	ChainSessions bool `json:"chain_sessions,omitempty"`
+
+	// InPlace is whether this run worked in the directories its tasks record,
+	// checked out at the commits they name, rather than in copies.
+	//
+	// It is on the page for the same reason ChainSessions is, and more
+	// strongly. A run that worked in place put an agent inside a working
+	// repository: the whole history was readable, the rest of the tree was
+	// around it, and the run put the tree back when it was done. A page that
+	// shows two runs side by side without this invites the reader to take the
+	// pair for the same experiment, and they were not.
+	InPlace bool `json:"in_place,omitempty"`
 
 	// Skills is what this run's own configuration says about the agent's
 	// skills. Nil means the run recorded no configuration -- it predates the
@@ -321,6 +352,15 @@ type Task struct {
 	Baseline *BaselineView `json:"baseline,omitempty"`
 
 	Error string `json:"error,omitempty"`
+
+	// WorkspaceDir is where the agent actually worked. For an in-place run that
+	// is a directory belonging to whoever ran the evaluation, which is worth
+	// naming on the page: the reader may be the person whose tree it was.
+	WorkspaceDir string `json:"workspace_dir,omitempty"`
+	// RestoreNotes is what happened to that directory when the run gave it
+	// back. Empty for a run that worked in a copy, where there was nothing to
+	// give back.
+	RestoreNotes string `json:"restore_notes,omitempty"`
 
 	Diff   string `json:"diff,omitempty"`
 	Answer string `json:"answer,omitempty"`
@@ -527,4 +567,56 @@ type IndexEntry struct {
 	PassRate *float64 `json:"pass_rate,omitempty"`
 
 	Error string `json:"error,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Recorded reports
+// ---------------------------------------------------------------------------
+
+// Reports is the listing of reports that were recorded.
+//
+// It lists *registrations*, not runs. A run appears here because somebody
+// rendered a report about it, which is a different claim from the run existing
+// -- and that is why the ordering is by registration time and not by anything
+// the run did.
+type Reports struct {
+	Version   int           `json:"version"`
+	Generated string        `json:"generated"`
+	Title     string        `json:"title"`
+	Entries   []ReportEntry `json:"reports"`
+}
+
+// ReportEntry is one recorded report, as the listing shows it.
+//
+// Every field here is a stored fact. The listing does not rebuild the payloads
+// it lists, so it cannot say whether one has drifted -- that costs a full
+// projection per row, and a listing whose cost grows with the number of reports
+// is a listing that stops being openable. The drift verdict is on the page you
+// get by opening one.
+type ReportEntry struct {
+	ID string `json:"id"`
+	// Kind is run | compare | sweep | index.
+	Kind  string `json:"kind"`
+	Title string `json:"title"`
+	// Subject is the human label of what the report was about. Stored at
+	// registration rather than looked up, because the thing it names can be
+	// deleted: a row whose run is gone still has to be able to say which run it
+	// was, and no lookup can answer that afterwards.
+	Subject   string `json:"subject"`
+	CreatedAt string `json:"created_at"`
+	// Hash is the recorded payload hash, clipped to what distinguishes two
+	// registrations at a glance rather than to what proves anything.
+	Hash string `json:"hash"`
+	// Href is filled in by whoever serves the listing, so the page needs no
+	// knowledge of the route and a listing inlined into a file does not carry a
+	// link that only works on one server.
+	Href  string `json:"href,omitempty"`
+	Bytes int64  `json:"bytes"`
+	// DataVersion is the payload format this was written in.
+	DataVersion int `json:"data_version"`
+	// OlderFormat is true when that format differs from this build's, which is
+	// on its own enough to make the recorded hash disagree when the report is
+	// opened. Saying it in the listing is what keeps that from reading as the
+	// data having changed.
+	OlderFormat bool `json:"older_format,omitempty"`
 }

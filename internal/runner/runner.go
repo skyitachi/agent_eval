@@ -29,6 +29,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/dataset"
 	"github.com/skyitachi/agenteval/internal/grader"
+	"github.com/skyitachi/agenteval/internal/machine"
 	"github.com/skyitachi/agenteval/internal/sandbox"
 	"github.com/skyitachi/agenteval/internal/store"
 	"github.com/skyitachi/agenteval/internal/trace"
@@ -89,10 +90,28 @@ type Config struct {
 	ChainSessions bool
 
 	// WorkRoot is where per-cell workspaces are created. Default: a
-	// "workspaces" directory beside the database.
+	// "workspaces" directory beside the database. It is unused when InPlace is
+	// set, because then no workspace is created at all.
 	WorkRoot string
 	// KeepWorkspaces leaves each cell's directory on disk for inspection.
 	KeepWorkspaces bool
+
+	// InPlace works in the directory each task records, checked out at the
+	// commit the task names, instead of in a copy under WorkRoot.
+	//
+	// This is the one mode that touches something the harness does not own. The
+	// recorded directory is the user's working tree, and the run's contract is
+	// to put it back: the branch, the commit and the tracked files it found are
+	// restored when the chain that was using it finishes. What cannot be put
+	// back is refused before the first cell -- see Preflight -- because a
+	// refusal costs nothing and a half-restored repository costs the user their
+	// work.
+	//
+	// It is a run-time decision rather than a dataset one: the same tasks can be
+	// replayed against a copy, which is what a shared or archived dataset should
+	// do, and the run row records which of the two happened so that a reader of
+	// the report is never left guessing.
+	InPlace bool
 
 	// Timeout and MaxTurns are the fallbacks for tasks that declare none.
 	Timeout  time.Duration
@@ -210,6 +229,24 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	// Before the run row exists, so that a dataset which cannot be run this way
+	// leaves no failed run behind for a mistake that was knowable up front.
+	if err := CheckMachine(ds); err != nil {
+		return nil, err
+	}
+	if err := Preflight(ctx, ds, cfg); err != nil {
+		return nil, err
+	}
+	// One lock per repository for the whole run, taken before the first cell
+	// and held until the last one has been put back. Per run rather than per
+	// chain: two chains of one run can name the same repository -- two samples
+	// of one task do by construction -- and a per-chain lock would make the run
+	// refuse itself.
+	held, err := acquireInPlace(ctx, ds, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseInPlace(held)
 
 	drive, err := agent.New(cfg.Agent.Kind)
 	if err != nil {
@@ -234,12 +271,16 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 		// starts from what its predecessor left, so a page that shows them as
 		// independent samples is describing a sequence as a set.
 		ChainSessions: cfg.ChainSessions,
-		FactorAxis:    cfg.FactorAxis,
-		FactorLevel:   cfg.FactorLevel,
-		SweepID:       cfg.SweepID,
-		Notes:         cfg.Notes,
-		ToolVersion:   cfg.ToolVersion,
-		ConfigJSON:    cfg.ConfigJSON,
+		// And for the same reason: a cell measured in someone's repository had
+		// that repository's history in front of it, and the run put the tree
+		// back afterwards. Neither is visible in any number on the row.
+		InPlace:     cfg.InPlace,
+		FactorAxis:  cfg.FactorAxis,
+		FactorLevel: cfg.FactorLevel,
+		SweepID:     cfg.SweepID,
+		Notes:       cfg.Notes,
+		ToolVersion: cfg.ToolVersion,
+		ConfigJSON:  cfg.ConfigJSON,
 	}
 	// The whole configuration, not just the labels above. The skill set is
 	// plugin_dirs plus the isolation flags that decide whether it survives, and
@@ -271,7 +312,7 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 			return nil, err
 		}
 		if cfg.ChainSessions {
-			if err := chainsIntact(planned, cells); err != nil {
+			if err := chainsIntact(planned, cells, cfg); err != nil {
 				_ = cfg.Store.FinishRun(context.WithoutCancel(ctx), run.ID, store.RunFailed, err.Error())
 				return nil, err
 			}
@@ -280,9 +321,17 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 
 	// The per-cell rows are read back below rather than taken from the return
 	// value, so that a resumed leg's rows are included too.
-	_, err = execute(ctx, ds, cfg, drive, cells)
+	_, err = execute(ctx, ds, cfg, drive, cells, held)
+	var restoreErr *restoreError
+	stranded := errors.As(err, &restoreErr)
 	status, errMsg := store.RunCompleted, ""
 	switch {
+	case stranded:
+		// The run happened and its cells are measurements, so the row says
+		// completed: marking it failed would hide a valid result behind a fact
+		// about a directory the harness does not own. The failure still has to
+		// reach the exit code, which is the one channel a person cannot miss,
+		// and it does -- below, after the row is finished.
 	case err != nil && errors.Is(err, context.Canceled):
 		status, errMsg = store.RunInterrupted, err.Error()
 	case err != nil:
@@ -367,7 +416,231 @@ func (c Config) Validate() error {
 		return fmt.Errorf("chaining a session's tasks gives them one workspace and runs them in order, "+
 			"so it cannot keep %d cells in flight at once", c.Concurrency)
 	}
+	if c.InPlace && c.Concurrency > 1 {
+		// Not "the same repository": two cells can name the same directory even
+		// when they are different tasks, and nothing in the scheduler keeps them
+		// apart. One at a time is the only arrangement in which the state a cell
+		// puts back is the state it found.
+		return fmt.Errorf("a run that works in the recorded repositories themselves cannot keep "+
+			"%d cells in flight at once: two cells can name the same directory, and nothing would "+
+			"stop them checking out over each other and putting back a state neither of them "+
+			"started from", c.Concurrency)
+	}
+	if c.InPlace && c.KeepWorkspaces {
+		return errors.New("this run creates no workspaces to keep: it works in the recorded " +
+			"repositories themselves, and each one is put back when its chain finishes. Drop the flag")
+	}
 	return nil
+}
+
+// InPlaceRepos are the directories an in-place run would work in, sorted and
+// deduplicated. It is empty for any other run.
+//
+// It exists so that the caller can say what is about to happen to which
+// directories before it happens, without resolving the paths a second way and
+// risking a banner that names a different directory from the one the run uses.
+func InPlaceRepos(ds *dataset.Dataset, cfg Config) []string {
+	if !cfg.InPlace || ds == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range ds.Tasks {
+		p := t.Workspace.RepoPath(ds.Dir)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Preflight reports whether a run can be carried out at all, before any of it
+// is.
+//
+// It is separate from Validate because these questions are about the dataset
+// and the machine rather than about the flags: Validate cannot see either. It
+// is separate from the run itself because the answer has to arrive before the
+// first cell -- a run that dies on the fourth task because the fourth task's
+// repository is dirty has already worked in three others, and one that stops
+// after creating the run row leaves a failed run behind for a mistake that was
+// knowable up front.
+//
+// Everything it checks is checked again where it is used: this is the answer a
+// person needs, not the one the run relies on.
+func Preflight(ctx context.Context, ds *dataset.Dataset, cfg Config) error {
+	if !cfg.InPlace {
+		return nil
+	}
+	if ds == nil {
+		return errors.New("no dataset to run")
+	}
+	for _, t := range ds.Tasks {
+		ws := t.Workspace
+		if ws.Type != dataset.WorkspaceGit {
+			return fmt.Errorf("task %s has no repository to work in, and this run works in the "+
+				"recorded directories themselves: its workspace is %s. Run it without --in-place, or "+
+				"collect it bound to a repository with --workspace-cwd", t.ID, orEmptyType(ws.Type))
+		}
+		repo := ws.RepoPath(ds.Dir)
+		if repo == "" {
+			return fmt.Errorf("task %s names no repository, and this run works in the directory the "+
+				"task records. Re-collect it with --workspace-cwd, or run it without --in-place", t.ID)
+		}
+		if strings.Contains(ws.Repo, "://") || strings.HasPrefix(ws.Repo, "git@") {
+			return fmt.Errorf("task %s names %s, which is a remote rather than a directory on this "+
+				"machine. This run works in a directory: clone it and point the task at the checkout, "+
+				"or run without --in-place", t.ID, ws.Repo)
+		}
+		if !filepath.IsAbs(ws.Repo) {
+			// A relative repo is resolved against the dataset directory, so a
+			// dataset that has been copied elsewhere names a different
+			// directory. A clone-based run would clone whatever is there and
+			// the difference would show up in the diff; a run that works in the
+			// directory cannot notice afterwards that it worked in the wrong
+			// one.
+			return fmt.Errorf("task %s names its repository as %s, which is relative to the dataset, "+
+				"and this run works in a directory rather than cloning one. Point it at an absolute "+
+				"path, or run without --in-place", t.ID, ws.Repo)
+		}
+		if ws.Subdir != "" {
+			return fmt.Errorf("task %s works in a subdirectory of its repository, and this run "+
+				"checks out and measures at the repository root: the agent would be pointed somewhere "+
+				"the harness is not measuring. Collect it without --subdir, or run it against a copy",
+				t.ID)
+		}
+		if len(ws.Setup) > 0 {
+			return fmt.Errorf("task %s runs setup commands before the agent starts, and this run "+
+				"works in the recorded directory itself: whatever they produce would be left in the "+
+				"repository and measured as the agent's work. Run it against a copy, or drop the "+
+				"setup commands", t.ID)
+		}
+		if ws.KeepGitHistory != nil && !*ws.KeepGitHistory {
+			// The task says its history must not be readable. In a copy the
+			// materializer honours that by dropping .git; here the history is
+			// the repository, and a run that went ahead would be measuring an
+			// agent that could read the answer.
+			return fmt.Errorf("task %s declares that its repository's history must not be readable "+
+				"by the agent, and this run works in that repository, where the history is. This mode "+
+				"cannot honour that: run it against a copy", t.ID)
+		}
+		if _, err := os.Stat(repo); err != nil {
+			return fmt.Errorf("task %s records the directory %s, which is not there: this run works "+
+				"in the recorded directory rather than cloning one", t.ID, repo)
+		}
+	}
+	for _, repo := range InPlaceRepos(ds, cfg) {
+		if err := sandbox.CheckInPlace(ctx, repo); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// currentMachine is the identity a replay compares against. It is a variable so
+// tests can stand in for a machine other than the one they run on.
+var currentMachine = machine.Current
+
+// CheckMachine refuses a dataset whose baselines were collected on a different
+// machine from this one.
+//
+// A collected baseline is a measurement of a session on one machine: its
+// working directory, the repository at that path, and the tools and caches
+// around it. A replay elsewhere would compare against those numbers while
+// running in something else, and nothing in the result would say so -- so the
+// replay does not start. A baseline that names no machine is not checked:
+// hand-written ones, and those collected before the identity was recorded,
+// have always run anywhere.
+//
+// It is separate from Preflight because it applies to every run, not only an
+// in-place one. Run calls it for the same reason it calls Preflight: a refused
+// run must not leave a failed run row behind.
+func CheckMachine(ds *dataset.Dataset) error {
+	if ds == nil {
+		return nil
+	}
+	var (
+		here    machine.Identity
+		probed  bool
+		foreign []string
+		other   machine.Identity
+	)
+	for _, t := range ds.Tasks {
+		b := t.ResolvedBaseline
+		if b == nil || b.Machine == nil {
+			continue
+		}
+		if !probed {
+			var err error
+			if here, err = currentMachine(); err != nil {
+				return fmt.Errorf("task %s was collected on %s, and this machine cannot be identified "+
+					"to check that it is the same one: %v", t.ID, b.Machine, err)
+			}
+			probed = true
+		}
+		if b.Machine.Same(here) {
+			continue
+		}
+		if len(foreign) == 0 {
+			other = *b.Machine
+		}
+		foreign = append(foreign, t.ID)
+	}
+	if len(foreign) == 0 {
+		return nil
+	}
+	names, more := foreign, ""
+	if len(names) > 5 {
+		names, more = names[:5], fmt.Sprintf(" and %d more", len(foreign)-5)
+	}
+	return fmt.Errorf("%d task(s) were collected on a different machine and cannot be replayed here: %s%s\n"+
+		"  recorded on: %s\n"+
+		"  running on:  %s\n"+
+		"A baseline measures a session in its own environment -- its directories, its repository, "+
+		"its tools -- so a replay on another machine would be compared against numbers it did not run "+
+		"under. Replay on the machine that collected them, or re-collect the sessions on this one",
+		len(foreign), strings.Join(names, ", "), more, other, here)
+}
+
+func orEmptyType(t dataset.WorkspaceType) string {
+	if t == "" {
+		return string(dataset.WorkspaceEmpty)
+	}
+	return string(t)
+}
+
+// acquireInPlace takes every repository an in-place run will work in.
+//
+// In sorted order, so that two runs over overlapping datasets cannot take the
+// same two locks in opposite orders. Neither of them waits -- the lock is taken
+// exclusively and refused immediately -- but a deterministic order means the
+// refusal a person reads is the same one every time.
+//
+// A failure gives back everything already taken. A lock held by a run that
+// never started is a repository that refuses every later run for a reason that
+// is no longer true.
+func acquireInPlace(ctx context.Context, ds *dataset.Dataset, cfg Config) (map[string]*sandbox.InPlace, error) {
+	if !cfg.InPlace {
+		return nil, nil
+	}
+	held := map[string]*sandbox.InPlace{}
+	for _, repo := range InPlaceRepos(ds, cfg) {
+		ip, err := sandbox.AcquireInPlace(ctx, repo)
+		if err != nil {
+			releaseInPlace(held)
+			return nil, err
+		}
+		held[repo] = ip
+	}
+	return held, nil
+}
+
+func releaseInPlace(held map[string]*sandbox.InPlace) {
+	for _, ip := range held {
+		_ = ip.Release()
+	}
 }
 
 // withDefaults fills in what a Config may leave out.
@@ -430,6 +703,11 @@ type cell struct {
 	// the directory back in between.
 	first bool
 	last  bool
+	// ip is the repository this cell works in directly, and is nil for every
+	// other run. It is filled in from the run's held map when the cell is
+	// dispatched, so that the cell carries the one handle whose lock the run
+	// owns rather than looking one up.
+	ip *sandbox.InPlace
 }
 
 // chainKey names the sequence a cell belongs to.
@@ -494,7 +772,15 @@ func plan(ds *dataset.Dataset, cfg Config) ([]cell, error) {
 			}
 			// A subdirectory per run, so two concurrent runs over one dataset
 			// do not share a workspace and silently observe each other's files.
+			//
+			// An in-place run is the exception, and the whole point of it: the
+			// directory is the one the task records, which the run has already
+			// locked. Every cell that names it therefore shares it -- which is
+			// what a chain wants, and why concurrency is refused for this mode.
 			dir := filepath.Join(root, cfg.RunID, key, fmt.Sprintf("s%d", s))
+			if cfg.InPlace {
+				dir = t.Workspace.RepoPath(ds.Dir)
+			}
 			groups[gk] = append(groups[gk], cell{task: t, sample: s, dir: dir, chain: key})
 		}
 	}
@@ -563,7 +849,7 @@ func dropDone(ctx context.Context, st *store.Store, runID string, cells []cell) 
 //
 // A chain that is entirely recorded is fine to skip, and one that is entirely
 // missing is fine to run -- it is only the split that is unmeasurable.
-func chainsIntact(planned, remaining []cell) error {
+func chainsIntact(planned, remaining []cell, cfg Config) error {
 	present := make(map[string]bool, len(remaining))
 	for _, c := range remaining {
 		present[fmt.Sprintf("%s#%d", c.task.ID, c.sample)] = true
@@ -592,11 +878,20 @@ func chainsIntact(planned, remaining []cell) error {
 		if ch.left == 0 || ch.left == ch.total {
 			continue
 		}
+		// Why the remaining tasks have nothing to start from depends on where
+		// they would have started from. In a copy it is that the directory went
+		// away with the cell; in place it is that the repository was put back
+		// where it was found, which is the opposite of leaving it behind and
+		// just as fatal to a half-resumed chain.
+		reason := "and that workspace went away with the cell, so these would each run against nothing"
+		if cfg.InPlace {
+			reason = "and the repository was put back where it was found once that cell was done, " +
+				"so these would each start from a state their predecessor never left"
+		}
 		return fmt.Errorf("chain %s is half recorded: %d of its %d task(s) still have to run and the "+
 			"rest already have a row. A chained task starts from the workspace its predecessor left, "+
-			"and that workspace went away with the cell, so these would each run against nothing. "+
-			"Re-run the chain from its first task instead, under a new run id",
-			ch.name, ch.left, ch.total)
+			"%s. Re-run the chain from its first task instead, under a new run id",
+			ch.name, ch.left, ch.total, reason)
 	}
 	return nil
 }
@@ -605,7 +900,8 @@ func chainsIntact(planned, remaining []cell) error {
 // Execution
 // ---------------------------------------------------------------------------
 
-func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, cells []cell) ([]store.Attempt, error) {
+func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, cells []cell,
+	held map[string]*sandbox.InPlace) ([]store.Attempt, error) {
 	if len(cells) == 0 {
 		return nil, nil
 	}
@@ -621,6 +917,12 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		// why. A later cell of such a chain must not be run: it would start
 		// from nothing and be recorded as a result.
 		broken = map[string]string{}
+		// stranded names the repositories that could not be put back. They are
+		// collected rather than reported per cell: the same directory is used
+		// by every cell of a chain and by every sample of a task, and a reader
+		// needs to know that a directory is in the wrong state, not how many
+		// cells noticed.
+		stranded []string
 	)
 	queue := make(chan cell)
 	var wg sync.WaitGroup
@@ -639,6 +941,7 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 
 				var attempt store.Attempt
 				var broke string
+				var restoreErr error
 				if reason != "" {
 					// Recorded rather than skipped, so the cell shows up in the
 					// report as the harness error it is. Dropping it would make
@@ -650,14 +953,18 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 						Category: c.task.Category, Tags: c.task.Tags,
 					}, fmt.Errorf("chain %s never got a workspace: %s", c.chain, reason))
 				} else {
+					c.ip = held[c.dir]
 					cellCtx, cellCancel := context.WithCancel(runCtx)
-					attempt, broke = runCell(cellCtx, ds, cfg, drive, c)
+					attempt, broke, restoreErr = runCell(cellCtx, ds, cfg, drive, c)
 					cellCancel()
 				}
 
 				mu.Lock()
 				if broke != "" {
 					broken[c.chain] = broke
+				}
+				if restoreErr != nil {
+					stranded = append(stranded, restoreErr.Error())
 				}
 				if err := cfg.Store.SaveAttempt(runCtx, attempt); err != nil && firstErr == nil {
 					firstErr = err
@@ -695,6 +1002,10 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	if firstErr != nil {
 		return saved, firstErr
 	}
+	if len(stranded) > 0 {
+		sort.Strings(stranded)
+		return saved, &restoreError{stranded: dedupeStrings(stranded)}
+	}
 	if cancelled && ctx.Err() == nil && cfg.FailFast {
 		// Fail-fast cancelled the run on purpose; that is not a run-level error.
 		return saved, nil
@@ -703,6 +1014,31 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		return saved, ctx.Err()
 	}
 	return saved, nil
+}
+
+// restoreError is a run that measured what it set out to measure and could not
+// put a repository back afterwards.
+//
+// It is not a run failure and must not be recorded as one: the cells ran, they
+// are measurements, and a row that says "failed" would hide a valid result
+// behind a fact about a directory the harness does not own. What it does have
+// to do is reach the exit code, because a person whose repository is checked
+// out at the wrong commit cannot be told by a zero exit.
+type restoreError struct{ stranded []string }
+
+func (e *restoreError) Error() string {
+	return "the run finished, but these repositories were not put back:\n  " +
+		strings.Join(e.stranded, "\n  ")
+}
+
+func dedupeStrings(in []string) []string {
+	out := in[:0]
+	for i, s := range in {
+		if i == 0 || in[i-1] != s {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // runCell performs one attempt: build the workspace, run the agent, grade what
@@ -714,7 +1050,7 @@ func execute(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 // agent that crashed or timed out tells you something, while a workspace that
 // was never built leaves the rest of the chain with nothing to start from, and
 // the cells after it would be measuring that absence rather than the agent.
-func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) (store.Attempt, string) {
+func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.Runner, c cell) (store.Attempt, string, error) {
 	t := c.task
 	att := store.Attempt{
 		RunID:    cfg.RunID,
@@ -725,18 +1061,43 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 		Status:   store.CellOK,
 	}
 	var broke string
+	// restored records that the repository was put back on the way out, so that
+	// the deferred guard below does not do it a second time.
+	var restored bool
+	var restoreErr error
+
+	// The run holds one lock per repository and hands each cell the handle it
+	// owns. A cell with no handle would be a run that got past Preflight
+	// without taking the lock, and working in the directory anyway would be
+	// exactly the thing the lock exists to prevent -- so it is refused here
+	// rather than panicking on the nil.
+	if cfg.InPlace && c.ip == nil {
+		msg := fmt.Sprintf("no lock was taken on %s, so this run will not work in it", c.dir)
+		return fail(att, errors.New(msg)), msg, nil
+	}
 
 	if err := os.MkdirAll(c.dir, 0o755); err != nil {
-		return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err)), err.Error()
+		return fail(att, fmt.Errorf("create workspace %s: %w", c.dir, err)), err.Error(), nil
 	}
 	sb, err := newSandbox(c.dir, t)
 	if err != nil {
-		return fail(att, err), err.Error()
+		return fail(att, err), err.Error(), nil
 	}
 
 	started := time.Now()
 	defer func() {
 		_ = sb.Close(context.WithoutCancel(ctx))
+		if cfg.InPlace {
+			// The directory is the user's, so the removal below is not reached
+			// in this mode -- not because a flag says so but because this branch
+			// returns first. What is left to do here is the restore for the
+			// paths that skip the explicit one: a panic, or a return added
+			// later above it.
+			if !restored && (c.last || broke != "") {
+				_, _ = c.ip.Restore(context.WithoutCancel(ctx))
+			}
+			return
+		}
 		if cfg.KeepWorkspaces {
 			return
 		}
@@ -754,15 +1115,20 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	// earlier task in the chain did -- which is the work the later prompt is
 	// asking about.
 	if c.first {
-		if err := sandbox.Materialize(ctx, sb, t.Workspace, ds.Dir); err != nil {
+		if cfg.InPlace {
+			if err := c.ip.Checkout(ctx, t.Workspace.Ref); err != nil {
+				broke = err.Error()
+				return fail(att, fmt.Errorf("check out the recorded commit: %w", err)), broke, nil
+			}
+		} else if err := sandbox.Materialize(ctx, sb, t.Workspace, ds.Dir); err != nil {
 			broke = err.Error()
-			return fail(att, fmt.Errorf("materialize: %w", err)), broke
+			return fail(att, fmt.Errorf("materialize: %w", err)), broke, nil
 		}
 	}
 	baseline, err := sandbox.CurrentBaseline(ctx, sb)
 	if err != nil {
 		broke = err.Error()
-		return fail(att, fmt.Errorf("baseline: %w", err)), broke
+		return fail(att, fmt.Errorf("baseline: %w", err)), broke, nil
 	}
 
 	// The agent's own budget, with the cell given room beyond it for setup,
@@ -779,10 +1145,10 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	cancel()
 
 	if agentErr != nil {
-		return fail(att, fmt.Errorf("agent: %w", agentErr)), broke
+		return fail(att, fmt.Errorf("agent: %w", agentErr)), broke, nil
 	}
 	if attempt == nil {
-		return fail(att, errors.New("agent returned no attempt")), broke
+		return fail(att, errors.New("agent returned no attempt")), broke, nil
 	}
 	att.DurationMs = time.Since(started).Milliseconds()
 	att.StopReason = attempt.StopReason()
@@ -839,7 +1205,18 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	att.Answer = attempt.FinalText()
 	att.Baseline = compareToBaseline(t, att.DurationMs)
 	att.WorkspaceDir = c.dir
-	return att, broke
+
+	// The repository goes back at the end of the chain that was using it, not
+	// at the end of every cell: a chain's later tasks start from what the
+	// earlier ones left, and putting the tree back between them would throw
+	// away the very work the next prompt is about.
+	if cfg.InPlace && (c.last || broke != "") {
+		rep, err := c.ip.Restore(ctx)
+		restored = true
+		att.RestoreNotes = rep.Notes
+		restoreErr = err
+	}
+	return att, broke, restoreErr
 }
 
 // applyUsage copies the agent's accounting into the row. The token classes are

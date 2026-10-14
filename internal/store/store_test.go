@@ -139,8 +139,8 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The database is built by taking today's schema and deleting what v2, v3,
-	// v4 and v5 added, rather than by pasting in an old DDL file: a copy of the
-	// old schema would drift from the migrations and stop testing them.
+	// v4, v5, v6 and v7 added, rather than by pasting in an old DDL file: a copy
+	// of the old schema would drift from the migrations and stop testing them.
 	for _, stmt := range []string{
 		string(body),
 		`ALTER TABLE attempts DROP COLUMN baseline_output`,
@@ -148,8 +148,10 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		`ALTER TABLE attempts DROP COLUMN baseline_agent_model`,
 		`ALTER TABLE attempts DROP COLUMN baseline_source`,
 		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
+		`ALTER TABLE attempts DROP COLUMN restore_notes`,
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`ALTER TABLE runs DROP COLUMN in_place`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','1')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id, baseline_tokens)
@@ -893,5 +895,326 @@ func TestTagsAndGradesNeverStoreAsNull(t *testing.T) {
 	got, _ := s.ListAttempts(ctx, "r1")
 	if got[0].Tags == nil || got[0].Grades == nil {
 		t.Errorf("tags/grades came back nil: %+v", got[0])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+// sampleReport is a registration with every column set, so a round trip that
+// drops one of them shows up rather than reading as a zero that was never
+// written.
+func sampleReport(id string) Report {
+	return Report{
+		ID:           id,
+		Kind:         ReportKindRun,
+		Title:        "nightly / model=opus",
+		Subject:      "nightly / model=opus",
+		ParamsJSON:   `{"run":"r1"}`,
+		OptionsJSON:  `{"max_inline_bytes":8388608}`,
+		CreatedAt:    time.Date(2026, 4, 5, 6, 7, 8, 900, time.UTC),
+		PayloadHash:  "9f2c4e6a8b0d1f3a5c7e9b1d3f5a7c9e",
+		PayloadBytes: 123456,
+		DataVersion:  2,
+	}
+}
+
+func TestReportRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	want := sampleReport("a1b2c3d4e5f60718")
+	if err := s.SaveReport(ctx, want); err != nil {
+		t.Fatalf("SaveReport: %v", err)
+	}
+	got, err := s.GetReport(ctx, want.ID)
+	if err != nil {
+		t.Fatalf("GetReport: %v", err)
+	}
+	if got.Kind != want.Kind || got.Title != want.Title || got.Subject != want.Subject {
+		t.Errorf("labels came back as %+v, want %+v", got, want)
+	}
+	if got.ParamsJSON != want.ParamsJSON || got.OptionsJSON != want.OptionsJSON {
+		t.Errorf("the request came back as %q / %q", got.ParamsJSON, got.OptionsJSON)
+	}
+	if got.PayloadHash != want.PayloadHash || got.PayloadBytes != want.PayloadBytes {
+		t.Errorf("the claim came back as %s / %d", got.PayloadHash, got.PayloadBytes)
+	}
+	if got.DataVersion != want.DataVersion {
+		t.Errorf("data version = %d, want %d", got.DataVersion, want.DataVersion)
+	}
+	// Nanoseconds survive: the generation stamp in the payload is formatted
+	// from this instant, so truncating it here would change the document.
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Errorf("created at = %s, want %s", got.CreatedAt, want.CreatedAt)
+	}
+}
+
+// TestRegistrationsAreALogNotAState pins the append-only choice.
+//
+// Collapsing two registrations of one view into a row would keep the latest
+// hash and throw away the earlier one, and the pair of hashes is the only
+// evidence that the document changed between the two. A store that deduplicated
+// would make that impossible to see afterwards.
+func TestRegistrationsAreALogNotAState(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	first := sampleReport("1111111111111111")
+	second := sampleReport("2222222222222222")
+	second.PayloadHash = "00000000000000000000000000000000"
+	second.CreatedAt = first.CreatedAt.Add(time.Hour)
+	for _, r := range []Report{first, second} {
+		if err := s.SaveReport(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListReports(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("the registry holds %d rows, want both registrations", len(got))
+	}
+	// Newest first, so the list reads as a log with the latest at the top.
+	if got[0].ID != second.ID {
+		t.Errorf("the listing starts with %s, want the newest registration", got[0].ID)
+	}
+}
+
+func TestListReportsHonoursTheLimit(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	base := sampleReport("0000000000000000")
+	for i := 0; i < 5; i++ {
+		r := base
+		r.ID = string(rune('a'+i)) + "000000000000000"
+		r.CreatedAt = base.CreatedAt.Add(time.Duration(i) * time.Minute)
+		if err := s.SaveReport(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.ListReports(ctx, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("limit 2 returned %d rows", len(got))
+	}
+}
+
+func TestGetReportReportsMissing(t *testing.T) {
+	s := openTemp(t)
+	_, err := s.GetReport(context.Background(), "nope")
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want it to match ErrNotFound", err)
+	}
+	// And it names the file, for the same reason the run lookup does: "not
+	// found" on its own reads like a bug, "not found in <file>" reads like the
+	// wrong --db, which is what it almost always is.
+	if !strings.Contains(err.Error(), s.Path()) {
+		t.Errorf("err = %q, want it to name %s", err, s.Path())
+	}
+	if !strings.Contains(err.Error(), "report") {
+		t.Errorf("err = %q, want it to say what kind of record was missing", err)
+	}
+}
+
+func TestSaveReportRequiresIdentity(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	noID := sampleReport("")
+	if err := s.SaveReport(ctx, noID); err == nil {
+		t.Error("a report with no id was stored, so nothing can ever open it")
+	}
+	noKind := sampleReport("aaaaaaaaaaaaaaaa")
+	noKind.Kind = ""
+	if err := s.SaveReport(ctx, noKind); err == nil {
+		t.Error("a report with no kind was stored, so nothing can say which view it is")
+	}
+}
+
+// TestOpenUpgradesAV5Database is the other half of the version rule: a database
+// written before reports existed has to keep working, and the table it never
+// had has to appear.
+//
+// The fixture is a database this build wrote with the v6 addition deleted --
+// the table -- rather than a copy of v5's DDL. A copy would keep passing after
+// the real definition changed, which is the one thing a migration test must not
+// be able to do. Deleting the table is also exactly what a genuine v5 database
+// looks like: v6 added a table and touched nothing else.
+func TestOpenUpgradesAV5Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`DROP TABLE reports`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','5')`,
+		`INSERT INTO runs(id, name, status, started_at) VALUES('r1','nightly','completed','2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v5 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v5 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	if _, err := s.GetRun(ctx, "r1"); err != nil {
+		t.Fatalf("the upgrade lost what was already in the database: %v", err)
+	}
+	// The new table has to be usable, not merely present: a create that ran
+	// without the columns would still let the version bump.
+	if err := s.SaveReport(ctx, sampleReport("abcdefabcdefabcd")); err != nil {
+		t.Fatalf("write into an upgraded database: %v", err)
+	}
+	reports, err := s.ListReports(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 {
+		t.Errorf("the upgraded database lists %d reports, want the one just written", len(reports))
+	}
+}
+
+// TestAV5DatabaseKeepsWorkingAfterTheUpgradeIsRecorded covers the second open.
+//
+// The first open adds the table and bumps the version; the second has to be a
+// no-op rather than replaying anything. A migration whose step assumed it was
+// running on the old shape would fail here and nowhere else.
+func TestAV5DatabaseKeepsWorkingAfterTheUpgradeIsRecorded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{string(body), `DROP TABLE reports`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','5')`} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatal(err)
+		}
+	}
+	raw.Close()
+
+	d, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SaveReport(context.Background(), sampleReport("0011223344556677")); err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopening an upgraded database: %v", err)
+	}
+	defer again.Close()
+	reports, err := again.ListReports(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 || reports[0].ID != "0011223344556677" {
+		t.Errorf("the registry came back as %+v", reports)
+	}
+}
+
+// TestOpenUpgradesAV6Database covers the columns that say a run worked in the
+// directories its tasks record, and what happened to each one afterwards.
+//
+// The two readings that have to stay apart are "this row predates the column"
+// and "this run did not work in place". They agree here -- no build before v7
+// could work in place -- which is what makes 0 the right default rather than a
+// third state to keep.
+func TestOpenUpgradesAV6Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v6.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE attempts DROP COLUMN restore_notes`,
+		`ALTER TABLE runs DROP COLUMN in_place`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','6')`,
+		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
+		`INSERT INTO attempts(run_id, task_id, status) VALUES('r1','t1','ok')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v6 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v6 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	ctx := context.Background()
+	runs, err := s.ListRuns(ctx, RunFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("runs = %d, want the row that was already there", len(runs))
+	}
+	if runs[0].InPlace {
+		t.Error("a row written before v7 must read as not in place")
+	}
+	attempts, err := s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read at all is half the assertion: scanAttempt names the column, so a
+	// migration that failed to add it fails here rather than returning zeros.
+	if len(attempts) != 1 || attempts[0].RestoreNotes != "" {
+		t.Errorf("attempts = %+v, want one row with no restore notes", attempts)
+	}
+
+	// And the upgraded database takes the new values.
+	if err := s.SaveAttempt(ctx, Attempt{
+		RunID: "r1", TaskID: "t2", Status: CellOK,
+		RestoreNotes: "put back at 2d347614 in /work/proj; nothing was left behind",
+	}); err != nil {
+		t.Fatalf("save into an upgraded database: %v", err)
+	}
+	attempts, err = s.ListAttempts(ctx, "r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range attempts {
+		if a.TaskID == "t2" && !strings.Contains(a.RestoreNotes, "nothing was left behind") {
+			t.Errorf("restore notes = %q after the upgrade", a.RestoreNotes)
+		}
 	}
 }

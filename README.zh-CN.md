@@ -27,11 +27,17 @@ aeval matrix   ──┴──> SQLite ──> aeval report    （一份自包�
 
 ## 设计立场
 
-有六个决定塑造了其余一切。之所以要写出来，是因为它们解释了一些否则会显得奇怪的行为。
+有七个决定塑造了其余一切。之所以要写出来，是因为它们解释了一些否则会显得奇怪的行为。
 
 **报告是数据库的函数，不是进程的函数。** 两周之后，在另一台机器上，从一份拷贝来的 `.db`  
 执行 `aeval report`，必须复现出当初运行期间写下的那份文档。因此渲染器只读取持久化状态，  
 并且有测试断言：从数据库重新生成的报告，与运行期写下的那份**逐字节相同**。
+
+**登记的是请求，不是答案的第二份拷贝。** 登记「渲染过一份报告」这件事，存的是当初要的是**哪个  
+视图**、以及渲染出来的东西的哈希 —— 从不存 HTML，也从不存载荷。载荷是数据库的函数，而一份存下来的  
+载荷是那个函数的**旧值**：行一变动的瞬间它就不再更新，却仍然看起来像一个答案。哈希是服务端在**每次  
+读取时**重新核对的主张，正因如此，被提供出去的页面才说得出「它是不是当初登记的那份文档」，说不是的  
+时候也说得出它现在是什么。
 
 **一次只动一条轴。** 一次 sweep 要么动 harness、要么动 model、要么动 skill，绝不同时动两个。  
 这条在**加载期**强制：某个 level 若改了它这条轴不拥有的键，是**拒绝**而不是警告。代价是真实的，  
@@ -73,6 +79,9 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" \
 
 # 可浏览的索引，加每次 run 一页，全部能从 file:// 打开
 ./bin/aeval report --index --out-dir reports/site
+
+# 或者把上面这些命令登记下来的报告跑成一个服务：http://127.0.0.1:8080
+./bin/aeval serve
 ```
 
 把 demo 换成真东西：
@@ -90,7 +99,8 @@ export ANTHROPIC_API_KEY=...
 | `aeval validate` | 检查数据集，不运行任何东西。                            |
 | `aeval run`      | 评测一份数据集并记录结果。                             |
 | `aeval matrix`   | 对一条因子轴跑一次 sweep，或对已跑过的 sweep 做归因。         |
-| `aeval report`   | 把一次 run、一次对比、一次 sweep，或整个索引渲染成 HTML。      |
+| `aeval report`   | 把一次 run、一次对比、一次 sweep，或整个索引渲染成 HTML，并登记它渲染了什么。 |
+| `aeval serve`    | 把登记下来的报告跑成一个 HTTP 服务。                       |
 | `aeval list`     | 列出已记录的 run，可按 sweep 或轴过滤。                 |
 | `aeval version`  | 打印构建、schema、payload 版本与已注册的 agent。        |
 
@@ -151,7 +161,9 @@ meta:   metadata: {...}          # 自由来源信息，引擎从不解释
 
 `workspace.type: git` 接受 `repo`、`ref`（写 commit SHA 可复现，写分支名不可复现）、  
 `subdir`；上游 `.git` 会被剥离并重建 baseline，所以 agent 没法从历史里读走修复。  
-`setup` 在 agent 之前运行，之后会重新 baseline —— 装依赖不算 agent 的改动。
+`setup` 在 agent 之前运行，之后会重新 baseline —— 装依赖不算 agent 的改动。  
+`run --in-place` 在 `repo` 本身里跑而不是在副本里，这也是它拒绝 `subdir`、`setup` 和显式  
+`keep_git_history: false` 的原因 —— 见上文那一节。
 
 `graders[].weight` 是个指针，这样 `weight: 0`（「跑它，但不计分」）与「未设置」（= 1）  
 能区分开。`required: true` 会让整个任务直接判负，与其它评分器无关。
@@ -254,6 +266,12 @@ aeval collect --cwd ~/code/proj --out datasets/mine
 以及**没有评分器**：转录里没有标准答案，所以这个任务是可测量但不可评分的。把它判成失败是  
 造一个判决，判成通过是造另一个。若你确实有评分依据，用 `--grader` 显式挂上去。
 
+每个 baseline 还记录采集它的机器（`machine`：平台机器标识的哈希 —— macOS 取 `IOPlatformUUID`、  
+Linux 取 `/etc/machine-id`、Windows 取 `MachineGuid` —— 外加给人看的主机名、OS、架构）。  
+`run` 与 `matrix` 会拿它和当前机器比对，**不一致就直接拒绝启动**（退出码 2，不写任何 run 行）：  
+baseline 里的目录、仓库、工具都属于那台机器，换台机器回放就是拿一个没在其中运行的环境作对照。  
+请回到采集的机器上回放，或在本机重新采集。没有 `machine` 的 baseline（手写的、或此前采集的）不做检查。
+
 `--out` 里已有数据集时，`collect` 会追加写入：同一份录制（同一会话、同一条 prompt）已在其中的  
 任务会跳过；id 被另一份录制占用的任务加 `-2` 后缀。已有的任务和 manifest 原样保留。  
 `--dry-run` 可预览会追加什么，`--overwrite` 则整体替换。
@@ -312,8 +330,18 @@ aeval run -d datasets/mine --chain-sessions
 aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
 ```
 
-- 目录是 git 仓库**且有提交** → 变成 `type: git`，钉在录制当时所在的分支上。提交号没有被记录，  
-  所以那次录制在该分支上做的提交就在回放的起点树里；任务的注记里写明这一点。
+- 目录是 git 仓库**且有提交** → 变成 `type: git`，钉在录制那次会话**开始时所在的提交**上。这个  
+  提交号来自新版 Claude Code 写在转录开头的那段 session-context 块 —— 它的 `Recent commits`  
+  第一行就是 HEAD；那里是十位缩写，这里会解析成完整的对象名。  
+  - 转录没有记提交号时（老版本、或会话开始的地方不是仓库）→ 退回钉在录制当时所在的**分支**上，  
+    注记里写明回放从该分支**现在**的样子起步。  
+  - 转录记了提交号、但仓库里已经没有了时（rebase、force-push、`gc`）→ 同样退回分支，但注记写的  
+    是**这一条**：对一次对比来说，「转录没记」和「仓库已经往前走了」是两件不同的事。  
+  - 录制开始时工作区是脏的时 → 注记写明有多少个路径是提交号无法复现的。回放从该提交的**干净检出**  
+    起步，那不是会话开始的地方；只告诉读者一个提交号，他会把它当成起点。  
+  - 钉到提交号会让物化走**全量** clone 而不是浅 clone，因为任意一个提交不在 depth-1 的克隆里。  
+    这次改动之前收集的数据集钉的是分支、走浅 clone；重新收集时它们的 `dataset_hash` 会变，  
+    因为 ref 本身变了。
 - 其他情况 —— 根本不是仓库，或仓库没有任何提交 → **拒绝**，点出目录并指向 `--workspace-repo`。  
   不拷贝任何东西：拷贝出来的是**录制结束之后**的目录，如果那次会话正是去修那里面的某个东西，  
   回放就从答案开始，baseline 对比量到的是那份拷贝而不是 agent。
@@ -326,6 +354,57 @@ aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
 
 不带这个 flag 时，空回放会带一条注记点出录制所在的目录 —— 让这个缺口在报告里可见，而不是靠一  
 张空白页去暗示；`collect` 也会把同样的话打到 stderr。
+
+### 在录制目录里原地跑（`--in-place`）
+
+即使钉到了提交号，回放仍然发生在**副本**里：树被 clone 到 `--work-root` 下的工作区，上游 `.git`  
+被删掉，agent 看到的是一个只有一条提交的仓库。`--in-place` 让 agent 直接在录制目录里跑：
+
+```sh
+aeval run --dataset datasets/mine/dataset.yaml --in-place
+```
+
+agent 被检出到任务指定的提交号，在真实的树里干活，跑完这次 run 把目录放回去 —— 它来时所在的分支、  
+提交号和被跟踪的文件。这个模式要的就是保真：agent 拿到的是当时的树，diff 是相对录制起点的那个  
+提交号量的，而不是相对一份拷贝。
+
+它是唯一会碰「harness 不拥有的东西」的模式，所以它的构造方式与工具其余部分相反：**所有它撤不回来  
+的事，都在第一个 cell 之前拒绝掉。**
+
+- 工作区**有未提交改动**的仓库被拒绝，并列出路径。提交号能回来，压在它上面的改动回不来。先 commit  
+  或 stash。
+- `--concurrency` 必须是 1。两个 cell 可能指向同一个目录，调度器里没有任何东西把它们隔开；一次  
+  只跑一个，才是「cell 放回去的状态就是它来时看到的状态」唯一成立的安排。
+- `--keep` 被拒绝，因为这次 run 不创建工作区，没有东西需要它保护。
+- 任务没有仓库、repo 是远端而不是目录、repo 路径相对数据集、有 `subdir`、有 `setup` 命令、或显式  
+  写了 `keep_git_history: false` —— 逐条拒绝并点出是哪个任务。最后一条是**测量完整性**层面的拒绝：  
+  这个模式把仓库整个交给 agent，所以一个声明「历史不可读」的任务在这里无法被兑现。
+- 目录是 linked worktree、是 submodule 检出、是 bare 仓库、或已被另一个 run 持有时，拒绝。
+
+恢复**不覆盖**什么，开跑前的 banner 会写清楚：
+
+- agent 创建或移动的分支、tag、stash。它们只被写进该 cell 的 restore notes，不会被删 —— harness  
+  无从知道哪些是 agent 有意留下的。
+- 被 `.gitignore` 隐藏的文件。删掉它们会连你的 `.env`、`node_modules` 一起删掉，所以新增的留在原地  
+  并写进 notes。
+- 任何 push 到远端的东西。整个 run 期间 agent 可以读该仓库的全部历史，而 push 不是一次 run 能放回去的。
+
+在把它指向你在意的仓库之前，还有两件事值得知道：harness 会为那个目录写下自己的 Claude Code 转录，  
+所以之后 `aeval collect --cwd <dir>` 会把这些回放会话当成你的录制收进来；另外 agent 是以  
+`bypassPermissions` 在一个它能任意写入的目录里跑的。
+
+每个仓库持有一把锁（`.git/agenteval/inplace.lock`），里面写着要把它还回哪个提交号和分支。第二个 run  
+会**拒绝**而不是等待；如果一个 run 发现锁还在、而持有它的进程已经不在了，它会打印修复该目录的命令：
+
+```
+git -C <repo> update-ref refs/heads/<branch> <commit>
+git -C <repo> checkout --force <branch>
+git -C <repo> clean -ffd
+```
+
+最后一条会丢掉该目录里所有从未提交过的东西，所以只在确认里面没有你要的东西之后再跑。恢复失败的 cell  
+会被记录下来、在报告里渲染成失败、并让退出码非零 —— 一个仓库停在错提交上的人，不该被一个 0 退出码  
+告知一切正常。
 
 ## 报告
 
@@ -374,6 +453,41 @@ run 的表头还会陈述这次 run 究竟驱动了哪份配置，包括它的 s
 
 这一切**没有增加任何新列**：轨迹本来就按 attempt 落库，所以在这之前录下的 run 也照样答得出来。
 
+### 登记渲染了什么，并把它提供出去
+
+`aeval report` 还会登记**它渲染过这么一份东西**，而这是报告里唯一无法事后重推的部分。那一行存的是  
+**请求** —— 哪个视图、关于谁、带了哪些参数、以及**已经 resolve 过**的选项 —— 加上载荷的 SHA-256。  
+它**不存 HTML，也不存载荷**。载荷是数据库的函数；把载荷存在数据库旁边，等于对同一个问题存了第二份  
+答案，而那份答案会在行一变动的瞬间停止更新。
+
+这些行是**日志，不是状态**。同一个视图渲染两次就写两行、两个 id，而那一对哈希才是漂移的证据。  
+id 用随机值而非序号（带编号的日志会被读成版本号），也不用内容寻址（内容恰恰是两次登记可以共享的  
+东西）。
+
+`aeval serve` 把它们列出来，并按需重建：
+
+```sh
+aeval serve --db runs.db --addr 127.0.0.1:8080
+```
+
+`GET /` 列出已登记的报告，`GET /r/<id>` 从数据库重建其中一份并渲染，`GET /r/<id>.json` 返回同一份  
+文档的 JSON。每个页面上都有一条横幅，说明「它刚刚重建出来的这份文档」与「当初登记的那份」是什么  
+关系：
+
+| 横幅写什么 | 什么时候 |
+| --- | --- |
+| `Recorded report.` | 重建出来的就是当初登记的那串字节 |
+| `Recorded in an older payload format.` | 该行早于一次格式变更，两个哈希本就不可比，它们不一致说明不了数据的事 |
+| `This page is not the recorded document.` | 行动了，或者投影它们的代码变了；服务端把两种可能都点名，不猜是哪一种 |
+
+哈希覆盖的字节**恰好就是** `/r/<id>.json` 返回的字节，所以脚本可以不经解析页面就核对这个主张 ——  
+响应头里有四个字段写着它：`X-Aeval-Reported-Hash` 与 `X-Aeval-Current-Hash`（当初登记的那个 vs 这次  
+读取算出来的那个）、`X-Aeval-Hash-Matches`，以及 `X-Aeval-Data-Version`。当某次登记对应的 run 已被  
+删掉，它照样答得出来：它说得出那是哪次 run，并说明对象已经不在了。
+
+**只有 `aeval report` 登记。** `run` 与 `matrix` 顺手写出的那份报告是便利产物、不是登记 —— 那个视图  
+没人要过，把它记进去只会让日志塞满从没被请求过的视图。
+
 ## 包结构
 
 ```
@@ -387,7 +501,9 @@ internal/session/  Claude Code 转录 -> 带 baseline 的任务
 internal/runner/   调度、超时、工作区生命周期、记录
 internal/store/    SQLite schema、runs 与 attempts
 internal/attrib/   因子轴、sweep 计划、配对比较、符号检验
-internal/report/   视图模型、加载器、HTML 渲染器
+internal/report/   视图模型、加载器、HTML 渲染器、报告登记表
+internal/server/   提供已登记报告的 HTTP 服务
+internal/machine/  collect 盖上、回放核对的机器标识
 internal/llm/      llm_judge 用的最小客户端
 tests/             驱动真实二进制的端到端测试
 ```
@@ -421,6 +537,9 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" go 
   于是 `resolve_rate` 无法被解释：分不清是任务难还是任务坏。
 - **`Baseline.RestorePaths` 写了但没人用。** 它正是「判分前把测试文件还原，让改了测试的  
   agent 按真实水平计分」那条语义的原语 —— 而它没有调用方、没有测试、数据集里也没有字段。
+- **报告服务只读、且无认证。** `aeval serve` 从数据库重建已登记的报告并把它提供出去；没有登录、  
+  没有写入路径、也没有按用户区分的视图。它默认绑 `127.0.0.1`，被要求监听别处时会打警告，  
+  因为凡是能连上那个端口的人，就能读到所有已登记的报告。
 
 `docs/real-repo-eval.md` 是「在真实仓库而不是三文件 demo 上评测 agent」的设计，  
 它的 §1 表格保持与代码同步。`docs/design.md` 是本实现所回答的最初需求。

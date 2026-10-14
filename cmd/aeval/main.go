@@ -34,12 +34,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -48,8 +51,10 @@ import (
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/machine"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
+	"github.com/skyitachi/agenteval/internal/server"
 	"github.com/skyitachi/agenteval/internal/session"
 	"github.com/skyitachi/agenteval/internal/store"
 )
@@ -88,6 +93,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdMatrix(rest, stdout, stderr)
 	case "report":
 		return cmdReport(rest, stdout, stderr)
+	case "serve":
+		return cmdServe(rest, stdout, stderr)
 	case "list", "ls":
 		return cmdList(rest, stdout, stderr)
 	case "version", "--version", "-v":
@@ -112,6 +119,7 @@ usage: aeval <command> [flags]
   run       run a dataset against one agent
   matrix    sweep one axis, or attribute a sweep that already ran
   report    render an HTML report, comparison, attribution or run list
+  serve     serve the reports that were recorded over HTTP
   list      list recorded runs
   version   print version and schema information
 
@@ -435,8 +443,9 @@ func warnUnboundReplays(w io.Writer, items []session.Item) {
 	}
 	fmt.Fprintf(w, "warning: %d task(s) replay in an empty workspace, but their recordings ran in %s%s.\n"+
 		"         A transcript does not carry the files a session worked on, so those replays start\n"+
-		"         without them. Re-collect with --workspace-cwd to bind each recording's repository,\n"+
-		"         or pass --workspace-repo <repo> --ref <commit> to bind one repository to all of them.\n",
+		"         without them. Re-collect with --workspace-cwd to bind each recording's repository at\n"+
+		"         the commit its session started from, or pass --workspace-repo <repo> --ref <commit>\n"+
+		"         to bind one repository to all of them.\n",
 		n, strings.Join(shown, ", "), more)
 }
 
@@ -664,6 +673,18 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		Category:        *category,
 		Tags:            tags,
 	}
+	// The machine collect runs on is stamped on every baseline, so that a replay
+	// elsewhere is refused rather than compared against an environment it is not
+	// running in. A machine that cannot be identified still collects -- refusing
+	// would leave its sessions uncollectable -- but the dataset then carries no
+	// identity and its replays are not checked, which is said out loud.
+	if id, err := machine.Current(); err != nil {
+		fmt.Fprintf(stderr, "warning: %v.\n"+
+			"         The baselines are written without a machine identity, so a replay on another\n"+
+			"         machine will not be refused.\n", err)
+	} else {
+		opts.Machine = &id
+	}
 	items, err := session.Collect(sessions, opts)
 	if err != nil {
 		return fail(stderr, "collect: %v", err)
@@ -740,8 +761,9 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	if !*wsCwd {
 		warnUnboundReplays(stderr, plan.Added)
 	} else {
-		fmt.Fprintln(stderr, "note: --workspace-cwd binds each recording's repository at the branch it ran on; "+
-			"a transcript records the branch and not the commit, so that is the branch as it stands now")
+		fmt.Fprintln(stderr, "note: --workspace-cwd binds each recording's repository at the commit its "+
+			"session started from; where the capture named no commit, or the repository no longer holds "+
+			"it, the task falls back to the recorded branch as it stands now, and says so in its notes")
 	}
 	fmt.Fprintf(stdout, "\nNext: aeval validate --dataset %s\n", filepath.Join(dir, "dataset.yaml"))
 	return exitOK
@@ -1077,11 +1099,13 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		conc    = fs.Int("concurrency", 1, "cells to keep in flight")
 		chain   = fs.Bool("chain-sessions", false,
 			"give each recorded session's tasks one shared workspace and run them in order")
-		timeout  = fs.Duration("timeout", 10*time.Minute, "per-task budget when the task declares none")
-		turns    = fs.Int("max-turns", 0, "per-task turn budget when the task declares none")
-		thresh   = fs.Float64("threshold", runner.DefaultThreshold, "composite score a task must reach to pass")
-		work     = fs.String("work-root", "", "where per-cell workspaces are created (default: beside the database)")
-		keep     = fs.Bool("keep", false, "leave each cell's workspace on disk for inspection")
+		timeout = fs.Duration("timeout", 10*time.Minute, "per-task budget when the task declares none")
+		turns   = fs.Int("max-turns", 0, "per-task turn budget when the task declares none")
+		thresh  = fs.Float64("threshold", runner.DefaultThreshold, "composite score a task must reach to pass")
+		work    = fs.String("work-root", "", "where per-cell workspaces are created (default: beside the database)")
+		keep    = fs.Bool("keep", false, "leave each cell's workspace on disk for inspection")
+		inPlace = fs.Bool("in-place", false,
+			"work in the directories the tasks record, checked out at the commits they name, and put each back afterwards")
 		failFast = fs.Bool("fail-fast", false, "stop scheduling cells after the first harness failure")
 		resume   = fs.Bool("resume", false, "skip cells that already have a row for this run")
 		runID    = fs.String("run-id", "", "reuse a run id, which is what --resume needs")
@@ -1128,11 +1152,23 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		FailFast:       *failFast,
 		Resume:         *resume,
 		ChainSessions:  *chain,
+		InPlace:        *inPlace,
 	}
 	// Asking the configuration rather than restating its rules: a flag mistake
 	// is a usage error, which is a different exit code from a run that started
 	// and failed.
 	if err := cfg.Validate(); err != nil {
+		return usageFail(stderr, "run: %v", err)
+	}
+	// The dataset's half of the same question, asked before the run row exists
+	// and before anything has been touched. It is reported as a usage error for
+	// the same reason as above: every one of these is a fact the caller can act
+	// on, and the run it would otherwise produce is not a measurement of
+	// anything.
+	if err := runner.CheckMachine(ds); err != nil {
+		return usageFail(stderr, "run: %v", err)
+	}
+	if err := runner.Preflight(ctx, ds, cfg); err != nil {
 		return usageFail(stderr, "run: %v", err)
 	}
 	if !*quiet && !*asJSON {
@@ -1147,6 +1183,9 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, "chained: each session's tasks share one workspace and run in order, "+
 			"so the cells of a chain are a sequence rather than independent samples")
 		fmt.Fprintln(stdout)
+	}
+	if cfg.InPlace {
+		warnInPlace(stderr, ds, cfg)
 	}
 
 	res, err := runner.Run(ctx, ds, cfg)
@@ -1179,6 +1218,48 @@ func cmdRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "\nreport  %s\n", absFlagPath(*reportTo))
 	}
 	return exitOK
+}
+
+// warnInPlace says what an in-place run is about to do to which directories.
+//
+// It is a warning and not a confirmation, because the run refuses everything it
+// cannot undo and puts back everything it does. What it cannot promise is
+// stated here rather than left to be discovered: a repository the agent pushed
+// to, a branch it created, and a file the .gitignore hides are all outside what
+// a restore can reach, and each of them is something a person would reasonably
+// have assumed was covered.
+//
+// The recovery instruction is not printed here because the values it needs are
+// read under the lock, a moment later. It is written into the lock instead, and
+// printed in full by any later run that finds the lock still there -- which is
+// exactly the run a person makes after finding their repository in the wrong
+// state.
+func warnInPlace(w io.Writer, ds *dataset.Dataset, cfg runner.Config) {
+	repos := runner.InPlaceRepos(ds, cfg)
+	if len(repos) == 0 {
+		return
+	}
+	counts := map[string]int{}
+	for _, t := range ds.Tasks {
+		counts[t.Workspace.RepoPath(ds.Dir)] += cfg.Samples
+	}
+	fmt.Fprintln(w, "in place: this run works in the directories below, each checked out at the commit "+
+		"its tasks name, and puts each one back when its chain finishes.")
+	fmt.Fprintln(w, "          A repository with uncommitted changes is refused before anything runs.")
+	fmt.Fprintln(w, "          Not put back: branches, tags and stashes the agent creates or moves "+
+		"(reported, not removed);")
+	fmt.Fprintln(w, "          files your .gitignore hides (left in place, reported); anything pushed to "+
+		"a remote.")
+	fmt.Fprintln(w, "          The repository's whole history is readable by the agent for the whole run.")
+	fmt.Fprintln(w)
+	for _, repo := range repos {
+		fmt.Fprintf(w, "  %s   (%d cell(s))\n", repo, counts[repo])
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Each directory holds a lock naming the commit and branch to return it to. If this "+
+		"process is killed outright it puts nothing back, and the next run that finds the lock will "+
+		"refuse and print the commands that repair it.")
+	fmt.Fprintln(w)
 }
 
 // progressLogger prints one line per finished cell.
@@ -1394,6 +1475,12 @@ func runSweep(ctx context.Context, st *store.Store, plan *attrib.Plan, sweepID, 
 	ds, err := dataset.Load(plan.DatasetPath)
 	if err != nil {
 		return fail(stderr, "matrix: %v", err)
+	}
+	// Once for the sweep, before the first level: every level replays the same
+	// dataset, and a refusal from inside the control level would arrive after
+	// the sweep header had already said it was starting.
+	if err := runner.CheckMachine(ds); err != nil {
+		return usageFail(stderr, "matrix: %v", err)
 	}
 
 	steps := plan.Steps()
@@ -1635,7 +1722,11 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 	}
 	defer st.Close()
 
-	opts := report.Options{Title: *title, NoTaskDetail: *summary}
+	// Resolved up front because the same options both build the payload and are
+	// stored beside its hash. Left unresolved, the second call inside Load would
+	// stamp a fresh time and the registration would be of a document that no
+	// longer exists by the time it is written.
+	opts := report.Options{Title: *title, NoTaskDetail: *summary}.Resolve()
 	ropts := report.RenderOptions{}
 
 	switch {
@@ -1663,6 +1754,19 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		if err := report.RenderIndexFile(indexPath, idx, ropts); err != nil {
 			return fail(stderr, "report: %v", err)
 		}
+		// One row for the invocation, describing the index. The per-run files
+		// written above are a batch convenience rather than the artifact: they
+		// are the same documents `report --run` produces, and recording each of
+		// them here would turn one command into a hundred registry rows.
+		if err := recordReport(ctx, st, stdout, report.Request{
+			Kind:    store.ReportKindIndex,
+			Title:   idx.Title,
+			Subject: indexSubject(len(idx.Runs), *sweepF),
+			Params:  indexParams(*limit, *sweepF),
+			Options: opts,
+		}, idx); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
 		fmt.Fprintf(stdout, "%d run report(s) and %s\n", len(idx.Runs), indexPath)
 		return exitOK
 
@@ -1673,6 +1777,15 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		}
 		path := absFlagPath(orDefault(out, "attribution-"+safeName(*sweep)+".html"))
 		if err := report.RenderSweepFile(path, data, ropts); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		if err := recordReport(ctx, st, stdout, report.Request{
+			Kind:    store.ReportKindSweep,
+			Title:   data.Title,
+			Subject: *sweep,
+			Params:  map[string]string{"sweep": *sweep},
+			Options: opts,
+		}, data); err != nil {
 			return fail(stderr, "report: %v", err)
 		}
 		fmt.Fprintln(stdout, path)
@@ -1689,6 +1802,15 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 		}
 		path := absFlagPath(orDefault(out, "compare-"+safeName(ids[0])+"-"+safeName(ids[1])+".html"))
 		if err := report.RenderComparisonFile(path, data, ropts); err != nil {
+			return fail(stderr, "report: %v", err)
+		}
+		if err := recordReport(ctx, st, stdout, report.Request{
+			Kind:    store.ReportKindCompare,
+			Title:   data.Title,
+			Subject: data.Title,
+			Params:  map[string]string{"left": ids[0], "right": ids[1]},
+			Options: opts,
+		}, data); err != nil {
 			return fail(stderr, "report: %v", err)
 		}
 		fmt.Fprintln(stdout, path)
@@ -1710,8 +1832,54 @@ func cmdReport(args []string, stdout, stderr io.Writer) int {
 	if err := report.RenderRunFile(path, data, ropts); err != nil {
 		return fail(stderr, "report: %v", err)
 	}
+	if err := recordReport(ctx, st, stdout, report.Request{
+		Kind:    store.ReportKindRun,
+		Title:   data.Title,
+		Subject: data.Title,
+		Params:  map[string]string{"run": id},
+		Options: opts,
+	}, data); err != nil {
+		return fail(stderr, "report: %v", err)
+	}
 	fmt.Fprintln(stdout, path)
 	return exitOK
+}
+
+// indexParams is the request a run listing records.
+func indexParams(limit int, sweepID string) map[string]string {
+	p := map[string]string{"limit": strconv.Itoa(limit)}
+	if sweepID != "" {
+		p["sweep_id"] = sweepID
+	}
+	return p
+}
+
+// indexSubject labels a listing by what it showed, not by its limit: a limit of
+// 100 over three runs is a document with three runs in it, and that is the
+// thing a reader scanning the registry wants to know.
+func indexSubject(runs int, sweepID string) string {
+	what := fmt.Sprintf("the %d most recent run(s)", runs)
+	if sweepID != "" {
+		return what + " of sweep " + sweepID
+	}
+	return what
+}
+
+// recordReport records a report that has been rendered.
+//
+// A failure here is fatal rather than a warning, which is the opposite of how
+// this program treats a task that failed to pass. The difference is what the
+// two are: a failing task is a measurement, and a registry that could not be
+// written is a bookkeeping failure -- the command would exit 0 having written a
+// file that the server will deny exists. The exit code is the only channel a
+// caller cannot miss.
+func recordReport(ctx context.Context, st *store.Store, stdout io.Writer, req report.Request, payload any) error {
+	reg, err := report.Save(ctx, st, req, payload)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "recorded  %s\n", reg.ID)
+	return nil
 }
 
 // safeName makes an id usable inside a filename, matching the sanitiser the
@@ -1734,6 +1902,118 @@ func safeName(id string) string {
 		s = s[:40]
 	}
 	return s
+}
+
+// ---------------------------------------------------------------------------
+// serve
+// ---------------------------------------------------------------------------
+
+// cmdServe serves the recorded reports over HTTP.
+//
+// It does not render anything to disk and it does not snapshot the database:
+// every page is rebuilt from the store on request, so a report recorded after
+// the server started is openable without a restart, and a page always shows
+// what the rows say now. What it cannot show is the past -- a report whose data
+// has moved says so in a banner rather than pretending to be the document that
+// was registered.
+func cmdServe(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	var (
+		common commonFlags
+		addr   = fs.String("addr", "127.0.0.1:8080", "address to listen on")
+		limit  = fs.Int("limit", 200, "how many recorded reports the list shows")
+		title  = fs.String("title", "", "heading of the report list")
+	)
+	addCommon(fs, &common)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if strings.TrimSpace(*addr) == "" {
+		return usageFail(stderr, "serve: --addr may not be empty")
+	}
+
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "serve: %v", err)
+	}
+	defer st.Close()
+
+	// Listen before printing anything. The address that comes back is the one
+	// that is actually open, which is what makes `--addr 127.0.0.1:0` usable for
+	// taking a free port; and a port already in use has to fail before a line
+	// claiming the server is up, not after it.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fail(stderr, "serve: listen on %s: %v", *addr, err)
+	}
+
+	srv := &http.Server{
+		Handler:           server.New(st, server.Options{Title: *title, Limit: *limit}).Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	ctx, stop := signalContext()
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// A fresh context rather than the cancelled one: Shutdown's job is to
+		// let in-flight requests finish, and a context that is already done
+		// would abort them instead.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}()
+
+	fmt.Fprintf(stdout, "serving   %s\n", listenURL(ln.Addr().String()))
+	fmt.Fprintf(stdout, "database  %s\n", st.Path())
+	if !isLoopback(ln.Addr().String()) {
+		// Worth a line: the database holds every recorded transcript, diff and
+		// answer, so the difference between this and the default is the
+		// difference between a page on this machine and one on the network.
+		fmt.Fprintln(stdout, "warning   bound to a non-loopback address: "+
+			"anything that can reach this port can read every recorded report")
+	}
+	fmt.Fprintln(stdout, "press ctrl-c to stop")
+
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fail(stderr, "serve: %v", err)
+	}
+	fmt.Fprintln(stdout, "stopped")
+	// Stopping is how a server ends, not an interruption of work: the signal is
+	// the ordinary way to stop one, and the work -- serving -- finished. 130
+	// would make every script that kills its own server look like a failure.
+	return exitOK
+}
+
+// listenURL renders a bound address as something a person can paste.
+//
+// The wildcard forms become 127.0.0.1 because that is where a reader on this
+// machine reaches the same port, and printing "http://0.0.0.0:8080/" would be
+// technically what was bound and useless to click.
+func listenURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr + "/"
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/"
+}
+
+// isLoopback reports whether a bound address is reachable only from this
+// machine. An unparseable address counts as loopback so that a warning is never
+// printed about a bind this program cannot describe.
+func isLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return true
+	}
+	if host == "" || host == "::" || host == "0.0.0.0" {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // ---------------------------------------------------------------------------

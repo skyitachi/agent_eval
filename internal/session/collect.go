@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/machine"
 )
 
 // Split selects how much of a session one task covers.
@@ -72,10 +73,12 @@ type Options struct {
 	// WorkspaceCwd binds every task to the directory its own recording ran in,
 	// instead of to one directory named up front.
 	//
-	// This is the only way to reproduce those files at all: a transcript
-	// records the branch a session ran on and not the commit, so nothing in the
-	// capture can reconstruct the tree. What this flag can do is put the
-	// directory back as it stands *now*, which is a decision the caller makes
+	// This is the only way to reproduce those files at all: a capture names the
+	// commit the session started from and not the files that were checked out
+	// around it, so nothing in it can reconstruct the tree as it stood. What
+	// this flag can do is put the directory back at the recorded commit -- or,
+	// when the capture named none or the repository no longer holds it, at the
+	// recorded branch as it stands now. That is a decision the caller makes
 	// rather than one this package makes for them -- see bindCwd for what that
 	// is and is not.
 	WorkspaceCwd bool
@@ -102,6 +105,17 @@ type Options struct {
 	// Category and Tags are applied to every emitted task.
 	Category string
 	Tags     []string
+
+	// Machine is stamped on every baseline, so a replay can refuse to run on a
+	// machine other than the one the recording was collected on. Nil writes no
+	// identity, and the replay is then not checked.
+	//
+	// It names the machine collect ran on, which is the machine the transcript
+	// was read from and the one whose directories --workspace-cwd resolved
+	// against. A transcript copied in from elsewhere is stamped with this
+	// machine, not the one it was recorded on: nothing in it says which that
+	// was.
+	Machine *machine.Identity
 }
 
 // Item is one emitted task together with the baseline it is measured against.
@@ -270,6 +284,21 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 	if boundNote != "" {
 		notes = append(notes, boundNote)
 	}
+	// A commit is reproducible and uncommitted changes are not, so a recording
+	// that started dirty cannot be replayed from where it started -- only from
+	// the commit underneath. Saying that is the difference between a comparison
+	// and a claim the data does not support, and the capture is the only thing
+	// that ever knew.
+	//
+	// Only when the task is actually bound to that repository. A task replaying
+	// in an empty workspace reproduces neither the commit nor the changes on
+	// top of it, and the note below is the one that describes that.
+	if ws.Type == dataset.WorkspaceGit && s.GitStart.Dirty {
+		notes = append(notes, fmt.Sprintf(
+			"the recording started from a repository with %d uncommitted path(s), which a commit "+
+				"cannot reproduce: the replay starts from a clean checkout of the recorded commit, "+
+				"not from where the recording started", s.GitStart.DirtyPaths))
+	}
 	// A replay starts from no workspace unless the caller bound one, and the
 	// transcript does not contain the files the session worked on. Recording
 	// that on the baseline is what stops the report from presenting the two
@@ -321,19 +350,21 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 	return Item{
 		Task: task,
 		Baseline: dataset.Baseline{
-			ID:          s.ID,
-			Source:      s.sourceName(),
-			Notes:       strings.Join(notes, "; "),
-			TaskID:      id,
-			Cwd:         s.Cwd,
-			GitBranch:   s.GitBranch,
-			GitHead:     s.GitHead,
-			AgentName:   s.agentName(),
-			AgentModel:  strings.Join(s.Models, ","),
-			StartedAt:   s.StartedAt,
-			EndedAt:     s.EndedAt,
-			FinalOutput: lastAssistantText(turns),
-			Turns:       baselineTurns(turns),
+			ID:            s.ID,
+			Source:        s.sourceName(),
+			Notes:         strings.Join(notes, "; "),
+			TaskID:        id,
+			Cwd:           s.Cwd,
+			GitBranch:     s.GitBranch,
+			GitHead:       s.GitHead,
+			RecordedDirty: s.GitStart.Dirty,
+			Machine:       copyMachine(opts.Machine),
+			AgentName:     s.agentName(),
+			AgentModel:    strings.Join(s.Models, ","),
+			StartedAt:     s.StartedAt,
+			EndedAt:       s.EndedAt,
+			FinalOutput:   lastAssistantText(turns),
+			Turns:         baselineTurns(turns),
 			Usage: dataset.BaselineUsage{
 				InputTokens:       usage.InputTokens,
 				OutputTokens:      usage.OutputTokens,
@@ -347,6 +378,16 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 		},
 		BaselineFile: baselineFile,
 	}, nil
+}
+
+// copyMachine gives each baseline its own identity, so editing one item's does
+// not quietly edit every other item collected with it.
+func copyMachine(m *machine.Identity) *machine.Identity {
+	if m == nil {
+		return nil
+	}
+	c := *m
+	return &c
 }
 
 func workspace(opts Options) dataset.Workspace {
@@ -372,13 +413,20 @@ func workspace(opts Options) dataset.Workspace {
 // bindCwd binds one task to the directory its recording ran in, and says what
 // the binding is.
 //
-// A transcript records the directory a session ran in and the branch it was on,
-// but not the commit, so the tree the agent actually started from is not
-// recoverable from the capture. What is recoverable is a repository cloned at
-// the recorded branch, which starts the replay from that branch's current tip;
-// the materializer drops the history, which is what stops the agent reading the
-// fix out of it. The note says the branch is as it stands now, because a commit
-// the recorded session made on it is in there.
+// The commit is preferred over the branch, and it is the stronger binding of the
+// two: a capture that carries a session-context block names the commit HEAD
+// pointed at when the session began, so the replay can start from that commit
+// instead of from whatever the branch has become since. The name in the block is
+// abbreviated, and resolving it here both completes it and answers the question
+// that matters -- whether the object is still in this repository at all. A
+// commit that has been rebased or garbage-collected away is not, and falling
+// back to the branch is then the honest answer rather than a silent one.
+//
+// The branch remains the fallback, and it is a weaker claim: it starts the
+// replay from that branch's current tip, so a commit the recorded session made
+// on it is in there. The note says which of the two happened, because a reader
+// comparing two attempts needs to know whether the replay started where the
+// session started or merely where the session's branch ended up.
 //
 // Nothing is copied into the dataset. A recording that ran in a directory which
 // is not a repository cannot be reproduced at all, and saying so is the point:
@@ -411,19 +459,62 @@ func bindCwd(s *Session, opts Options) (dataset.Workspace, string, error) {
 	if !hasCommit(cwd) {
 		return dataset.Workspace{}, "", fmt.Errorf(
 			"the directory session %s ran in (%s) is not a git repository with a commit, so "+
-				"--workspace-cwd cannot bind it: the transcript records the branch and not the commit, "+
-				"and the directory as it stands now is after that session finished, so a replay would "+
-				"start from the answer (pass --workspace-repo to name a starting point)",
-			shortID(s.ID), cwd)
+				"--workspace-cwd cannot bind it: the directory as it stands now is after that session "+
+				"finished, so a replay would start from the answer (pass --workspace-repo to name a "+
+				"starting point)", shortID(s.ID), cwd)
 	}
 
-	ref := s.GitBranch
 	note := "bound to the repository the recorded session ran in (" + cwd + ")"
-	if ref != "" {
-		note += " at branch " + ref
+	if head, ok := resolveHead(cwd, s.GitHead); ok {
+		return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: head},
+			note + " at commit " + shortSHA(head) + ", which the transcript records as the commit " +
+				"the session started from", nil
 	}
-	note += "; the transcript records the branch and not the commit, so this is that branch as it stands now"
-	return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: ref}, note, nil
+	// Either the capture never named a commit or the repository no longer holds
+	// it. Both leave the branch, and both have to say so: the first is a limit
+	// of the capture, the second is a repository that has moved on, and a reader
+	// who cannot tell them apart cannot tell which replays are comparable.
+	why := "the transcript records the branch and not the commit, so this is that branch as it stands now"
+	if s.GitHead != "" {
+		why = "the transcript records commit " + shortSHA(s.GitHead) + ", which is no longer in this " +
+			"repository, so this is branch " + orDash(s.GitBranch) + " as it stands now"
+	}
+	if s.GitBranch != "" {
+		note += " at branch " + s.GitBranch
+	}
+	return dataset.Workspace{Type: dataset.WorkspaceGit, Repo: cwd, Ref: s.GitBranch},
+		note + "; " + why, nil
+}
+
+// resolveHead turns the abbreviated object name a capture wrote into the full
+// commit it names, and reports whether the repository still holds it.
+//
+// Abbreviation is why this cannot be a string comparison: a capture writes ten
+// hex characters and the dataset has to carry something a checkout can use. The
+// same call answers the other question -- an object that has been rebased away
+// is gone, and there is nothing to check out.
+func resolveHead(dir, head string) (string, bool) {
+	if strings.TrimSpace(head) == "" {
+		return "", false
+	}
+	out, err := gitOut(dir, "rev-parse", "--verify", "--quiet", head+"^{commit}")
+	if err != nil {
+		return "", false
+	}
+	full := strings.TrimSpace(out)
+	if full == "" {
+		return "", false
+	}
+	return full, true
+}
+
+// orDash renders an empty string as a dash, for a note that has to name
+// something even when the capture did not.
+func orDash(s string) string {
+	if s == "" {
+		return "(detached)"
+	}
+	return s
 }
 
 // hasCommit reports whether dir is a git repository with at least one commit.
@@ -435,14 +526,23 @@ func hasCommit(dir string) bool {
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
 		return false
 	}
-	cmd := exec.Command("git", "-C", dir, "rev-parse", "--verify", "HEAD")
-	// The environment is sanitised for the same reason the materializer
-	// sanitises it: a developer's global config is an uncontrolled input, and a
-	// trace2 hook here would write into the repository being inspected.
+	_, err := gitOut(dir, "rev-parse", "--verify", "HEAD")
+	return err == nil
+}
+
+// gitOut runs one git command against a repository the caller does not own.
+//
+// The environment is sanitised for the same reason the materializer sanitises
+// it: a developer's global config is an uncontrolled input, and a trace2 hook
+// here would write into the repository being inspected. Nothing here is allowed
+// to change the repository -- every caller asks a question.
+func gitOut(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
 	cmd.Env = append(os.Environ(),
 		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull,
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
-	return cmd.Run() == nil
+	out, err := cmd.Output()
+	return string(out), err
 }
 
 // deriveLimits sizes an attempt against the recorded one.
@@ -512,6 +612,12 @@ func metadata(s *Session, p Prompt, turns []Turn, usage Usage, busyMs int64) map
 	if s.GitBranch != "" {
 		m["git_branch"] = s.GitBranch
 	}
+	if s.GitHead != "" {
+		m["git_head"] = s.GitHead
+	}
+	if s.GitStart.Known {
+		m["git_dirty"] = s.GitStart.Dirty
+	}
 	if s.Version != "" {
 		m["claude_version"] = s.Version
 	}
@@ -579,6 +685,16 @@ func shortID(id string) string {
 		return id[:8]
 	}
 	return id
+}
+
+// shortSHA abbreviates an object name for a sentence a person reads. It matches
+// what git itself prints, so the note and the `git log` a reader runs beside it
+// name the same commit the same way.
+func shortSHA(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
 }
 
 // sliceDurationMs totals the turn clocks inside a slice. A turn whose build

@@ -359,6 +359,11 @@ func runInfo(run store.Run, attempts []store.Attempt, s runner.Summary) RunInfo 
 		// a set of independent samples -- the one reading that is certainly
 		// wrong about a chain.
 		ChainSessions: run.ChainSessions,
+		// The same kind of fact and for the same reason: an agent that ran in
+		// someone's repository had that repository's history in front of it and
+		// the tree around it, and the run put the tree back afterwards. Nothing
+		// in a cell's numbers says either thing.
+		InPlace: run.InPlace,
 	}
 	if run.EndedAt != nil {
 		info.EndedAt = run.EndedAt.UTC().Format(time.RFC3339)
@@ -423,6 +428,13 @@ func chainedLabel(chained bool) string {
 		return "chained"
 	}
 	return "not chained"
+}
+
+func inPlaceLabel(inPlace bool) string {
+	if inPlace {
+		return "in place"
+	}
+	return "in a copy"
 }
 
 func sameSkills(a, b []string) bool {
@@ -660,6 +672,12 @@ func tasks(attempts []store.Attempt, runAgent, declaredModel string, opts Option
 			ToolCalls:    a.ToolCalls,
 			ToolErrors:   a.ToolErrors,
 			Error:        a.Error,
+			// Both are empty for a run that worked in a copy, which is what
+			// makes "no restore was needed" and "the restore was not recorded"
+			// the same reading -- correct here, because the only runs that
+			// restore anything are the ones that say so on the run row.
+			WorkspaceDir: a.WorkspaceDir,
+			RestoreNotes: a.RestoreNotes,
 		}
 		diff, answer := clip(a.Diff, opts.MaxFieldBytes), clip(a.Answer, opts.MaxFieldBytes)
 		t.Baseline = baselineView(a, runAgent, opts.MaxFieldBytes)
@@ -1089,6 +1107,16 @@ func comparisonWarnings(left, right store.Run, seenLeft, seenRight []string) []s
 		differing = append(differing, fmt.Sprintf(
 			"whether a session's tasks were chained into one workspace (%s vs %s)",
 			chainedLabel(left.ChainSessions), chainedLabel(right.ChainSessions)))
+	}
+	// In place is the third of these, and the largest difference of the three:
+	// one run put an agent inside a working repository with its history
+	// readable and restored the tree afterwards, and the other gave the agent a
+	// copy with the history stripped. Whatever the deltas below say, they are
+	// not saying that one agent beat another.
+	if left.InPlace != right.InPlace {
+		differing = append(differing, fmt.Sprintf(
+			"whether the agent worked in the recorded directories themselves (%s vs %s)",
+			inPlaceLabel(left.InPlace), inPlaceLabel(right.InPlace)))
 	}
 
 	var out []string

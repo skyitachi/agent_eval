@@ -88,7 +88,22 @@ var schemaFS embed.FS
 // earlier row reads back as 0, which here is not a gap in the record: no build
 // that wrote those rows could chain, so "predates the column" and "did not
 // chain" are the same fact and do not need keeping apart.
-const schemaVersion = 5
+//
+// v6 adds the reports table: the reports that were actually rendered, as the
+// request that produced them plus the hash of what came out. It adds a table
+// rather than a column, so an older database gains an empty one and nothing
+// that was already there reads differently -- a build that predates this simply
+// never recorded a report, which is the same fact as having recorded none.
+//
+// v7 adds runs.in_place and attempts.restore_notes: whether the run worked in
+// the directories the tasks record rather than in copies of them, and what
+// happened to each of those directories when the run gave it back. The first is
+// the same kind of fact as v5's chain_sessions -- it changes what the cells
+// beside it are evidence of -- and the second is the only record of a directory
+// the harness does not own, which the next run over the dataset will not see.
+// An earlier row reads back as 0 and ”, which is not a gap: no build that wrote
+// those rows could work in place.
+const schemaVersion = 7
 
 // ErrNotFound is matched by every missing-record error. It is a sentinel, not a
 // message: the errors that match it carry their own text, which names the record
@@ -198,8 +213,19 @@ type Run struct {
 	// makes the cells of one chain a sequence and not independent samples. A
 	// row written before v5 reads false, and that is correct rather than
 	// missing -- no earlier build could chain.
-	ChainSessions bool   `json:"chain_sessions,omitempty"`
-	Error         string `json:"error,omitempty"`
+	ChainSessions bool `json:"chain_sessions,omitempty"`
+	// InPlace is whether this run worked in the directories its tasks record,
+	// checked out at the commits they name, instead of in copies under the work
+	// root.
+	//
+	// It changes what the cells are evidence of, in the same way and for the
+	// same reason as ChainSessions above: an agent that ran in someone's
+	// repository had that repository's history in front of it and the rest of
+	// the tree around it, and the run put the tree back afterwards. A row
+	// written before v7 reads false, which is correct rather than missing -- no
+	// earlier build could work in place.
+	InPlace bool   `json:"in_place,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // AgentSpec decodes the recorded configuration. ok is false when the row has
@@ -257,6 +283,15 @@ type Attempt struct {
 
 	Error        string `json:"error,omitempty"`
 	WorkspaceDir string `json:"workspace_dir,omitempty"`
+
+	// RestoreNotes is what happened to the recorded directory when the run gave
+	// it back, and is empty for every cell of a run that worked in a copy.
+	//
+	// It is the only record of that directory: the harness does not own it, the
+	// next run over the dataset will not see the state this one left, and a
+	// person whose repository was not put back has to be able to find out from
+	// the report rather than from their working tree.
+	RestoreNotes string `json:"restore_notes,omitempty"`
 }
 
 // BaselineComparison is what the attempt was measured against.
@@ -486,6 +521,8 @@ var migrations = []func(*Store) error{
 	upgradeV2ToV3,
 	upgradeV3ToV4,
 	upgradeV4ToV5,
+	upgradeV5ToV6,
+	upgradeV6ToV7,
 }
 
 // upgrade walks from a database's revision to this build's.
@@ -552,6 +589,37 @@ func upgradeV4ToV5(s *Store) error {
 	return s.addColumnIfMissing("runs", "chain_sessions", "INTEGER NOT NULL DEFAULT 0")
 }
 
+// upgradeV5ToV6 brings an older database up to the revision that records
+// rendered reports.
+//
+// The step is empty, and deliberately so. The new revision adds a *table*, and
+// migrate applies schema.sql before walking the chain -- CREATE TABLE IF NOT
+// EXISTS is what creates it, on a fresh database and on an upgrade alike.
+// Repeating the DDL here would be a second definition of the same table, and
+// the two would drift: the migration would keep working after a column was
+// added to schema.sql and nobody would notice until a database upgraded along
+// one path and not the other.
+//
+// It exists because the chain has to have no gaps: `upgrade` walks from the
+// database's revision to this build's, one entry per step, so a missing entry
+// is reported as "this build has no path from it" for every v5 database.
+func upgradeV5ToV6(s *Store) error { return nil }
+
+// upgradeV6ToV7 adds the two columns that say a run worked in the recorded
+// directories and what it did with them.
+//
+// Two columns on two tables rather than one, because they are answers to two
+// questions: whether the run worked in place is a property of the run and every
+// cell inherits it, while what happened to the directory is per cell -- a chain
+// puts it back once, at its end, and the cells that come before it have nothing
+// to say about it.
+func upgradeV6ToV7(s *Store) error {
+	if err := s.addColumnIfMissing("runs", "in_place", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return s.addColumnIfMissing("attempts", "restore_notes", "TEXT NOT NULL DEFAULT ''")
+}
+
 // addColumnIfMissing is why the steps above can be re-run: ADD COLUMN is not
 // idempotent, and a step interrupted before the version bump would otherwise
 // fail the next open with "duplicate column name" -- a message that names
@@ -604,11 +672,19 @@ func (s *Store) existingVersion() (int, error) {
 	return v, nil
 }
 
+// hasForeignTables reports whether the file holds tables from the earlier
+// prototype, which this build refuses rather than migrates.
+//
+// The allow-list names every table this build creates. A table it does not know
+// is somebody else's, and an unrecognised table sitting beside a missing
+// version row is the signature of the prototype -- whose reward and oracle
+// columns answer a different question, so reading it as a v1 database would
+// silently reinterpret them.
 func (s *Store) hasForeignTables() (bool, error) {
 	var n int
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master
-		 WHERE type='table' AND name NOT IN ('schema_meta','runs','attempts','sqlite_sequence')`).Scan(&n)
+		 WHERE type='table' AND name NOT IN ('schema_meta','runs','attempts','reports','sqlite_sequence')`).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("store: inspect tables: %w", err)
 	}
@@ -623,7 +699,7 @@ const runColumns = `id, name, status, started_at, ended_at, duration_ms,
 	dataset_path, dataset_name, dataset_hash,
 	agent_kind, agent_model, agent_bin, backend,
 	samples, concurrency, factor_axis, factor_level, sweep_id,
-	notes, tool_version, config_json, agent_spec_json, chain_sessions, error`
+	notes, tool_version, config_json, agent_spec_json, chain_sessions, in_place, error`
 
 // CreateRun inserts a run. The caller sets StartedAt; a run with no status is
 // recorded as running.
@@ -644,7 +720,8 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 		r.DatasetPath, r.DatasetName, r.DatasetHash,
 		r.AgentKind, r.AgentModel, r.AgentBin, r.Backend,
 		r.Samples, r.Concurrency, r.FactorAxis, r.FactorLevel, r.SweepID,
-		r.Notes, r.ToolVersion, r.ConfigJSON, r.AgentSpecJSON, boolInt(r.ChainSessions), r.Error,
+		r.Notes, r.ToolVersion, r.ConfigJSON, r.AgentSpecJSON, boolInt(r.ChainSessions),
+		boolInt(r.InPlace), r.Error,
 	}
 	if err := checkArity("runs", runColumns, args); err != nil {
 		return err
@@ -664,6 +741,7 @@ func (s *Store) CreateRun(ctx context.Context, r Run) error {
 			notes=excluded.notes, tool_version=excluded.tool_version,
 			config_json=excluded.config_json, agent_spec_json=excluded.agent_spec_json,
 			chain_sessions=excluded.chain_sessions,
+			in_place=excluded.in_place,
 			error=excluded.error`,
 		args...)
 	if err != nil {
@@ -773,7 +851,7 @@ const attemptColumns = `id, run_id, task_id, sample_index, category, tags_json,
 	has_baseline, baseline_id, baseline_ref, baseline_tokens, baseline_ms,
 	baseline_cost, baseline_turns, baseline_output,
 	baseline_agent_name, baseline_agent_model, baseline_source, baseline_notes,
-	error, workspace_dir`
+	error, workspace_dir, restore_notes`
 
 // SaveAttempt inserts or replaces one cell.
 func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
@@ -809,7 +887,7 @@ func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
 		a.Baseline.Tokens, a.Baseline.Ms, a.Baseline.Cost, a.Baseline.Turns,
 		a.Baseline.Output,
 		a.Baseline.AgentName, a.Baseline.AgentModel, a.Baseline.Source, a.Baseline.Notes,
-		a.Error, a.WorkspaceDir,
+		a.Error, a.WorkspaceDir, a.RestoreNotes,
 	}
 	if err := checkArity("attempts", attemptColumns, args); err != nil {
 		return err
@@ -838,7 +916,8 @@ func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
 			baseline_agent_model=excluded.baseline_agent_model,
 			baseline_source=excluded.baseline_source,
 			baseline_notes=excluded.baseline_notes,
-			error=excluded.error, workspace_dir=excluded.workspace_dir`,
+			error=excluded.error, workspace_dir=excluded.workspace_dir,
+			restore_notes=excluded.restore_notes`,
 		args...)
 	if err != nil {
 		return fmt.Errorf("store: save attempt %s#%d: %w", a.TaskID, a.Sample, err)
@@ -886,16 +965,17 @@ func scanRun(sc scanner) (Run, error) {
 	var r Run
 	var started string
 	var ended sql.NullString
-	var chained int
+	var chained, inPlace int
 	err := sc.Scan(&r.ID, &r.Name, &r.Status, &started, &ended, &r.DurationMs,
 		&r.DatasetPath, &r.DatasetName, &r.DatasetHash,
 		&r.AgentKind, &r.AgentModel, &r.AgentBin, &r.Backend,
 		&r.Samples, &r.Concurrency, &r.FactorAxis, &r.FactorLevel, &r.SweepID,
-		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.AgentSpecJSON, &chained, &r.Error)
+		&r.Notes, &r.ToolVersion, &r.ConfigJSON, &r.AgentSpecJSON, &chained, &inPlace, &r.Error)
 	if err != nil {
 		return Run{}, err
 	}
 	r.ChainSessions = chained != 0
+	r.InPlace = inPlace != 0
 	r.StartedAt = parseTime(started)
 	if ended.Valid {
 		t := parseTime(ended.String)
@@ -918,7 +998,7 @@ func scanAttempt(sc scanner) (Attempt, error) {
 		&a.Baseline.Tokens, &a.Baseline.Ms, &a.Baseline.Cost, &a.Baseline.Turns,
 		&a.Baseline.Output,
 		&a.Baseline.AgentName, &a.Baseline.AgentModel, &a.Baseline.Source, &a.Baseline.Notes,
-		&a.Error, &a.WorkspaceDir)
+		&a.Error, &a.WorkspaceDir, &a.RestoreNotes)
 	if err != nil {
 		return Attempt{}, err
 	}
@@ -942,6 +1022,119 @@ func scanAttempt(sc scanner) (Attempt, error) {
 		a.Trace = json.RawMessage(traceJSON)
 	}
 	return a, nil
+}
+
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+
+// Report kinds. Each names a view the report command can produce, and together
+// with the params they are the whole of what a recorded report asks for.
+const (
+	ReportKindRun     = "run"
+	ReportKindCompare = "compare"
+	ReportKindSweep   = "sweep"
+	ReportKindIndex   = "index"
+)
+
+// Report is one registration: a report that was produced, described by what was
+// asked for rather than by what came out.
+//
+// The payload is not stored. See schema.sql for why -- in short, a report is a
+// function of this database, and PayloadHash is the claim that survives: the
+// server rebuilds the payload and compares.
+type Report struct {
+	ID string `json:"id"`
+	// Kind is one of the ReportKind constants. An unknown kind is refused by
+	// the server rather than rendered: it names a view this build cannot
+	// rebuild, so the row is a record of something not in this build's
+	// vocabulary.
+	Kind    string `json:"kind"`
+	Title   string `json:"title"`
+	Subject string `json:"subject"`
+	// ParamsJSON is the request: the ids the view was asked for.
+	ParamsJSON string `json:"params_json"`
+	// OptionsJSON is the *resolved* report.Options the payload was built with.
+	OptionsJSON  string    `json:"options_json"`
+	CreatedAt    time.Time `json:"created_at"`
+	PayloadHash  string    `json:"payload_hash"`
+	PayloadBytes int64     `json:"payload_bytes"`
+	// DataVersion is report.DataVersion at registration, so a hash that no
+	// longer agrees can be told apart from a payload format that changed.
+	DataVersion int `json:"data_version"`
+}
+
+const reportColumns = `id, kind, title, subject, params_json, options_json,
+	created_at, payload_hash, payload_bytes, data_version`
+
+// SaveReport records a production of a report.
+//
+// The id is the writer's business, not this layer's: it is the permalink a
+// reader will cite, and what makes one stable is a decision about the tool, not
+// about the table. An empty id is refused rather than defaulted, because a row
+// nobody can name is a row nobody can open.
+func (s *Store) SaveReport(ctx context.Context, r Report) error {
+	if strings.TrimSpace(r.ID) == "" {
+		return errors.New("store: report has no id")
+	}
+	if strings.TrimSpace(r.Kind) == "" {
+		return fmt.Errorf("store: report %s has no kind", r.ID)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO reports(`+reportColumns+`) VALUES(`+placeholders(10)+`)`,
+		r.ID, r.Kind, r.Title, r.Subject, r.ParamsJSON, r.OptionsJSON,
+		fmtTime(r.CreatedAt), r.PayloadHash, r.PayloadBytes, r.DataVersion)
+	if err != nil {
+		return fmt.Errorf("store: save report: %w", err)
+	}
+	return nil
+}
+
+// GetReport returns one recorded report.
+func (s *Store) GetReport(ctx context.Context, id string) (Report, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+reportColumns+` FROM reports WHERE id=?`, id)
+	r, err := scanReport(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Report{}, &NotFoundError{Kind: "report", ID: id, Path: s.path}
+	}
+	return r, err
+}
+
+// ListReports returns recorded reports, newest first.
+func (s *Store) ListReports(ctx context.Context, limit int) ([]Report, error) {
+	q := `SELECT ` + reportColumns + ` FROM reports ORDER BY created_at DESC, id DESC`
+	if limit > 0 {
+		q += fmt.Sprintf(` LIMIT %d`, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("store: list reports: %w", err)
+	}
+	defer rows.Close()
+	var out []Report
+	for rows.Next() {
+		r, err := scanReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func scanReport(sc scanner) (Report, error) {
+	var (
+		r         Report
+		createdAt string
+	)
+	if err := sc.Scan(&r.ID, &r.Kind, &r.Title, &r.Subject, &r.ParamsJSON, &r.OptionsJSON,
+		&createdAt, &r.PayloadHash, &r.PayloadBytes, &r.DataVersion); err != nil {
+		return Report{}, err
+	}
+	r.CreatedAt = parseTime(createdAt)
+	return r, nil
 }
 
 // ---------------------------------------------------------------------------

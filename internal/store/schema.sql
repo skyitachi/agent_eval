@@ -67,6 +67,20 @@ CREATE TABLE IF NOT EXISTS runs (
     -- no earlier build could chain, so the two readings agree here and there is
     -- no third state to keep apart.
     chain_sessions INTEGER NOT NULL DEFAULT 0,
+
+    -- in_place is whether this run worked in the directories the tasks record
+    -- rather than in copies of them.
+    --
+    -- It is on the row because it changes what the cells are evidence *of*. A
+    -- run that worked in someone's repository put an agent in a tree with the
+    -- repository's whole history in it, and put the tree back afterwards; a
+    -- copy-based run gave the agent neither. Two runs whose rows are identical
+    -- apart from this were not the same experiment, and a page that does not
+    -- say so invites a reader to compare them as though they were.
+    --
+    -- 0 means the row predates this column, which is the same as not in place
+    -- -- no earlier build could work in place, so the two readings agree.
+    in_place     INTEGER NOT NULL DEFAULT 0,
     error        TEXT NOT NULL DEFAULT ''
 );
 
@@ -146,9 +160,75 @@ CREATE TABLE IF NOT EXISTS attempts (
     error         TEXT NOT NULL DEFAULT '',
     workspace_dir TEXT NOT NULL DEFAULT '',
 
+    -- restore_notes is what happened to the recorded directory when the run
+    -- gave it back: where it was put back, what was deliberately left in it,
+    -- and -- the case that matters -- whether it could not be put back at all.
+    --
+    -- It is stored rather than derived because it is the only record of a
+    -- directory the harness does not own. The next run over the same dataset
+    -- will not see this state; the person whose repository it is has to, and
+    -- the report is where they will look.
+    restore_notes TEXT NOT NULL DEFAULT '',
+
     UNIQUE(run_id, task_id, sample_index),
     FOREIGN KEY(run_id) REFERENCES runs(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_attempts_run  ON attempts(run_id, task_id);
 CREATE INDEX IF NOT EXISTS idx_attempts_task ON attempts(task_id);
+
+-- One report that was actually produced, recorded so a server can list it and
+-- hand it back under a stable link.
+--
+-- The rendered payload is deliberately NOT here. A report is a function of this
+-- database, and a second copy of it would be a second answer to the same
+-- question: it would stop tracking the rows the moment the database moved, and
+-- a renderer fix would never reach it. What is stored is the part that cannot
+-- be re-derived -- which view was asked for, with which options, at which
+-- moment -- plus the hash of what came out.
+--
+-- The hash is what makes the row a *claim* rather than a cache. Serving this id
+-- rebuilds the payload, hashes it the same way and compares: a page whose data
+-- has moved says so on its face instead of quietly showing a different document
+-- under the same link. That is also why `payload_bytes` is kept -- it is the
+-- size of the document that was hashed, which is a measurement of the record
+-- and not a forecast of anything.
+--
+-- One row per registration, append-only. Re-rendering a view writes a second
+-- row rather than updating the first, because the two hashes side by side are
+-- the evidence of drift -- collapsing them to the latest would erase exactly
+-- the history this table exists to keep.
+CREATE TABLE IF NOT EXISTS reports (
+    id            TEXT PRIMARY KEY,
+    -- Which view: run | compare | sweep | index.
+    kind          TEXT NOT NULL DEFAULT '',
+    -- The document title, as rendered.
+    title         TEXT NOT NULL DEFAULT '',
+    -- A human label for what the report was about ("run name / axis=level",
+    -- "a vs b"). Stored rather than derived because the thing it names can be
+    -- deleted: a row whose subject is gone still has to be able to say what it
+    -- was about, and no lookup can answer that afterwards.
+    subject       TEXT NOT NULL DEFAULT '',
+    -- The ids the view was asked for, as JSON. Together with kind this is the
+    -- whole of the request; an unknown or missing key is an error rather than a
+    -- default, because guessing would rebuild a different document and then
+    -- report it as drift.
+    params_json   TEXT NOT NULL DEFAULT '{}',
+    -- The resolved report.Options that shaped the payload (field budgets, the
+    -- summary/detail switch, the generation stamp). Resolved and not as-typed:
+    -- the zero values become real numbers before they are stored, so replaying
+    -- them cannot pick up a different default than the one that applied.
+    options_json  TEXT NOT NULL DEFAULT '{}',
+    created_at    TEXT NOT NULL,
+    -- sha256 over the exact bytes the JSON endpoint returns. Hex, lower case.
+    payload_hash  TEXT NOT NULL DEFAULT '',
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
+    -- report.DataVersion at registration. A payload whose format has changed
+    -- since is a different document for a reason that has nothing to do with
+    -- the data, and a reader comparing hashes has to be able to tell the two
+    -- apart.
+    data_version  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_kind    ON reports(kind, created_at DESC);

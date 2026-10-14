@@ -1,18 +1,21 @@
 {{- /* The page shell.
    *
-   * All three outputs -- a single run, the run index, a comparison -- share
-   * this shell and differ only in (a) the payload they embed and (b) the mode
-   * attribute the client reads. Putting the routing in the client rather than
-   * in three near-identical templates is what keeps the file report and the
-   * served report from drifting apart.
+   * All the outputs -- a single run, the run index, a comparison, a sweep, the
+   * listing of recorded reports -- share this shell and differ only in (a) the
+   * payload they embed and (b) the mode attribute the client reads. Putting the
+   * routing in the client rather than in five near-identical templates is what
+   * keeps the file report and the served report from drifting apart.
    *
    * CSS and JS are inlined by default so the output is one file that works from
    * a file:// URL, an email attachment or a USB stick. The non-standalone branch
    * exists for the web server, which serves them once and caches them.
+   *
+   * The <head> is a template of its own because the failure page needs it too,
+   * and a second copy of it is a second copy that stops matching. The top bar
+   * deliberately is not shared: the failure page has no client and so must not
+   * offer a search box, a JSON export and a print button that do nothing.
    */ -}}
-{{- define "page" -}}
-<!doctype html>
-<html lang="en" data-theme="auto">
+{{- define "shell-head" -}}
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -27,6 +30,11 @@
 <link rel="stylesheet" href="{{.AssetBase}}app.css">
 {{- end}}
 </head>
+{{- end -}}
+{{- define "page" -}}
+<!doctype html>
+<html lang="en" data-theme="auto">
+{{template "shell-head" .Head}}
 <body data-mode="{{.Mode}}">
 <header class="topbar">
   <div class="topbar-inner">
@@ -44,6 +52,16 @@
     </div>
   </div>
 </header>
+{{/* The record banner sits outside <main>, which the client empties and
+     repaints on every render. Inside it, the one part of the page that
+     describes the page itself would be erased by the first repaint. Every value
+     in it is escaped by default: the note names a hash and a timestamp, and
+     none of it is trusted markup. */}}
+{{- if .Record}}
+<div class="recordbar">
+  <div class="notice {{.Record.Severity}}"><b>{{.Record.Head}}</b> {{.Record.Note}}</div>
+</div>
+{{- end}}
 <main id="main"></main>
 <aside id="drawer" class="drawer" hidden aria-live="polite"></aside>
 
@@ -54,10 +72,10 @@
      guarantees it contains no "<", so it can neither close the element early
      nor open an HTML comment. */}}
 <script>window.__AEVAL_PAYLOAD__ = {{.Payload}};</script>
-{{- if .Standalone}}
+{{- if .Head.Standalone}}
 <script>{{.JS}}</script>
 {{- else}}
-<script src="{{.AssetBase}}app.js"></script>
+<script src="{{.Head.AssetBase}}app.js"></script>
 {{- end}}
 </body>
 </html>

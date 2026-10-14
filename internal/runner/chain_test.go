@@ -174,7 +174,7 @@ func TestAHalfRecordedChainIsRefused(t *testing.T) {
 		chained("s1-p0", "s1", 0), chained("s1-p1", "s1", 1), chained("s1-p2", "s1", 2),
 		chained("s2-p0", "s2", 0), chained("s2-p1", "s2", 1),
 	)
-	err := chainsIntact(planned, planned[1:])
+	err := chainsIntact(planned, planned[1:], Config{})
 	if err == nil {
 		t.Fatal("a chain whose first task is already recorded must not be resumed in the middle")
 	}
@@ -183,18 +183,18 @@ func TestAHalfRecordedChainIsRefused(t *testing.T) {
 	}
 
 	// Nothing recorded yet: every chain runs whole.
-	if err := chainsIntact(planned, planned); err != nil {
+	if err := chainsIntact(planned, planned, Config{}); err != nil {
 		t.Errorf("an untouched chain must be runnable: %v", err)
 	}
 	// Everything recorded: every chain is skipped whole.
-	if err := chainsIntact(planned, nil); err != nil {
+	if err := chainsIntact(planned, nil, Config{}); err != nil {
 		t.Errorf("a finished chain must be skipped, not refused: %v", err)
 	}
 	// One chain whole and another half done is still a refusal -- and it names
 	// the one that is broken rather than the one that is fine.
 	half := append([]cell{}, planned[:3]...)
 	half = append(half, planned[4]) // s2-p1 without s2-p0
-	err = chainsIntact(planned, half)
+	err = chainsIntact(planned, half, Config{})
 	if err == nil || !strings.Contains(err.Error(), "s2#0") || strings.Contains(err.Error(), "s1#0") {
 		t.Errorf("the refusal must point at the half-done chain, got: %v", err)
 	}

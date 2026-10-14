@@ -81,10 +81,9 @@ func materializeFiles(sb Sandbox, ws dataset.Workspace, datasetDir string) error
 }
 
 func materializeGit(ctx context.Context, sb Sandbox, ws dataset.Workspace, datasetDir string) error {
-	repo := ws.Repo
-	if !looksLikeURL(repo) && !filepath.IsAbs(repo) {
-		repo = filepath.Join(datasetDir, repo)
-	}
+	// Resolved through the workspace so that this and a runner deciding whether
+	// it can work in the repository directly cannot disagree about where it is.
+	repo := ws.RepoPath(datasetDir)
 	// Clone elsewhere first so a Subdir can be promoted to the sandbox root and
 	// the same on-disk layout works for both backends.
 	stage, err := os.MkdirTemp("", "agenteval-clone-")

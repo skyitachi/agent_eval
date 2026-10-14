@@ -41,7 +41,11 @@ import (
 // It holds generated support files (injected suites, settings). Because it is
 // created by the harness and not by the agent, it is always excluded from the
 // diff so it can never influence a patch-based score.
-const HarnessDir = ".agenteval"
+//
+// The name lives in the sandbox package because that is what lays out a
+// workspace, and a run that works in a directory it did not create has to be
+// able to remove this one without importing the graders.
+const HarnessDir = sandbox.HarnessDir
 
 // HarnessIgnore are glob patterns always removed from diffs.
 var HarnessIgnore = []string{HarnessDir + "/**", HarnessDir}

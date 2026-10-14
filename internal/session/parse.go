@@ -19,12 +19,17 @@
 // 176 assistant records for 63 messages in a real session. The parser
 // accumulates blocks per message id and counts usage exactly once.
 //
-// # What a transcript cannot give back
+// # What a transcript gives back about the repository
 //
-// It records the branch the session ran on, not the commit. A collected task can
-// therefore say "this was done on main" but cannot reconstruct the tree, and this
-// package refuses to pretend otherwise: GitHead stays empty unless the caller
-// passes it in. Binding a workspace is an explicit decision.
+// Recent builds write a session-context attachment whose gitStatus block is a
+// snapshot of the repository as the session found it. Its "Recent commits" list
+// starts at HEAD, so the commit the session started from is recoverable, and
+// GitStart carries it along with whether the worktree had uncommitted changes.
+// Older captures have no such record and leave both empty.
+//
+// What it still cannot give back is the *tree*: a commit is reproducible, and
+// uncommitted changes are not. A recording that started dirty says so, because
+// a replay from the commit is not a replay from where the session started.
 //
 // # What it deliberately drops
 //
@@ -64,6 +69,27 @@ const (
 // SourceName is the producer recorded in dataset.Baseline.Source.
 const SourceName = "claude-code-session"
 
+// GitStart is what a capture says about its repository when the session began.
+//
+// It comes from a rendered block rather than a field, so every part of it is
+// best-effort: Known says whether the block was there at all, and the rest is
+// only meaningful when it was.
+type GitStart struct {
+	// Head is the commit HEAD pointed at, as the block wrote it. Recent builds
+	// abbreviate it to ten hex characters, so it is not a full object name and
+	// has to be resolved against the repository before it can be checked out.
+	Head string
+	// Dirty is whether the worktree had uncommitted changes. It is the half of
+	// the snapshot a commit cannot reproduce.
+	Dirty bool
+	// DirtyPaths is how many paths the status block listed. It counts paths
+	// rather than changes, because that is what the block lists.
+	DirtyPaths int
+	// Known reports that a status block was found, which is what makes a clean
+	// reading a measurement rather than an absence.
+	Known bool
+}
+
 // Session is a parsed transcript.
 type Session struct {
 	// ID is the session uuid.
@@ -84,9 +110,17 @@ type Session struct {
 	// Provenance.
 	Cwd       string
 	GitBranch string
-	GitHead   string
-	Version   string
-	Models    []string
+	// GitHead is the commit the session started from, as the transcript's
+	// session-context block recorded it. Empty when the capture has no such
+	// block, or when it started outside a repository.
+	GitHead string
+	// GitStart is what that block said about the worktree. It travels with the
+	// session because a commit cannot reproduce uncommitted changes, and a
+	// reader who is told only the commit would take the replay for a replay of
+	// where the session actually started.
+	GitStart GitStart
+	Version  string
+	Models   []string
 
 	StartedAt time.Time
 	EndedAt   time.Time
@@ -258,6 +292,21 @@ type rawRecord struct {
 	ModelUsage        map[string]rawModelUsage `json:"modelUsage"`
 
 	Snapshot *rawSnapshot `json:"snapshot"`
+
+	Attachment *rawAttachment `json:"attachment"`
+}
+
+// rawAttachment is a record about the environment rather than about the
+// conversation -- hooks, tool listings, and the session context that carries the
+// repository snapshot.
+//
+// Context stays raw because the shape under it varies with the attachment type
+// and with the build that wrote it. Decoding it into one wide struct would turn
+// a shape this build does not know into a failed line, and the record is worth
+// nothing next to the conversation beside it.
+type rawAttachment struct {
+	Type    string          `json:"type"`
+	Context json.RawMessage `json:"context"`
 }
 
 type rawMessage struct {
@@ -431,6 +480,8 @@ func (s *Session) absorb(rec rawRecord, assistantAt map[string]int, modelSet map
 				edited[p] = true
 			}
 		}
+	case "attachment":
+		s.absorbAttachment(rec)
 	}
 }
 
@@ -583,6 +634,94 @@ func isHumanPrompt(rec rawRecord) bool {
 	// Older builds carry no origin. A typed prompt is the only user record that
 	// says where it came from, so the flag is the fallback signal.
 	return rec.PromptSource == "typed"
+}
+
+// absorbAttachment reads the session-context block, which is where a capture
+// says what repository it started in.
+//
+// Only the first one counts. A resumed session appends a second block, and that
+// one describes the resume rather than the state the recorded work started
+// from, which is the state a replay has to be measured against.
+func (s *Session) absorbAttachment(rec rawRecord) {
+	if rec.Attachment == nil || rec.Attachment.Type != "session_context" {
+		return
+	}
+	if s.GitStart.Known {
+		return
+	}
+	// A context this build cannot read is not a corrupt capture. The record is
+	// one line about the environment, and failing it would report the whole
+	// transcript as damaged over a block nothing else depends on.
+	var ctx struct {
+		GitStatus string `json:"gitStatus"`
+	}
+	if err := json.Unmarshal(rec.Attachment.Context, &ctx); err != nil {
+		return
+	}
+	start := parseGitStatus(ctx.GitStatus)
+	if !start.Known {
+		return
+	}
+	s.GitStart = start
+	if s.GitHead == "" {
+		s.GitHead = start.Head
+	}
+}
+
+// parseGitStatus reads the rendered git-status block.
+//
+// It is prose, not a record, so this reads as little of it as it can: the first
+// line under "Recent commits:" is HEAD, and the status section is either
+// "(clean)" or a list of paths. Everything else in the block is ignored, and a
+// block whose shape has changed yields Known with nothing else set rather than
+// a guess.
+func parseGitStatus(status string) GitStart {
+	if strings.TrimSpace(status) == "" {
+		return GitStart{}
+	}
+	out := GitStart{Known: true}
+
+	if _, rest, ok := strings.Cut(status, "Recent commits:\n"); ok {
+		line, _, _ := strings.Cut(rest, "\n")
+		// The list is "<abbreviated object name> <subject>". A repository with
+		// no commits has no list, so the section is simply absent.
+		name, _, _ := strings.Cut(strings.TrimSpace(line), " ")
+		if isObjectName(name) {
+			out.Head = name
+		}
+	}
+
+	if _, rest, ok := strings.Cut(status, "\nStatus:\n"); ok {
+		// The section ends at the blank line before the commit list. It is cut
+		// again on the heading because a build that omits the blank line would
+		// otherwise fold the heading into the last path.
+		block, _, _ := strings.Cut(rest, "\n\n")
+		block, _, _ = strings.Cut(block, "Recent commits:")
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || line == "(clean)" {
+				continue
+			}
+			out.DirtyPaths++
+		}
+		out.Dirty = out.DirtyPaths > 0
+	}
+	return out
+}
+
+// isObjectName reports whether s could be a git object name. Recent builds write
+// ten hex characters; the range is wide because that is a rendering choice and
+// not a promise.
+func isObjectName(s string) bool {
+	if len(s) < 7 || len(s) > 40 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Session) finish(modelSet map[string]bool, edited map[string]bool) {

@@ -1,0 +1,34 @@
+{{- /* The failure page.
+   *
+   * A reader who opened a link that does not work should land somewhere that
+   * looks like the tool, says which link was wrong, and offers the list. It is
+   * rendered by the server and carries no client: there is no payload to draw,
+   * and app.js would paint an empty listing over the reason the page exists.
+   *
+   * The top bar is written out here rather than shared with the report shell
+   * because the shell's bar has a search box, a JSON export and a print button,
+   * none of which can work without a payload. Sharing it would put three dead
+   * controls on every error page.
+   */ -}}
+{{- define "error" -}}
+<!doctype html>
+<html lang="en" data-theme="auto">
+{{template "shell-head" .Head}}
+<body data-mode="error">
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="{{.Home}}">Report<span class="brand-sub">not available</span></a>
+  </div>
+</header>
+<main>
+  <div class="card runhead">
+    <h1>{{.Head.Title}}</h1>
+    <p class="errmessage">{{.Message}}</p>
+    {{- if .HomeText}}
+    <p><a href="{{.Home}}">{{.HomeText}}</a></p>
+    {{- end}}
+  </div>
+</main>
+</body>
+</html>
+{{- end -}}

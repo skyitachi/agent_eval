@@ -184,6 +184,26 @@ main {
   padding: 20px;
 }
 
+/* The banner a served report carries above its content, saying which
+ * registration the page came from and whether it still reproduces.
+ *
+ * It is a sibling of main rather than a child: the client empties and repaints
+ * main on every render, so a banner inside it would be erased by the first
+ * repaint -- and being erased is precisely what must not happen to the one part
+ * of the page that describes the page itself. That is also why it repeats the
+ * shell's width and padding instead of inheriting them. */
+.recordbar {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 16px 20px 0;
+}
+.recordbar .notice { margin-bottom: 0; }
+
+/* The failure page's explanation. It is prose rather than a value, so it takes
+ * the body size and a comfortable line height instead of the card's tighter
+ * heading styling. */
+.errmessage { font-size: 13.5px; line-height: 1.6; }
+
 .card {
   background: var(--panel);
   border: 1px solid var(--border);

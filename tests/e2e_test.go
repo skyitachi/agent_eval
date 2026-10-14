@@ -16,16 +16,19 @@
 package tests
 
 import (
+	"bufio"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	// The version test below rewrites a database into an older shape, which
 	// needs a driver of its own: the point is to be a client of the file, not
@@ -248,6 +251,12 @@ type runInfo struct {
 	// continuation rather than independent samples.
 	ChainSessions bool `json:"chain_sessions"`
 
+	// InPlace is whether the run worked in the directories the tasks record
+	// rather than in copies. The page has to be able to say so, because a cell
+	// measured in someone's working repository is not the same experiment as
+	// one measured in a copy with the history stripped.
+	InPlace bool `json:"in_place"`
+
 	// Model is which model the agent used, as far as the record goes. The label
 	// above is only what the command line asked for, and it is empty on every
 	// run that did not pass --model.
@@ -340,7 +349,12 @@ type task struct {
 		Notes          string `json:"notes"`
 	} `json:"baseline"`
 
-	Error   string `json:"error"`
+	Error string `json:"error"`
+	// WorkspaceDir and RestoreNotes are what an in-place cell records about the
+	// directory it worked in and what happened to it afterwards.
+	WorkspaceDir string `json:"workspace_dir"`
+	RestoreNotes string `json:"restore_notes"`
+
 	Diff    string `json:"diff"`
 	Answer  string `json:"answer"`
 	Graders []struct {
@@ -1024,6 +1038,64 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 	}
 	if _, ok := metricByKey(p, "baseline_tokens"); !ok {
 		t.Error("a run with a baseline should headline its token delta, not bury it in the task")
+	}
+}
+
+// TestCLIRefusesToReplayOnAnotherMachine moves a collected dataset to "another
+// machine" by rewriting the identity its baseline carries, which is the only
+// part of a move the harness can observe.
+func TestCLIRefusesToReplayOnAnotherMachine(t *testing.T) {
+	work := t.TempDir()
+	out := filepath.Join(work, "collected")
+	db := filepath.Join(work, "runs.db")
+	session := filepath.Join(repoRoot, "tests", "testdata", "session", "basic.jsonl")
+	if r := runCLI(t, "collect", "--session", session, "--out", out); r.exitCode != 0 {
+		t.Fatalf("collect exited %d\n%s", r.exitCode, r.stderr)
+	}
+
+	basePath := filepath.Join(out, "baselines", "aaaabbbb.json")
+	raw, err := os.ReadFile(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := doc["machine"].(map[string]any)
+	if !ok || m["id"] == "" {
+		t.Fatalf("collect wrote no machine identity onto the baseline:\n%s", raw)
+	}
+
+	replay := func(name string) result {
+		return runCLI(t, "run", "--dataset", out, "--agent", "mock", "--bin", "/bin/true",
+			"--name", name, "--db", db, "--work-root", filepath.Join(work, "work"), "--quiet")
+	}
+	// On the machine that collected it, the replay runs.
+	if r := replay("here"); r.exitCode != 0 {
+		t.Fatalf("the collecting machine could not replay its own dataset (%d):\n%s\n%s",
+			r.exitCode, r.stdout, r.stderr)
+	}
+
+	m["id"] = "0000000000000000000000000000beef"
+	m["hostname"] = "elsewhere"
+	moved, _ := json.MarshalIndent(doc, "", "  ")
+	if err := os.WriteFile(basePath, moved, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := replay("there")
+	if r.exitCode != 2 {
+		t.Fatalf("a replay on another machine exited %d, want 2\nstdout:\n%s\nstderr:\n%s",
+			r.exitCode, r.stdout, r.stderr)
+	}
+	for _, want := range []string{"different machine", "aaaabbbb", "recorded on: elsewhere", "running on:"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("the refusal should say %q, got:\n%s", want, r.stderr)
+		}
+	}
+	// Refused before anything ran: only the first replay is in the database.
+	if l := runCLI(t, "list", "--db", db); strings.Contains(l.stdout, "there") {
+		t.Errorf("the refused replay left a run behind:\n%s", l.stdout)
 	}
 }
 
@@ -2834,4 +2906,593 @@ tasks:
   "duration_ms": 90000
 }`)
 	return dir
+}
+
+// ---------------------------------------------------------------------------
+// Recorded reports and the server that hands them back
+// ---------------------------------------------------------------------------
+
+// runOneAnswer produces one run with one measured cell, without an interpreter.
+//
+// The demo dataset's tasks are graded by pytest, so driving the registry
+// through it would skip these tests on every machine without an interpreter --
+// which is exactly where the coverage is cheapest to have. The one-answer
+// dataset is graded on stdout and the fixture emits a real stream, so the cell
+// is a measurement rather than the "never ran" case.
+func runOneAnswer(t *testing.T, work, db, name string) payload {
+	t.Helper()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds-"+name))
+	reportPath := filepath.Join(work, name+".html")
+	r := runCLI(t, "run",
+		"--dataset", ds,
+		"--bin", filepath.Join(agents, "one-turn.sh"),
+		"--name", name,
+		"--db", db,
+		"--work-root", filepath.Join(work, "work-"+name),
+		"--report", reportPath,
+	)
+	if r.exitCode != 0 {
+		t.Fatalf("%s run exited %d\nstdout:\n%s\nstderr:\n%s", name, r.exitCode, r.stdout, r.stderr)
+	}
+	p := payloadFromHTML(t, reportPath)
+	if p.Run.ID == "" {
+		t.Fatal("the run's own report does not name the run")
+	}
+	if len(p.Tasks) != 1 {
+		t.Fatalf("the fixture produced %d cells, want one to report on", len(p.Tasks))
+	}
+	return p
+}
+
+// TestCLIRecordsTheReportsItRenders covers the first half of the registry: what
+// gets recorded, and what does not.
+//
+// The rule is that `report` records and nothing else does. A run that wrote its
+// own HTML has not been *asked* for a report, and recording it would fill the
+// registry with documents nobody chose; the row is a record of a request, which
+// is why only the command that answers one writes it.
+func TestCLIRecordsTheReportsItRenders(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	p := runOneAnswer(t, work, db, "recorded")
+
+	if n := countReports(t, db); n != 0 {
+		t.Errorf("a run that wrote its own report left %d row(s) in the registry; "+
+			"only `report` should record one", n)
+	}
+
+	out := filepath.Join(work, "again.html")
+	r := runCLI(t, "report", "--db", db, "--run", p.Run.ID, "--out", out)
+	if r.exitCode != 0 {
+		t.Fatalf("report exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("report wrote no file: %v", err)
+	}
+	id := recordedID(t, r.stdout)
+
+	rows := reportRows(t, db)
+	if len(rows) != 1 {
+		t.Fatalf("the registry holds %d row(s), want 1:\n%v", len(rows), rows)
+	}
+	row := rows[0]
+	if row["id"] != id {
+		t.Errorf("the command printed id %q but the row is %q", id, row["id"])
+	}
+	if row["kind"] != "run" {
+		t.Errorf("kind = %q, want run", row["kind"])
+	}
+	// The hash has to be there and has to look like a sha256, because it is
+	// the only thing that makes the row checkable later.
+	hash, _ := row["payload_hash"].(string)
+	if len(hash) != 64 {
+		t.Errorf("payload_hash = %q, want a 64-character sha256", hash)
+	}
+	// And the request has to be one a rebuild can honour, which is the failure
+	// this row is otherwise silent about.
+	if row["params_json"] != `{"run":"`+p.Run.ID+`"}` {
+		t.Errorf("params_json = %v, want the run the report was about", row["params_json"])
+	}
+	if s, _ := row["subject"].(string); s == "" {
+		t.Error("the registration recorded no subject, so a later deletion would leave it unable to say what it was about")
+	}
+	// Registering again is a second row, not an update: the two hashes side by
+	// side are the evidence that the document did or did not change between
+	// them, and collapsing them would throw that away.
+	second := runCLI(t, "report", "--db", db, "--run", p.Run.ID, "--out", filepath.Join(work, "twice.html"))
+	if second.exitCode != 0 {
+		t.Fatalf("the second report exited %d: %s", second.exitCode, second.stderr)
+	}
+	if n := countReports(t, db); n != 2 {
+		t.Errorf("the registry holds %d row(s) after two renders, want both", n)
+	}
+	if recordedID(t, second.stdout) == id {
+		t.Error("two registrations share an id, so one of them cannot be cited")
+	}
+}
+
+// TestCLIServesTheReportsItRecorded is the join, and the reason it is one test
+// rather than two.
+//
+// `report` writes a row and `serve` reads it, but either half passing its own
+// tests says nothing about the join: a registration keyed one way and a lookup
+// keyed another, or a listing whose links point at a route the server does not
+// register, both pass in isolation and break the one thing the feature is for.
+// The last of those is only checkable against a real router, so this runs a
+// real server on a real port.
+func TestCLIServesTheReportsItRecorded(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	p := runOneAnswer(t, work, db, "served")
+
+	r := runCLI(t, "report", "--db", db, "--run", p.Run.ID, "--out", filepath.Join(work, "r.html"))
+	if r.exitCode != 0 {
+		t.Fatalf("report exited %d: %s", r.exitCode, r.stderr)
+	}
+	id := recordedID(t, r.stdout)
+
+	base, stop := startServer(t, db)
+	defer stop()
+
+	listing := httpGet(t, base)
+	if !strings.Contains(listing, id) {
+		t.Errorf("the listing does not mention the recorded report %s", id)
+	}
+	// The link the listing carries has to be one the server answers, which is
+	// the part no unit test of either half can see.
+	if !strings.Contains(listing, `"href":"/r/`+id+`"`) {
+		t.Errorf("the listing carries no link to /r/%s", id)
+	}
+
+	page, status := httpGetStatus(t, base+"r/"+id)
+	if status != http.StatusOK {
+		t.Fatalf("GET /r/%s returned %d\n%s", id, status, page)
+	}
+	if !strings.Contains(page, "Recorded report.") {
+		t.Error("the served report does not say it still reproduces")
+	}
+	if !strings.Contains(page, `data-mode="run"`) {
+		t.Error("the served report did not render in the run mode")
+	}
+	if !strings.Contains(page, p.Run.Name) {
+		t.Error("the served report is not about the run it was recorded for")
+	}
+	if matches := httpHeader(t, base+"r/"+id+".json", "X-Aeval-Hash-Matches"); matches != "true" {
+		t.Errorf("the served document does not reproduce the recorded hash (X-Aeval-Hash-Matches: %q)", matches)
+	}
+
+	// A link to something that was never recorded is a page, not a status code.
+	_, missing := httpGetStatus(t, base+"r/nosuchreport")
+	if missing != http.StatusNotFound {
+		t.Errorf("GET /r/nosuchreport returned %d, want 404", missing)
+	}
+}
+
+// countReports is how many rows the registry holds, read as a client of the
+// file rather than through the code under test.
+func countReports(t *testing.T, db string) int {
+	t.Helper()
+	return len(reportRows(t, db))
+}
+
+// reportRows reads the registry straight out of the database.
+//
+// It does not go through internal/store on purpose: the assertion is about what
+// was written, and a reader that agreed with the writer by construction would
+// agree with a wrong column name too.
+func reportRows(t *testing.T, db string) []map[string]any {
+	t.Helper()
+	conn, err := sql.Open("sqlite", db)
+	if err != nil {
+		t.Fatalf("open %s: %v", db, err)
+	}
+	defer conn.Close()
+	rows, err := conn.Query(`SELECT id, kind, title, subject, params_json, payload_hash, payload_bytes,
+		data_version FROM reports ORDER BY created_at DESC`)
+	if err != nil {
+		t.Fatalf("the reports table does not exist: %v", err)
+	}
+	defer rows.Close()
+	var out []map[string]any
+	cols, _ := rows.Columns()
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]any{}
+		for i, c := range cols {
+			m[c] = vals[i]
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// recordedID reads the id a report printed. The line is the command's only
+// handle on the row, so it has to be there and has to be parseable.
+func recordedID(t *testing.T, stdout string) string {
+	t.Helper()
+	for _, line := range strings.Split(stdout, "\n") {
+		if !strings.HasPrefix(line, "recorded") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 || len(fields[1]) != 16 {
+			t.Fatalf("the recorded line is %q, want `recorded  <16 hex characters>`", line)
+		}
+		return fields[1]
+	}
+	t.Fatalf("report did not print the id it recorded:\n%s", stdout)
+	return ""
+}
+
+// startServer runs aeval serve on a port the kernel picks and returns its base
+// URL.
+//
+// Port 0 rather than a fixed one: a test that needs a specific port fails when
+// something else is already on it, and that failure says nothing about the
+// code. The address printed is the one that actually came back, which is the
+// only way to find out which port that was.
+func startServer(t *testing.T, db string) (string, func()) {
+	t.Helper()
+	cmd := exec.Command(cliPath, "serve", "--db", db, "--addr", "127.0.0.1:0")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errBuf strings.Builder
+	cmd.Stderr = &errBuf
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start serve: %v", err)
+	}
+
+	stop := func() {
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			_ = cmd.Process.Kill()
+			t.Errorf("serve did not stop on SIGINT\nstderr:\n%s", errBuf.String())
+		}
+	}
+	t.Cleanup(stop)
+
+	type firstLine struct {
+		line string
+		err  error
+	}
+	ch := make(chan firstLine, 1)
+	go func() {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		ch <- firstLine{line, err}
+	}()
+	select {
+	case fl := <-ch:
+		if fl.err != nil {
+			t.Fatalf("reading serve's output: %v\nstderr:\n%s", fl.err, errBuf.String())
+		}
+		fields := strings.Fields(fl.line)
+		if len(fields) < 2 || !strings.HasPrefix(fields[len(fields)-1], "http://") {
+			t.Fatalf("serve first printed %q, want the address it is listening on", fl.line)
+		}
+		return fields[len(fields)-1], stop
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("serve never printed an address\nstderr:\n%s", errBuf.String())
+		return "", stop
+	}
+}
+
+func httpGet(t *testing.T, url string) string {
+	t.Helper()
+	body, status := httpGetStatus(t, url)
+	if status != http.StatusOK {
+		t.Fatalf("GET %s returned %d\n%s", url, status, body)
+	}
+	return body
+}
+
+func httpGetStatus(t *testing.T, url string) (string, int) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	return string(body), resp.StatusCode
+}
+
+func httpHeader(t *testing.T, url, header string) string {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Header.Get(header)
+}
+
+// TestCLIRefusesToServeAnAddressItCannotBind covers the one startup failure a
+// person actually hits: a port already in use.
+//
+// It has to fail before anything is printed, or a script reading the address
+// gets a line about a server that is not running.
+func TestCLIRefusesToServeAnAddressItCannotBind(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	// The failure under test is about the address, not the data, but serve
+	// still has to open a real database first.
+	runOneAnswer(t, work, db, "bind-probe")
+
+	// Take a port, then ask for it.
+	busy, stopBusy := startServer(t, db)
+	defer stopBusy()
+	host := strings.TrimPrefix(busy, "http://")
+	host = strings.TrimSuffix(host, "/")
+
+	r := runCLI(t, "serve", "--db", db, "--addr", host)
+	if r.exitCode != 1 {
+		t.Fatalf("serve on a taken port exited %d, want 1\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+	if strings.Contains(r.stdout, "serving") {
+		t.Errorf("serve claimed to be up on a port it could not bind:\n%s", r.stdout)
+	}
+	if !strings.Contains(r.stderr, host) {
+		t.Errorf("the error does not name the address it could not bind:\n%s", r.stderr)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Working in the recorded repository
+// ---------------------------------------------------------------------------
+
+// gitInRepo runs git in a test repository with the developer's own configuration
+// kept out of it, so a global hook cannot decide whether these tests pass.
+func gitInRepo(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", dir, "-c", "commit.gpgsign=false",
+		"-c", "user.name=agenteval", "-c", "user.email=eval@agenteval.local"}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Env = append(os.Environ(),
+		"GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_SYSTEM="+os.DevNull,
+		"GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v in %s: %s", args, dir, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// writeInPlaceDataset writes a repository with two commits and a one-task
+// dataset bound to the first, which is the shape `collect --workspace-cwd`
+// produces for a session whose capture named a commit.
+func writeInPlaceDataset(t *testing.T, dir string) (dsPath, repo, first, second string) {
+	t.Helper()
+	repo = filepath.Join(dir, "repo")
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, repo, "init", "--quiet", "--initial-branch=main")
+	if err := os.WriteFile(filepath.Join(repo, "calc.py"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, repo, "add", "-A")
+	gitInRepo(t, repo, "commit", "--quiet", "-m", "first")
+	first = gitInRepo(t, repo, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(repo, "calc.py"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, repo, "add", "-A")
+	gitInRepo(t, repo, "commit", "--quiet", "-m", "second")
+	second = gitInRepo(t, repo, "rev-parse", "HEAD")
+
+	ds := filepath.Join(dir, "ds")
+	if err := os.MkdirAll(ds, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "name: in-place\ntasks_file: tasks.jsonl\n"
+	if err := os.WriteFile(filepath.Join(ds, "dataset.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tasks := fmt.Sprintf(
+		`{"id":"t1","prompt":"change the file","workspace":{"type":"git","repo":%q,"ref":%q},`+
+			`"output":{"type":"patch"},"limits":{"timeout_s":60},`+
+			`"graders":[{"type":"command","config":{"command":"test -f calc.py"}}]}`+"\n", repo, first)
+	if err := os.WriteFile(filepath.Join(ds, "tasks.jsonl"), []byte(tasks), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(ds, "dataset.yaml"), repo, first, second
+}
+
+// TestCLIRunsInPlaceAndPutsTheRepositoryBack is the end-to-end claim of the
+// whole mode: an agent was let into a working repository, and the repository is
+// where it was found.
+func TestCLIRunsInPlaceAndPutsTheRepositoryBack(t *testing.T) {
+	work := t.TempDir()
+	ds, repo, first, second := writeInPlaceDataset(t, work)
+	db := filepath.Join(work, "runs.db")
+	report := filepath.Join(work, "run.html")
+
+	r := runCLI(t, "run", "--dataset", ds, "--in-place",
+		"--bin", filepath.Join(agents, "good.sh"),
+		"--db", db, "--name", "inplace", "--run-id", "inplace",
+		"--report", report)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+
+	// What the run did to the repository, which is the half that cannot be
+	// undone if it is wrong.
+	if _, err := os.Stat(repo); err != nil {
+		t.Fatalf("the repository must still exist: %v", err)
+	}
+	if got := gitInRepo(t, repo, "rev-parse", "HEAD"); got != second {
+		t.Errorf("HEAD = %s, want %s: the repository was not put back", got, second)
+	}
+	if got := gitInRepo(t, repo, "rev-parse", "--abbrev-ref", "HEAD"); got != "main" {
+		t.Errorf("branch = %q, want main", got)
+	}
+	if got := gitInRepo(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("the tree is not clean: %q", got)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo, "calc.py")); err != nil || string(got) != "second\n" {
+		t.Errorf("calc.py = %q (%v), want the content the run started with", got, err)
+	}
+	// The lock is gone, so the next run is not refused by this one.
+	if _, err := os.Stat(filepath.Join(repo, ".git", "agenteval")); !os.IsNotExist(err) {
+		t.Errorf("the lock must not outlive the run: %v", err)
+	}
+
+	// And what the page says about it, because a reader who is not told will
+	// take the cells for the same experiment as a copy-based run's.
+	p := payloadFromHTML(t, report)
+	if !p.Run.InPlace {
+		t.Error("the page must say the run worked in the recorded directory")
+	}
+	cell := p.taskByID(t, "t1")
+	if cell.WorkspaceDir != repo {
+		t.Errorf("workspace_dir = %q, want %s", cell.WorkspaceDir, repo)
+	}
+	if !strings.Contains(cell.RestoreNotes, "put back") {
+		t.Errorf("restore_notes = %q, want the restore recorded", cell.RestoreNotes)
+	}
+	// The diff is still measured against the commit the task names, which is
+	// the whole reason the checkout is worth doing.
+	if !strings.Contains(cell.Diff, "calc.py") {
+		t.Errorf("the agent's change is not in the diff: %q", cell.Diff)
+	}
+	// The banner says what the run is about to do, before it does it.
+	for _, want := range []string{"in place", "puts each one back", repo} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("the banner should mention %q, got:\n%s", want, r.stderr)
+		}
+	}
+	_ = first
+}
+
+func TestCLIRefusesInPlaceWithConcurrency(t *testing.T) {
+	work := t.TempDir()
+	ds, repo, _, second := writeInPlaceDataset(t, work)
+	r := runCLI(t, "run", "--dataset", ds, "--in-place", "--concurrency", "4",
+		"--bin", filepath.Join(agents, "one-turn.sh"),
+		"--db", filepath.Join(work, "runs.db"))
+	if r.exitCode != 2 {
+		t.Errorf("in-place with four cells in flight exited %d, want the usage error 2\nstderr:\n%s",
+			r.exitCode, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "in flight") {
+		t.Errorf("the refusal must say what it cannot honour, got:\n%s", r.stderr)
+	}
+	// Nothing was touched: the refusal is before the first cell.
+	if got := gitInRepo(t, repo, "rev-parse", "HEAD"); got != second {
+		t.Errorf("a refused run moved the repository to %s", got)
+	}
+}
+
+func TestCLIInPlaceRefusesADirtyRepository(t *testing.T) {
+	// Uncommitted work is the one thing a restore cannot reconstruct, so it is
+	// refused before anything runs rather than discovered afterwards.
+	work := t.TempDir()
+	ds, repo, _, _ := writeInPlaceDataset(t, work)
+	if err := os.WriteFile(filepath.Join(repo, "calc.py"), []byte("someone's work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLI(t, "run", "--dataset", ds, "--in-place",
+		"--bin", filepath.Join(agents, "one-turn.sh"),
+		"--db", filepath.Join(work, "runs.db"))
+	if r.exitCode != 2 {
+		t.Errorf("a dirty repository exited %d, want the usage error 2\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "uncommitted changes") {
+		t.Errorf("the refusal must say what is wrong, got:\n%s", r.stderr)
+	}
+	// The uncommitted work is still there, which is the point of refusing.
+	if got, _ := os.ReadFile(filepath.Join(repo, "calc.py")); string(got) != "someone's work\n" {
+		t.Errorf("the refusal must leave the worktree alone, got %q", got)
+	}
+}
+
+func TestCLIRefusesASecondInPlaceRunOnALockedRepository(t *testing.T) {
+	// Two runs in one repository would check out over each other, and each
+	// would put back a state neither of them started from. The lock is not
+	// stolen, and the refusal carries the commands that repair a repository a
+	// killed run left behind.
+	work := t.TempDir()
+	ds, repo, _, second := writeInPlaceDataset(t, work)
+	lockDir := filepath.Join(repo, ".git", "agenteval")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lock := fmt.Sprintf(`{"repo":%q,"head":%q,"branch":"main","pid":1,`+
+		`"started_at":"2026-01-02T03:04:05Z","tool":"aeval"}`, repo, second)
+	if err := os.WriteFile(filepath.Join(lockDir, "inplace.lock"), []byte(lock), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := runCLI(t, "run", "--dataset", ds, "--in-place",
+		"--bin", filepath.Join(agents, "one-turn.sh"),
+		"--db", filepath.Join(work, "runs.db"))
+	if r.exitCode == 0 {
+		t.Fatalf("a locked repository must be refused\nstderr:\n%s", r.stderr)
+	}
+	for _, want := range []string{"update-ref refs/heads/main", "checkout --force main", "clean -ffd"} {
+		if !strings.Contains(r.stderr, want) {
+			t.Errorf("the refusal must carry the recovery command %q, got:\n%s", want, r.stderr)
+		}
+	}
+}
+
+// TestCLIOnlyWorksInPlaceWhenAsked covers the default, which is the whole
+// safety of the mode.
+//
+// `--in-place` is off unless it is asked for, and the default lives in the flag
+// registration rather than in anything a reader of the run would see. A default
+// of true would put every ordinary run inside somebody's working repository,
+// with the history readable and the tree rewritten underneath them, and the
+// only thing that would look different is a chip on a page.
+func TestCLIOnlyWorksInPlaceWhenAsked(t *testing.T) {
+	work := t.TempDir()
+	ds, repo, _, second := writeInPlaceDataset(t, work)
+	report := filepath.Join(work, "copy.html")
+
+	r := runCLI(t, "run", "--dataset", ds,
+		"--bin", filepath.Join(agents, "good.sh"),
+		"--db", filepath.Join(work, "runs.db"), "--name", "copy", "--run-id", "copy",
+		"--work-root", filepath.Join(work, "work"),
+		"--report", report)
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	p := payloadFromHTML(t, report)
+	if p.Run.InPlace {
+		t.Error("a run that did not ask for --in-place claims it worked in the recorded directory")
+	}
+	if got := p.taskByID(t, "t1").RestoreNotes; got != "" {
+		t.Errorf("a copy-based run has nothing to restore, got notes: %q", got)
+	}
+	// And the recorded repository is untouched: the agent's edit went into a
+	// copy under the work root, which is the difference the flag buys.
+	if got := gitInRepo(t, repo, "rev-parse", "HEAD"); got != second {
+		t.Errorf("HEAD = %s, want %s: an ordinary run moved the recorded repository", got, second)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo, "calc.py")); err != nil || string(got) != "second\n" {
+		t.Errorf("calc.py = %q (%v), want it untouched", got, err)
+	}
+	if got := gitInRepo(t, repo, "status", "--porcelain"); got != "" {
+		t.Errorf("the recorded repository is not clean: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "agenteval")); !os.IsNotExist(err) {
+		t.Errorf("an ordinary run must not leave an in-place lock behind: %v", err)
+	}
 }

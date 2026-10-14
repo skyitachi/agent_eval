@@ -32,14 +32,23 @@ is a new file, not a fork.
 
 ## Design stance
 
-Six decisions shape everything else. They are worth stating because they explain
-some otherwise-surprising behaviour.
+Seven decisions shape everything else. They are worth stating because they
+explain some otherwise-surprising behaviour.
 
 **A report is a function of the database, not of the process.** Two weeks later,
 from a copied `.db` on another machine, `aeval report` must reproduce the
 document that was written during the run. The renderer therefore reads only
 persisted state, and a test asserts that a report regenerated from the database
 is byte-identical to the one the run wrote.
+
+**A registration is a request, not a copy of the answer.** Recording that a
+report was rendered stores which view was asked for and the hash of what came
+out — never the HTML, and never the payload. A payload is a function of the
+database, and a stored payload is that function's *old* value: it stops being
+updated the moment the rows move while still looking like an answer. The hash is
+a claim the server re-checks on every read, which is why a served page can say
+whether it still is the document that was registered, and can say what it is
+when it is not.
 
 **An attribution is one axis at a time.** A sweep varies *either* the harness
 *or* the model *or* the skill, never two. This is enforced at load time — a level
@@ -89,6 +98,9 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" \
 
 # Browsable index plus one page per run, all openable from file://
 ./bin/aeval report --index --out-dir reports/site
+
+# Or serve the reports the commands above recorded, at http://127.0.0.1:8080
+./bin/aeval serve
 ```
 
 To evaluate the real thing instead of the demo:
@@ -106,7 +118,8 @@ export ANTHROPIC_API_KEY=...
 | `aeval validate` | Check a dataset without running anything. |
 | `aeval run` | Evaluate a dataset and record the result. |
 | `aeval matrix` | Run a sweep over one factor axis, or attribute one that already ran. |
-| `aeval report` | Render a run, a comparison, a sweep, or the whole index as HTML. |
+| `aeval report` | Render a run, a comparison, a sweep, or the whole index as HTML, and record what was rendered. |
+| `aeval serve` | Serve the recorded reports over HTTP. |
 | `aeval list` | List recorded runs, filtered by sweep or axis. |
 | `aeval version` | Print the build, schema and payload versions and the registered agents. |
 
@@ -172,7 +185,9 @@ value the engine interprets cannot live in the block it never interprets.
 is not) and `subdir`; the upstream `.git` is dropped and the baseline rebuilt, so
 an agent cannot read the fix out of the history. `setup` runs before the agent and
 is re-baselined afterwards, so installing dependencies does not count as the
-agent's change.
+agent's change. `run --in-place` works in `repo` itself instead of a copy, which
+is why it refuses `subdir`, `setup` and an explicit `keep_git_history: false` —
+see the section on it above.
 
 `graders[].weight` is a pointer, which is how `weight: 0` ("run it, do not score
 it") stays distinct from an unset weight (= 1). `required: true` fails the whole
@@ -288,6 +303,16 @@ so the task is measurable and unscorable. Grading it as a failure would invent a
 verdict; grading it as a pass would invent the opposite. Attach a grader
 explicitly with `--grader` if you have one.
 
+Every baseline also records the machine it was collected on (`machine`: a
+hashed platform identifier — `IOPlatformUUID` on macOS, `/etc/machine-id` on
+Linux, `MachineGuid` on Windows — plus host name, OS and arch for the reader).
+`run` and `matrix` compare it with the machine they run on and **refuse to
+start** (exit 2, before any run row is written) when they differ: the
+baseline's directories, repository and tools belong to that machine, and a
+replay elsewhere would be measured against an environment it is not running in.
+Replay on the collecting machine, or re-collect there. Baselines with no
+`machine` (hand-written, or collected before this) are not checked.
+
 ### How much of a session one task covers
 
 `--split` decides that, and the default is `session`: one task holding the
@@ -365,9 +390,26 @@ aeval collect --session <id>.jsonl --out datasets/mine --workspace-cwd
 ```
 
 - A directory that is a git repository **with a commit** becomes `type: git`,
-  pinned to the branch the recording was on. The commit is not recorded, so a
-  commit the recording made on that branch is in the tree the replay starts
-  from; the task's notes say so.
+  pinned to the commit the recording's session started from. That commit comes
+  out of the session-context block a recent Claude Code writes at the top of a
+  transcript, whose `Recent commits` list starts at HEAD; it is abbreviated to
+  ten hex characters there and is resolved to a full object name here.
+  - Where the capture named no commit — an older build, or a session that began
+    outside a repository — the task is pinned to the recorded **branch**
+    instead, and its notes say the replay starts from that branch as it stands
+    now.
+  - Where the capture named a commit the repository no longer holds — a rebase,
+    a force-push, a `gc` — the same fallback happens, and the notes say *that*,
+    because "the capture did not record it" and "the repository has moved on"
+    are different facts about a comparison.
+  - Where the recording started with uncommitted changes, the notes say how many
+    paths a commit cannot reproduce. The replay starts from a clean checkout of
+    the commit, which is not where the session started, and a reader who is told
+    only the commit would take it for one.
+  - A pinned commit makes the materialiser do a **full** clone rather than a
+    shallow one, since an arbitrary commit is not in a depth-1 clone. Datasets
+    collected before this change name a branch and clone shallowly; their
+    `dataset_hash` changes when they are re-collected, because the ref did.
 - Anything else — no repository, or a repository with no commits — is refused,
   naming the directory and pointing at `--workspace-repo`. Nothing is copied:
   a copy would be the directory *after* the recording finished, so if that
@@ -386,6 +428,75 @@ never reaches that path: it refuses a commit-less repository up front.
 Without the flag, an empty replay carries a note naming the recorded directory —
 so the gap is visible in the report rather than implied by an empty page, and
 `collect` prints the same thing to stderr.
+
+### Running in the recorded repository (`--in-place`)
+
+Even pinned to a commit, a replay happens in a **copy**: the tree is cloned into
+a workspace under `--work-root`, the upstream `.git` is dropped, and the agent
+sees a repository with one commit in it. `--in-place` runs the agent in the
+recorded directory itself instead:
+
+```sh
+aeval run --dataset datasets/mine/dataset.yaml --in-place
+```
+
+The agent is checked out at the commit the task names, works in the real tree,
+and the run puts the directory back when it is done — the branch, the commit and
+the tracked files it found. The point of the mode is fidelity: the agent gets
+the tree as it was, and the diff is measured against the commit the recording
+started from rather than against a copy of it.
+
+It is the one mode that touches something the harness does not own, so it is
+built the other way round from the rest of the tool: **everything it cannot undo
+is refused before the first cell.**
+
+- A repository with **uncommitted changes** is refused, naming the paths. The
+  commit comes back; the changes on top of it cannot. Commit or stash first.
+- `--concurrency` must be 1. Two cells can name the same directory, and nothing
+  in the scheduler keeps them apart; one at a time is the only arrangement in
+  which the state a cell puts back is the state it found.
+- `--keep` is refused, because this run creates no workspaces to keep.
+- A task with no repository, a remote instead of a directory, a repository path
+  relative to the dataset, a `subdir`, `setup` commands, or an explicit
+  `keep_git_history: false` is refused, each naming the task. The last is a
+  measurement-integrity refusal: the mode hands the agent the repository, so a
+  task that asked for the history to be hidden cannot be honoured here.
+- A directory that is a linked worktree, a submodule checkout, bare, or already
+  held by another run is refused.
+
+What a restore does **not** cover, and says so in the banner before the run:
+
+- Branches, tags and stashes the agent creates or moves. They are reported in
+  the cell's restore notes rather than deleted, because the harness cannot know
+  which of them the agent meant to keep.
+- Files your `.gitignore` hides. Removing them would take your `.env` or
+  `node_modules` with them, so new ones are left in place and named in the
+  notes.
+- Anything pushed to a remote. The repository's whole history is readable by the
+  agent for the whole run, and a push is not something a run can put back.
+
+Two more things worth knowing before pointing this at a repository you care
+about. The harness writes its own Claude Code transcript for that directory, so
+a later `aeval collect --cwd <dir>` will pick the replay sessions up as if they
+were your recordings. And the agent runs with `bypassPermissions` in a directory
+it can write anything into.
+
+Each repository holds a lock (`.git/agenteval/inplace.lock`) naming the commit
+and branch to return it to. A second run refuses rather than waiting, and a run
+that finds a lock left by a process that is gone prints the commands that repair
+the directory:
+
+```
+git -C <repo> update-ref refs/heads/<branch> <commit>
+git -C <repo> checkout --force <branch>
+git -C <repo> clean -ffd
+```
+
+The last command discards everything in the directory that was never committed,
+so run it only once you are sure there is nothing there you want. A restore that
+fails is recorded on the cell, rendered as a failure in the report, and returned
+as a non-zero exit — a person whose repository is at the wrong commit must not
+be told by a zero exit that everything is fine.
 
 ## Reports
 
@@ -450,6 +561,50 @@ measurement.
 None of this needed a new column: the trajectory was already stored per attempt,
 so runs recorded before the header said any of it are answered here too.
 
+### Recording what was rendered, and serving it
+
+`aeval report` also records *that* it rendered something, and this is the one
+part of a report that cannot be re-derived. The row holds the request — which
+view, of what subject, with which options, already resolved — and the SHA-256 of
+the payload. It does not hold the HTML, and it does not hold the payload. A
+payload is a function of the database; storing it beside the database would be a
+second answer to the same question, one that stops being updated the moment the
+rows move.
+
+The rows are a log, not a state. Rendering the same view twice writes two rows
+with two ids, and the pair of hashes is the evidence. Ids are random rather than
+sequential, because a numbered log invites reading the number as a version, and
+random rather than content-addressed, because the content is exactly what two
+registrations can share while still being two events.
+
+`aeval serve` lists them and rebuilds each one on demand:
+
+```sh
+aeval serve --db runs.db --addr 127.0.0.1:8080
+```
+
+`GET /` lists the recorded reports, `GET /r/<id>` rebuilds one from the database
+and renders it, and `GET /r/<id>.json` returns the same document as JSON. Every
+page carries a banner saying how the document it just rebuilt relates to the one
+that was recorded:
+
+| the banner says | when |
+| --- | --- |
+| `Recorded report.` | the rebuild produced the recorded bytes |
+| `Recorded in an older payload format.` | the row predates a format change, so the two hashes are not comparable and their disagreement says nothing about the data |
+| `This page is not the recorded document.` | the rows moved, or the code that projects them changed; the server names both causes rather than guessing which |
+
+The hash covers exactly the bytes `/r/<id>.json` returns, so a script can check
+the claim without parsing the page. The response carries it in four headers:
+`X-Aeval-Reported-Hash` and `X-Aeval-Current-Hash` (what was registered, versus
+what this read produced), `X-Aeval-Hash-Matches`, and `X-Aeval-Data-Version`. A
+registration whose run has since been deleted still answers: it says which run
+it was, and that the subject is gone.
+
+Only `aeval report` registers. The report `run` and `matrix` write alongside
+their own output is a convenience, not a registration — nobody asked for that
+view, and recording it would fill the log with views that were never requested.
+
 ## Package layout
 
 ```
@@ -463,7 +618,9 @@ internal/session/  Claude Code transcript -> tasks with baselines
 internal/runner/   scheduling, timeouts, workspace lifecycle, recording
 internal/store/    the SQLite schema, runs and attempts
 internal/attrib/   factor axes, sweep plans, paired comparison, the sign test
-internal/report/   the view model, the loader, and the HTML renderer
+internal/report/   the view model, the loader, the HTML renderer, the report registry
+internal/server/   the HTTP server that serves recorded reports
+internal/machine/  the machine identity collect stamps and replays check
 internal/llm/      the minimal client used by llm_judge
 tests/             end-to-end tests driving the built binary
 ```
@@ -504,6 +661,11 @@ Stated here rather than discovered later:
   "restore the test files before grading, so an agent that edits the tests is
   scored on its actual work" — and it has no caller, no test and no dataset
   field.
+- **The report server is read-only and unauthenticated.** `aeval serve` rebuilds
+  recorded reports from the database and serves them; there is no login, no
+  write path and no per-user view. It binds to `127.0.0.1` by default and warns
+  when told to listen anywhere else, because anyone who can reach the port can
+  read every recorded report.
 
 `docs/real-repo-eval.md` is the design for evaluating agents against a real
 repository rather than a three-file demo, and its §1 tables are kept current.

@@ -251,7 +251,9 @@
   function renderBrand() {
     var b = document.getElementById('brand');
     if (!b) return;
-    if (MODE === 'index') {
+    if (MODE === 'reports') {
+      b.innerHTML = tpl`Reports<span class="brand-sub">recorded</span>`;
+    } else if (MODE === 'index') {
       b.innerHTML = tpl`Evaluations<span class="brand-sub">run history</span>`;
     } else if (MODE === 'compare') {
       b.innerHTML = tpl`Comparison<span class="brand-sub">${P.compare ? P.compare.left_label + ' → ' + P.compare.right_label : ''}</span>`;
@@ -318,6 +320,14 @@
      * measurement. */
     if (r.chain_sessions) {
       chips.push(raw('<span class="chip mode-alert">sessions <b>chained in order</b></span>'));
+    }
+    /* And the largest difference of all: an agent that ran inside a working
+     * repository rather than in a copy. It goes beside the chained chip because
+     * it corrects the same reading -- that the cells are what they look like --
+     * and it is an alert because a reader who misses it will compare this run
+     * against a copy-based one as though the two were the same experiment. */
+    if (r.in_place) {
+      chips.push(raw('<span class="chip mode-alert">agent ran <b>in your repositories</b></span>'));
     }
     chips.push(raw(tpl`<span class="chip">started <b>${clock(r.started_at)}</b></span>`));
     chips.push(raw(tpl`<span class="chip">duration <b>${dur(r.duration_ms)}</b></span>`));
@@ -781,6 +791,15 @@
 
     if (t.error) frag.appendChild(el(tpl`<div class="notice err"><b>Error.</b> ${t.error}</div>`));
     if (t.detail) frag.appendChild(el(tpl`<div class="notice warn"><b>Partial detail.</b> ${t.detail}</div>`));
+    /* A restore that did not go cleanly is the one thing on this page that is
+     * about the reader's own machine rather than about the measurement: it means
+     * a directory they own was left in a state the run could not undo. It is
+     * rendered as an error notice rather than a field so that it cannot be
+     * missed by someone reading the card for the score. */
+    if (t.restore_notes) {
+      var restoreBad = t.restore_notes.indexOf('NOT fully put back') >= 0;
+      frag.appendChild(el(tpl`<div class="notice ${restoreBad ? 'err' : 'warn'}"><b>${restoreBad ? 'Not put back.' : 'Restored.'}</b> ${t.restore_notes}</div>`));
+    }
 
     frag.appendChild(el(tpl`
       <div class="card" style="padding:14px 16px;margin-bottom:14px">
@@ -793,6 +812,7 @@
           ['cost', money(t.cost_usd)],
           ['tokens', 'in ' + int(t.input_tokens) + ' · out ' + int(t.output_tokens) + ' · cache read ' + int(t.cache_read_tokens) + ' · cache write ' + int(t.cache_create_tokens)],
           ['turns / tools', int(t.turns) + ' turns · ' + int(t.tool_calls) + ' calls · ' + int(t.tool_errors) + ' errored'],
+          ['workspace', t.workspace_dir],
           ['tags', (t.tags || []).join(', ')]
         ])}
       </div>`));
@@ -1062,6 +1082,79 @@
     return 'report-' + name + '.html';
   }
 
+  /* ------------------------------------------------------------- reports */
+
+  /* The listing of what was *recorded*, which is not the same as what is in the
+   * database: a run appears here because somebody rendered a report about it,
+   * and that is a different claim from the run existing.
+   *
+   * Every column is a stored fact. The listing deliberately does not rebuild
+   * the payloads it lists -- that would cost a full projection per row, and a
+   * listing whose price grows with the number of reports is a listing that
+   * stops being openable. Whether one still reproduces is on the page you get
+   * by opening it, where it costs one projection and buys the reader a verdict.
+   */
+  function renderReports() {
+    var entries = P.reports || [];
+    var frag = document.createDocumentFragment();
+
+    frag.appendChild(el(tpl`
+      <div class="card runhead">
+        <div class="row1"><div>
+          <h1>${P.title || 'Recorded reports'}</h1>
+          <div class="subtitle">${entries.length} report(s) · generated ${clock(P.generated)}</div>
+        </div></div>
+      </div>`));
+
+    if (!entries.length) {
+      frag.appendChild(el('<div class="empty">Nothing has been recorded yet. <code>aeval report</code> records a row every time it renders a report, and those rows are what this page lists.</div>'));
+      return frag;
+    }
+
+    var rows = entries.map(function (e) {
+      /* older_format has to be a pill rather than part of the hash cell: it is
+       * the one flag that predicts a report will disagree with itself for a
+       * reason that has nothing to do with the data. */
+      var format = e.older_format
+        ? raw(tpl`<span class="pill warn" title="written in payload format v${e.data_version}, which this build does not produce">v${e.data_version}</span>`)
+        : raw('');
+      return raw(tpl`
+        <tr data-href="${e.href || ('/r/' + e.id)}">
+          <td class="task">${e.title || e.subject || e.id}<span class="tmeta mono-sm">${e.id}</span></td>
+          <td><span class="chip">${e.kind}</span></td>
+          <td>${e.subject || '—'}</td>
+          <td class="num nowrap">${bytes(e.bytes)}</td>
+          <td class="mono-sm" title="${e.hash}">${e.hash}</td>
+          <td class="num nowrap">${clock(e.created_at)}</td>
+          <td>${format}</td>
+        </tr>`);
+    });
+
+    var table = el(tpl`
+      <div class="section">
+        <div class="tablewrap" style="max-height:none">
+          <table>
+            <thead><tr>
+              <th class="nosort">Report</th><th class="nosort">Kind</th><th class="nosort">Subject</th>
+              <th class="nosort num">Size</th><th class="nosort">Payload sha256</th>
+              <th class="nosort num">Recorded</th><th class="nosort">Format</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>`);
+
+    table.querySelectorAll('tbody tr').forEach(function (tr) {
+      tr.addEventListener('click', function (e) {
+        if (e.target.closest('a')) return;
+        window.location.href = tr.getAttribute('data-href');
+      });
+    });
+
+    frag.appendChild(table);
+    return frag;
+  }
+
   function renderIndex() {
     var runs = P.runs || [];
     var frag = document.createDocumentFragment();
@@ -1319,7 +1412,9 @@
     root.innerHTML = '';
     root.appendChild(renderNotices());
 
-    if (MODE === 'index') {
+    if (MODE === 'reports') {
+      root.appendChild(renderReports());
+    } else if (MODE === 'index') {
       root.appendChild(renderIndex());
     } else if (MODE === 'compare') {
       root.appendChild(renderCompare());
@@ -1367,7 +1462,8 @@
       var blob = new Blob([rawPayload], { type: 'application/json' });
       var a = document.createElement('a');
       a.href = URL.createObjectURL(blob);
-      a.download = (MODE === 'index' ? 'runs' : (P.run && P.run.id) || MODE) + '.json';
+      var stem = MODE === 'index' ? 'runs' : (MODE === 'reports' ? 'reports' : (P.run && P.run.id) || MODE);
+      a.download = stem + '.json';
       document.body.appendChild(a);
       a.click();
       a.remove();

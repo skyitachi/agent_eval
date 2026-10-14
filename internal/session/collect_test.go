@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/machine"
 )
 
 func TestCollectSessionSplitEmitsOneTaskPerSession(t *testing.T) {
@@ -752,8 +753,10 @@ func TestABoundWorkspaceIsNotAlsoCalledAnEmptyReplay(t *testing.T) {
 }
 
 // TestWorkspaceCwdClonesARepositoryWithACommit: a repository can be reproduced
-// faithfully enough to be worth preferring -- the branch is what the transcript
-// records -- so it is bound as a repository.
+// faithfully enough to be worth preferring, so it is bound as a repository.
+// This capture carries no session-context block, so the branch is all there is
+// to bind to -- see TestBindCwdPrefersTheRecordedCommitOverTheBranch for the
+// case where the capture names a commit.
 func TestWorkspaceCwdClonesARepositoryWithACommit(t *testing.T) {
 	dir := t.TempDir()
 	gitIn(t, dir, "init", "--quiet")
@@ -844,5 +847,196 @@ func TestWorkspaceCwdRefusesADirectoryThatIsGone(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), s.Cwd) {
 		t.Errorf("the error must name the directory, got: %v", err)
+	}
+}
+
+// TestBindCwdPrefersTheRecordedCommitOverTheBranch is the difference between a
+// replay that starts where the session started and one that starts wherever the
+// session's branch ended up. The capture names the commit; the branch is the
+// weaker claim and is only used when the commit is gone.
+func TestBindCwdPrefersTheRecordedCommitOverTheBranch(t *testing.T) {
+	dir := t.TempDir()
+	gitIn(t, dir, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "code.py"), []byte("first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "--quiet", "-m", "first")
+	first := revParse(t, dir)
+	// A second commit on the same branch, so the branch tip is NOT the commit
+	// the session started from. That gap is the whole point of the binding.
+	if err := os.WriteFile(filepath.Join(dir, "code.py"), []byte("second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "--quiet", "-m", "second")
+
+	s := parseFixture(t)
+	s.Cwd, s.GitBranch, s.GitHead = dir, "main", first[:10]
+	s.GitStart = GitStart{Known: true}
+	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := items[0].Task.Workspace
+	if got.Ref != first {
+		t.Errorf("ref = %q, want the full sha of the commit the session started from (%s), "+
+			"not the branch tip", got.Ref, first)
+	}
+	if len(got.Ref) != 40 {
+		t.Errorf("ref = %q (%d chars), want a full object name a checkout can use", got.Ref, len(got.Ref))
+	}
+	if !strings.Contains(items[0].Baseline.Notes, "the commit the session started from") {
+		t.Errorf("the binding must say it is pinned to a commit, got: %q", items[0].Baseline.Notes)
+	}
+	if items[0].Baseline.GitHead != first[:10] {
+		t.Errorf("baseline git_head = %q, want the commit the capture recorded", items[0].Baseline.GitHead)
+	}
+}
+
+// TestBindCwdFallsBackWhenTheRecordedCommitIsGone: a commit that has been
+// rebased or collected away cannot be checked out, and the honest answer is the
+// branch plus a note that says which of the two happened.
+func TestBindCwdFallsBackWhenTheRecordedCommitIsGone(t *testing.T) {
+	dir := t.TempDir()
+	gitIn(t, dir, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "code.py"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "--quiet", "-m", "c")
+
+	s := parseFixture(t)
+	s.Cwd, s.GitBranch, s.GitHead = dir, "main", "deadbee"
+	s.GitStart = GitStart{Known: true}
+	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := items[0].Task.Workspace.Ref; got != "main" {
+		t.Errorf("ref = %q, want the branch when the recorded commit is not in the repository", got)
+	}
+	notes := items[0].Baseline.Notes
+	if !strings.Contains(notes, "no longer in this repository") {
+		t.Errorf("the note must say the commit is gone rather than that none was recorded, got: %q", notes)
+	}
+}
+
+// TestADirtyRecordingSaysTheReplayCannotStartWhereItDid: a commit is
+// reproducible and uncommitted changes are not, so a clean checkout of the
+// recorded commit is not a replay of where the session started.
+func TestADirtyRecordingSaysTheReplayCannotStartWhereItDid(t *testing.T) {
+	dir := t.TempDir()
+	gitIn(t, dir, "init", "--quiet")
+	if err := os.WriteFile(filepath.Join(dir, "code.py"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitIn(t, dir, "add", "-A")
+	gitIn(t, dir, "commit", "--quiet", "-m", "c")
+	head := revParse(t, dir)
+
+	s := parseFixture(t)
+	s.Cwd, s.GitBranch, s.GitHead = dir, "main", head[:10]
+	s.GitStart = GitStart{Known: true, Dirty: true, DirtyPaths: 4}
+	items, err := Collect([]*Session{s}, Options{WorkspaceCwd: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !items[0].Baseline.RecordedDirty {
+		t.Error("the baseline must record that the recording started dirty")
+	}
+	notes := items[0].Baseline.Notes
+	if !strings.Contains(notes, "4 uncommitted path(s)") {
+		t.Errorf("the note must say how much the commit cannot reproduce, got: %q", notes)
+	}
+	if !strings.Contains(notes, "not from where the recording started") {
+		t.Errorf("the note must not let a clean checkout pass for the starting state, got: %q", notes)
+	}
+}
+
+// TestMetadataCarriesTheCommitAndTheDirtyFlag: the task's own metadata is what a
+// person reads when they open the dataset, and "which commit" is the first
+// question a replay raises.
+func TestMetadataCarriesTheCommitAndTheDirtyFlag(t *testing.T) {
+	s := parseFixture(t)
+	s.GitBranch, s.GitHead = "main", "2d347614e9"
+	s.GitStart = GitStart{Known: true, Dirty: true, DirtyPaths: 1}
+	items, err := Collect([]*Session{s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := items[0].Task.Metadata
+	if m["git_head"] != "2d347614e9" {
+		t.Errorf("metadata git_head = %v, want the recorded commit", m["git_head"])
+	}
+	if m["git_dirty"] != true {
+		t.Errorf("metadata git_dirty = %v, want true", m["git_dirty"])
+	}
+}
+
+// revParse is the full object name of HEAD, which is what a binding has to
+// produce for a checkout to be possible.
+func revParse(t *testing.T, dir string) string {
+	t.Helper()
+	out, err := gitOut(dir, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse: %v", err)
+	}
+	return strings.TrimSpace(out)
+}
+
+// TestADirtyRecordingIsNotDescribedAsAReplayOfACommitWhenItIsNot: the note is
+// about what the replay starts from, so it belongs only on a task that starts
+// from that commit. An unbound task reproduces neither the commit nor the
+// changes on top of it, and it already carries a note saying so.
+func TestADirtyRecordingIsNotDescribedAsAReplayOfACommitWhenItIsNot(t *testing.T) {
+	s := parseFixture(t)
+	s.Cwd, s.GitHead = "/Users/someone/tmp/whatever", "2d347614e9"
+	s.GitStart = GitStart{Known: true, Dirty: true, DirtyPaths: 3}
+	items, err := Collect([]*Session{s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notes := items[0].Baseline.Notes
+	if strings.Contains(notes, "clean checkout of the recorded commit") {
+		t.Errorf("an empty-workspace replay must not be described as a checkout: %q", notes)
+	}
+	if !strings.Contains(notes, "replays in an empty workspace") {
+		t.Errorf("it still has to say what it does replay from, got: %q", notes)
+	}
+	// The fact is still recorded on the baseline: it is true of the recording
+	// whether or not this task uses it.
+	if !items[0].Baseline.RecordedDirty {
+		t.Error("the recording started dirty and the baseline must say so")
+	}
+}
+
+func TestCollectStampsTheMachineOnEveryBaseline(t *testing.T) {
+	s := parseFixture(t)
+	m := &machine.Identity{ID: "abc", Hostname: "box"}
+	items, err := Collect([]*Session{s}, Options{Split: SplitTurn, Machine: m})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) < 2 {
+		t.Fatalf("items = %d, want the fixture's two prompts", len(items))
+	}
+	for _, it := range items {
+		if it.Baseline.Machine == nil || !it.Baseline.Machine.Same(*m) {
+			t.Errorf("%s: machine = %+v, want %+v", it.Task.ID, it.Baseline.Machine, m)
+		}
+	}
+	// Each baseline owns its identity; editing one must not edit the others.
+	items[0].Baseline.Machine.ID = "edited"
+	if items[1].Baseline.Machine.ID != "abc" || m.ID != "abc" {
+		t.Error("the baselines share one identity")
+	}
+
+	none, err := Collect([]*Session{s}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if none[0].Baseline.Machine != nil {
+		t.Errorf("no machine was given, got %+v", none[0].Baseline.Machine)
 	}
 }

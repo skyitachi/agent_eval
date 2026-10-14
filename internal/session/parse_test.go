@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -411,5 +412,173 @@ func TestSourcesOnAMissingRootIsNotAnError(t *testing.T) {
 	}
 	if len(srcs) != 0 {
 		t.Errorf("sources = %d, want 0", len(srcs))
+	}
+}
+
+// gitStatusBlock renders the block the way a capture writes it, so these tests
+// parse the shape a real transcript has rather than one invented for them.
+func gitStatusBlock(status, commits []string) string {
+	var b strings.Builder
+	b.WriteString("This is the git status at the start of the conversation. " +
+		"Note that this status is a snapshot in time, and will not update during the conversation.\n\n")
+	b.WriteString("Current branch: main\n\n")
+	b.WriteString("Main branch (you will usually use this for PRs): main\n\n")
+	b.WriteString("Git user: someone\n\n")
+	b.WriteString("Status:\n")
+	if len(status) == 0 {
+		b.WriteString("(clean)\n")
+	} else {
+		b.WriteString(strings.Join(status, "\n") + "\n")
+	}
+	b.WriteString("\nRecent commits:\n")
+	b.WriteString(strings.Join(commits, "\n") + "\n")
+	return b.String()
+}
+
+// sessionContext renders one session-context attachment as a transcript line.
+func sessionContext(t *testing.T, status string) string {
+	t.Helper()
+	rec := map[string]any{
+		"type":      "attachment",
+		"uuid":      "att-1",
+		"timestamp": "2026-01-02T03:04:05.000Z",
+		"cwd":       "/work/proj",
+		"gitBranch": "main",
+		"version":   "2.1.296",
+		"attachment": map[string]any{
+			"type":    "session_context",
+			"context": map[string]any{"gitStatus": status},
+		},
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestParseReadsTheCommitTheSessionStartedFrom(t *testing.T) {
+	// The block is prose, and the commit in it is abbreviated -- seven to ten
+	// hex characters depending on the repository. It is still the only place a
+	// capture says which commit the session began at, and everything that binds
+	// a replay to a starting point depends on reading it back out.
+	stream := sessionContext(t, gitStatusBlock(nil, []string{
+		"2d347614e9 [feishu-0001]fix: metadata gc",
+		"273189125a [feishu-0001]fix: remove code",
+	})) + "\n"
+	s, err := Parse(strings.NewReader(stream))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.GitHead != "2d347614e9" {
+		t.Errorf("GitHead = %q, want the first line under Recent commits", s.GitHead)
+	}
+	if !s.GitStart.Known {
+		t.Error("a status block was present, so GitStart.Known must be true")
+	}
+	if s.GitStart.Dirty {
+		t.Error("(clean) is not dirty")
+	}
+	if s.Cwd != "/work/proj" || s.GitBranch != "main" {
+		t.Errorf("the record's own provenance was dropped: cwd=%q branch=%q", s.Cwd, s.GitBranch)
+	}
+}
+
+func TestTheFirstSessionContextWins(t *testing.T) {
+	// A resumed session appends a second block. That one describes the resume,
+	// and the state a replay has to be measured against is the one the recorded
+	// work started from.
+	first := sessionContext(t, gitStatusBlock(nil, []string{"aaaaaaaaaa first"}))
+	second := sessionContext(t, gitStatusBlock(nil, []string{"bbbbbbbbbb second"}))
+	s, err := Parse(strings.NewReader(first + "\n" + second + "\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.GitHead != "aaaaaaaaaa" {
+		t.Errorf("GitHead = %q, want the first block's commit", s.GitHead)
+	}
+}
+
+func TestASessionContextWithoutACommitIsNotAnError(t *testing.T) {
+	// A repository with no commits has no "Recent commits" section. That is a
+	// fact about the capture, not a damaged line, and the block still says the
+	// session ran in a repository.
+	block := "This is the git status at the start of the conversation.\n\n" +
+		"Current branch: main\n\nGit user: someone\n\nStatus:\n(clean)\n"
+	s, err := Parse(strings.NewReader(sessionContext(t, block) + "\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if s.GitHead != "" {
+		t.Errorf("GitHead = %q, want empty", s.GitHead)
+	}
+	if !s.GitStart.Known {
+		t.Error("the block was there, so Known must be true even with no commit in it")
+	}
+	if len(s.ParseErrors) != 0 {
+		t.Errorf("a block with no commit list is not a parse error: %v", s.ParseErrors)
+	}
+}
+
+func TestASessionContextRecordsADirtyStart(t *testing.T) {
+	// A commit cannot reproduce uncommitted changes, so the dirty half of the
+	// snapshot is what decides whether the recorded commit describes where the
+	// session started or merely the commit underneath it.
+	clean, err := Parse(strings.NewReader(
+		sessionContext(t, gitStatusBlock(nil, []string{"2d347614e9 x"})) + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clean.GitStart.Dirty {
+		t.Error("(clean) must not read as dirty")
+	}
+
+	dirty, err := Parse(strings.NewReader(sessionContext(t, gitStatusBlock(
+		[]string{"M cmd/main.go", " M internal/app.go", "?? notes/"}, []string{"2d347614e9 x"})) + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty.GitStart.Dirty {
+		t.Error("a status list must read as dirty")
+	}
+	if got := dirty.GitStart.DirtyPaths; got != 3 {
+		t.Errorf("DirtyPaths = %d, want 3", got)
+	}
+}
+
+func TestAnAttachmentWithAnUnknownShapeDoesNotFailTheLine(t *testing.T) {
+	// Attachments carry hooks, tool listings and other environment chatter, and
+	// their shapes vary by build. A context this build cannot read must not turn
+	// a line into a parse error, and must not cost the line's own provenance.
+	odd := `{"type":"attachment","uuid":"a","timestamp":"2026-01-02T03:04:05.000Z",` +
+		`"cwd":"/work/proj","gitBranch":"main","attachment":{"type":"session_context","context":"a string"}}`
+	empty := `{"type":"attachment","uuid":"b","timestamp":"2026-01-02T03:04:05.100Z","attachment":{}}`
+	other := `{"type":"attachment","uuid":"c","timestamp":"2026-01-02T03:04:05.200Z",` +
+		`"attachment":{"type":"hook_success"}}`
+	s, err := Parse(strings.NewReader(odd + "\n" + empty + "\n" + other + "\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(s.ParseErrors) != 0 {
+		t.Errorf("an unreadable attachment is not a damaged capture: %v", s.ParseErrors)
+	}
+	if s.GitHead != "" || s.GitStart.Known {
+		t.Errorf("nothing here names a commit: head=%q known=%v", s.GitHead, s.GitStart.Known)
+	}
+	if s.Cwd != "/work/proj" || s.GitBranch != "main" {
+		t.Errorf("the line's provenance was dropped: cwd=%q branch=%q", s.Cwd, s.GitBranch)
+	}
+}
+
+func TestATranscriptWithoutAnAttachmentLeavesGitHeadEmpty(t *testing.T) {
+	// Every capture written before the session-context block existed lands here,
+	// and so does one that started outside a repository. Empty is the answer,
+	// not a failure.
+	s := parseFixture(t)
+	if s.GitHead != "" {
+		t.Errorf("GitHead = %q, want empty for a capture with no session context", s.GitHead)
+	}
+	if s.GitStart.Known {
+		t.Error("no block was present, so Known must be false")
 	}
 }
