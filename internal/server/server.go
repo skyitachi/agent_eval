@@ -56,6 +56,12 @@ type Server struct {
 	// arrive at the same answer.
 	cssETag string
 	jsETag  string
+
+	// sessions is set by EnableSessions; nil serves reports only.
+	sessions *SessionOptions
+	// csrf is the token every POST must carry. It is per process, so a form
+	// rendered by an earlier server is refused rather than honoured.
+	csrf string
 }
 
 // New builds a server over a store. The store is not copied: every request
@@ -85,6 +91,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /r/{id}", s.handleReport)
 	mux.HandleFunc("GET /static/app.css", s.handleCSS)
 	mux.HandleFunc("GET /static/app.js", s.handleJS)
+	s.sessionRoutes(mux)
 	mux.HandleFunc("GET /", s.handleMissing)
 	return mux
 }

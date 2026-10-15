@@ -485,8 +485,45 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 读取算出来的那个）、`X-Aeval-Hash-Matches`，以及 `X-Aeval-Data-Version`。当某次登记对应的 run 已被  
 删掉，它照样答得出来：它说得出那是哪次 run，并说明对象已经不在了。
 
-**只有 `aeval report` 登记。** `run` 与 `matrix` 顺手写出的那份报告是便利产物、不是登记 —— 那个视图  
-没人要过，把它记进去只会让日志塞满从没被请求过的视图。
+**只有 `aeval report` 与回放按钮登记。** `run` 与 `matrix` 顺手写出的那份报告是便利产物、不是登记 ——  
+那个视图没人要过，把它记进去只会让日志塞满从没被请求过的视图。
+
+### 浏览本机会话并回放
+
+`aeval serve` 同时提供本机录下的会话：Claude Code（`~/.claude/projects`）与 Cursor（它的 `state.vscdb`）。
+
+| 路由 | 内容 |
+| --- | --- |
+| `GET /sessions` | 全部会话，最新在前，用工具自己的名字作标题（Claude Code 生成的标题、Cursor 的对话名，没有就取第一条 prompt）；可按来源或文本过滤 |
+| `GET /sessions/<source>/<id>` | 会话明细 —— 目录、分支、commit、模型、tokens、花费、每条 prompt / 回答 / 工具调用 —— 旁边是回放表单和它已有的回放 |
+| `POST /sessions/<source>/<id>/replay` | 按所选 harness、skill、model 开始一次回放 |
+| `GET /replays`、`GET /replays/<id>` | 回放状态与日志；未结束时页面自动刷新，结束后给出报告链接 |
+
+一次回放 = `collect --split turn --workspace-cwd` + `run --chain-sessions` + 登记 run 报告：每条 prompt 一个  
+任务，按顺序在同一个工作区里跑，工作区从录制所在仓库检出（目录不是仓库时从空目录起步，日志里会写明）；报告  
+像其他登记一样在 `/r/<id>` 打开。回放**一次只跑一个**，免得两个 agent 争抢机器、污染要对照的忙碌时间。服务  
+停掉时没跑完的回放，在下次启动时被标记为失败。
+
+harness 与 skill 是**命名预设**，页面只能提交名字、提交不了内容：
+
+```sh
+aeval serve --replay-config examples/replay-presets.yaml
+```
+
+harness 是 matrix 词汇里的部分 agent 块，**不许设 model 或 `plugin_dirs`**（那是另外两个选项，设了就会覆盖用  
+户的选择）。skill 目录不存在 → 启动即报错。在带 `--disable-slash-commands` 的 harness 下选 skill → 表单直  
+接拒绝（否则一个 skill 都加载不上）。model 是带建议的自由文本，按 model id 的字符规则校验后作为一个带引号  
+的参数传给 `--model`。没给预设文件时提供 `clean-room` 与 `host`（用本机自己的配置跑 Claude Code）两个  
+harness、`none` 一个 skill、CLI 默认模型。
+
+这些页面能读本机每一份转录、并以跳过权限确认的方式启动 agent，所以防护比报告页更严：
+
+- **只绑 loopback。** `--addr` 不是 loopback 就拒绝启动，除非加 `--no-sessions`（只提供报告）。
+- **不认别的主机名。** 会话路由只接受 `Host` 为 `localhost` 或 IP 字面量 —— 这是挡住 DNS rebinding 页面读转  
+  录的那一道。
+- **不接受跨站表单。** 每个 POST 都要带服务启动时生成的 token；带了 `Origin` 的必须是本服务。别的网站发  
+  不起回放。
+- **没有登录。** 本机以你的身份运行、能开 socket 的任何东西都能用这些页面。
 
 ## 包结构
 
@@ -502,7 +539,8 @@ internal/runner/   调度、超时、工作区生命周期、记录
 internal/store/    SQLite schema、runs 与 attempts
 internal/attrib/   因子轴、sweep 计划、配对比较、符号检验
 internal/report/   视图模型、加载器、HTML 渲染器、报告登记表
-internal/server/   提供已登记报告的 HTTP 服务
+internal/server/   HTTP 服务：已登记报告、本机会话、回放表单
+internal/replay/   回放预设与回放按钮背后的任务队列
 internal/machine/  collect 盖上、回放核对的机器标识
 internal/llm/      llm_judge 用的最小客户端
 tests/             驱动真实二进制的端到端测试
@@ -524,6 +562,9 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" go 
 ## 已知缺口
 
 写在这里，好过让别人日后发现：
+
+- **会话页面没有登录。** 只绑 loopback、拒绝外来主机名与跨站表单，但本机以你身份运行的任何进程都能通过  
+  它们读每一份转录、发起回放。不能接受时用 `--no-sessions`。
 
 - **只有一种 agent 实现。** Claude Code 是唯一的真驱动；注册表是那道缝，第二个驱动是一个新文件。
 - **容器后端不可达。** `internal/sandbox/docker.go` 已经写好（364 行，带 `--pids-limit`、  

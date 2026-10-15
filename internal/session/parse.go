@@ -178,6 +178,11 @@ type Session struct {
 	// ParseErrors are lines that could not be decoded. A corrupt capture stays
 	// usable; only I/O failures abort.
 	ParseErrors []string
+
+	// Title is the name the producing tool shows for the session: Claude Code's
+	// generated title, or the name of a Cursor conversation. Empty when it gave
+	// none, which a listing renders from the first prompt instead.
+	Title string
 }
 
 // Prompt is one human turn.
@@ -294,6 +299,9 @@ type rawRecord struct {
 	Snapshot *rawSnapshot `json:"snapshot"`
 
 	Attachment *rawAttachment `json:"attachment"`
+
+	// AITitle is the name Claude Code gives a session, on an "ai-title" record.
+	AITitle string `json:"aiTitle"`
 }
 
 // rawAttachment is a record about the environment rather than about the
@@ -482,6 +490,12 @@ func (s *Session) absorb(rec rawRecord, assistantAt map[string]int, modelSet map
 		}
 	case "attachment":
 		s.absorbAttachment(rec)
+	case "ai-title":
+		// Claude Code names a session after its first exchange and may rename it
+		// later; the last name is the one its own history list shows.
+		if t := strings.TrimSpace(rec.AITitle); t != "" {
+			s.Title = t
+		}
 	}
 }
 

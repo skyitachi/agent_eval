@@ -609,6 +609,7 @@ func (c *cursorDB) parseChat(composerID string) (*Session, error) {
 		Path:   c.Path,
 		Source: CursorSourceName,
 		Cwd:    data.workspaceDir(),
+		Title:  strings.TrimSpace(data.Name),
 		Turns:  []Turn{},
 	}
 	s.StartedAt = msTime(data.CreatedAt)

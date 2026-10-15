@@ -1,0 +1,264 @@
+{{- /* The session pages: the list of recorded sessions, one session's detail
+   * with its replay form, and one replay's status.
+   *
+   * They are rendered on the server rather than drawn by app.js. app.js draws
+   * a payload, and these pages are the opposite case: a form that has to work
+   * before any script runs, and text read out of transcripts that has to be
+   * escaped by the one escaper that knows the context it lands in. Every value
+   * here is a string in a text or attribute context, so html/template escapes
+   * all of it; nothing is marked safe.
+   *
+   * The only script is the refresh on a replay still running, and it is a meta
+   * tag rather than code. */ -}}
+
+{{- define "top" -}}
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{.Title}}</title>
+{{- if .Refresh}}
+<meta http-equiv="refresh" content="{{.Refresh}}">
+{{- end}}
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body data-mode="{{.Mode}}">
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/sessions">aeval<span class="brand-sub">sessions</span></a>
+    <nav class="nav">
+      <a href="/sessions"{{if eq .Mode "sessions"}} class="active"{{end}}>Sessions</a>
+      <a href="/replays"{{if eq .Mode "replays"}} class="active"{{end}}>Replays</a>
+      <a href="/">Reports</a>
+    </nav>
+  </div>
+</header>
+<main>
+{{- end -}}
+
+{{- define "bottom" -}}
+</main>
+</body>
+</html>
+{{- end -}}
+
+{{- define "status" -}}
+{{- if eq . "completed"}}<span class="pill pass">completed</span>
+{{- else if eq . "failed"}}<span class="pill fail">failed</span>
+{{- else if eq . "running"}}<span class="pill warn">running</span>
+{{- else}}<span class="pill skip">{{.}}</span>{{end -}}
+{{- end -}}
+
+{{- define "replay-rows" -}}
+<div class="tablewrap">
+<table>
+  <thead><tr>
+    <th class="nosort">Replay</th>
+    {{- if .WithSession}}<th class="nosort">Session</th>{{end}}
+    <th class="nosort">Harness</th><th class="nosort">Skills</th><th class="nosort">Model</th>
+    <th class="nosort">Status</th><th class="nosort">Started</th><th class="nosort">Report</th>
+  </tr></thead>
+  <tbody>
+  {{- range .Rows}}
+  <tr>
+    <td class="mono-sm"><a href="/replays/{{.ID}}">{{.ID}}</a></td>
+    {{- if $.WithSession}}<td><a href="/sessions/{{.Source}}/{{.SessionID}}">{{.SessionTitle}}</a></td>{{end}}
+    <td>{{.Harness}}</td><td>{{.Skill}}</td><td class="mono-sm">{{or .Model "(default)"}}</td>
+    <td>{{template "status" .Status}}</td>
+    <td class="nowrap small">{{when .CreatedAt}}</td>
+    <td>{{if .ReportID}}<a href="/r/{{.ReportID}}">open report</a>{{else}}<span class="muted">—</span>{{end}}</td>
+  </tr>
+  {{- end}}
+  </tbody>
+</table>
+</div>
+{{- end -}}
+
+{{- define "sessions" -}}
+{{template "top" .}}
+<div class="card runhead">
+  <div class="row1"><div>
+    <h1>Recorded sessions</h1>
+    <div class="subtitle">{{len .Entries}} session(s) on this machine{{if .Filter}} matching “{{.Filter}}”{{end}}.
+      Open one to read it and replay it.</div>
+  </div></div>
+  <form class="bar-actions" method="get" action="/sessions">
+    <select name="source" class="search" aria-label="Source">
+      <option value="">All sources</option>
+      <option value="claude"{{if eq .Source "claude"}} selected{{end}}>Claude Code</option>
+      <option value="cursor"{{if eq .Source "cursor"}} selected{{end}}>Cursor</option>
+    </select>
+    <input type="search" name="q" class="search" value="{{.Filter}}" placeholder="Title, directory or id" aria-label="Filter sessions">
+    <button type="submit" class="btn">Filter</button>
+  </form>
+  {{- range .Errors}}
+  <div class="notice warn mt"><b>{{.Source}} sessions could not be read.</b> {{.Message}}</div>
+  {{- end}}
+</div>
+<div class="card mt">
+{{- if .Entries}}
+<div class="tablewrap">
+<table>
+  <thead><tr>
+    <th class="nosort">Title</th><th class="nosort">Source</th><th class="nosort">Directory</th>
+    <th class="nosort">Model</th><th class="nosort">Updated</th>
+  </tr></thead>
+  <tbody>
+  {{- range .Entries}}
+  <tr>
+    <td class="task"><a href="/sessions/{{.Source}}/{{.ID}}">{{.Title}}</a><span class="tmeta mono-sm">{{.ID}}</span></td>
+    <td>{{sourceLabel .Source}}</td>
+    <td class="mono-sm">{{or .Cwd "—"}}{{if .Branch}} <span class="muted">({{.Branch}})</span>{{end}}</td>
+    <td class="mono-sm">{{or .Model "—"}}</td>
+    <td class="nowrap small">{{when .UpdatedAt}}</td>
+  </tr>
+  {{- end}}
+  </tbody>
+</table>
+</div>
+{{- if .Truncated}}<p class="muted small" style="padding:0 16px 12px">Showing the {{len .Entries}} most recent; narrow the filter to see older ones.</p>{{end}}
+{{- else}}
+<div class="empty">No sessions{{if .Filter}} match this filter{{else}} were found on this machine{{end}}.</div>
+{{- end}}
+</div>
+{{template "bottom" .}}
+{{- end -}}
+
+{{- define "session" -}}
+{{template "top" .}}
+{{- $s := .Session -}}
+<div class="card runhead">
+  <div class="row1"><div>
+    <h1>{{.Entry.Title}}</h1>
+    <div class="subtitle">{{sourceLabel .Entry.Source}} session <span class="mono-sm">{{.Entry.ID}}</span></div>
+  </div></div>
+  <div class="chips">
+    {{- if $s.Cwd}}<span class="chip">dir <b>{{$s.Cwd}}</b></span>{{end}}
+    {{- if $s.GitBranch}}<span class="chip">branch <b>{{$s.GitBranch}}</b></span>{{end}}
+    {{- if $s.GitHead}}<span class="chip">commit <b>{{short $s.GitHead}}</b></span>{{end}}
+    {{- range $s.Models}}<span class="chip">model <b>{{.}}</b></span>{{end}}
+    <span class="chip">prompts <b>{{len $s.Prompts}}</b></span>
+    <span class="chip">turns <b>{{len $s.Turns}}</b></span>
+    <span class="chip">tool calls <b>{{len $s.ToolCalls}}</b></span>
+    <span class="chip">tokens <b>{{$s.Usage.Total}}</b></span>
+    {{- if $s.CostUSD}}<span class="chip">cost <b>${{printf "%.4f" $s.CostUSD}}</b></span>{{end}}
+    {{- if $s.BusyMs}}<span class="chip">busy <b>{{ms $s.BusyMs}}</b></span>{{end}}
+    {{- if not $s.StartedAt.IsZero}}<span class="chip">started <b>{{when $s.StartedAt}}</b></span>{{end}}
+  </div>
+  {{- range $s.BaselineNotes}}<div class="notice info mt">{{.}}</div>{{end}}
+</div>
+
+<div class="grid2 mt">
+<div class="card" style="padding:16px 20px">
+  <div class="section"><h2>Replay this session</h2></div>
+  {{- if .FormError}}<div class="notice err">{{.FormError}}</div>{{end}}
+  <form method="post" action="/sessions/{{.Entry.Source}}/{{.Entry.ID}}/replay">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <dl class="kv">
+      <dt><label for="harness">Harness</label></dt>
+      <dd><select id="harness" name="harness" class="search">
+        {{- range .Presets.Harnesses}}<option value="{{.Name}}"{{if eq .Name $.Pick.Harness}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+      {{- range .Presets.Harnesses}}<div class="small muted"><b>{{.Name}}</b>: {{or .Notes (describe .Spec)}}</div>{{end}}</dd>
+      <dt><label for="skill">Skills</label></dt>
+      <dd><select id="skill" name="skill" class="search">
+        {{- range .Presets.Skills}}<option value="{{.Name}}"{{if eq .Name $.Pick.Skill}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+      {{- range .Presets.Skills}}<div class="small muted"><b>{{.Name}}</b>: {{or .Notes (join .Dirs ", ") "no skill directories"}}</div>{{end}}</dd>
+      <dt><label for="model">Model</label></dt>
+      <dd><input id="model" name="model" class="search" list="models" value="{{.Pick.Model}}" placeholder="the CLI's default" autocomplete="off" maxlength="128">
+        <datalist id="models">{{range .Models}}<option value="{{.}}">{{end}}</datalist>
+        <div class="small muted">Passed to <code>--model</code> as written. Empty uses the CLI's default.</div></dd>
+    </dl>
+    <p class="small muted">Each prompt becomes one task, run in order in one workspace{{if .Bound}} checked out from <span class="mono-sm">{{$s.Cwd}}</span>{{else}} that starts empty{{end}}.
+      The agent runs on this machine with permission prompts bypassed.</p>
+    <button type="submit" class="btn primary">Replay</button>
+  </form>
+</div>
+
+<div class="card" style="padding:16px 20px">
+  <div class="section"><h2>Replays of this session</h2></div>
+  {{- if .Replays}}{{template "replay-rows" (rows .Replays false)}}
+  {{- else}}<div class="empty">Not replayed yet.</div>{{end}}
+</div>
+</div>
+
+<div class="card mt" style="padding:16px 20px">
+  <div class="section"><h2>Conversation</h2></div>
+  {{- if .Clipped}}<div class="notice warn">Showing the first {{len .Turns}} of {{len $s.Turns}} turns.</div>{{end}}
+  <div class="timeline">
+  {{- range .Turns}}
+    {{- if eq .Role "user"}}
+    <div class="ev ev-result">
+      <div class="ev-head"><span class="who user">human</span>{{if not .At.IsZero}}<span>{{when .At}}</span>{{end}}</div>
+      <div class="bubble">{{.Text}}</div>
+    </div>
+    {{- else}}
+    <div class="ev ev-text">
+      <div class="ev-head"><span class="who assistant">assistant</span>{{if not .At.IsZero}}<span>{{when .At}}</span>{{end}}
+        {{- if .Usage}}<span>{{.Usage.Total}} tokens</span>{{end}}{{if .DurationMs}}<span>{{ms .DurationMs}}</span>{{end}}</div>
+      {{- if .Thinking}}<div class="bubble think">{{clip .Thinking 4000}}</div>{{end}}
+      {{- if .Text}}<div class="bubble">{{clip .Text 20000}}</div>{{end}}
+      {{- range .Tools}}
+      <div class="toolcard mt"><div class="th"><span class="tname">{{.Name}}</span></div>
+        {{- if .Input}}<div class="tsec"><pre class="code">{{clip (printf "%s" .Input) 6000}}</pre></div>{{end}}</div>
+      {{- end}}
+    </div>
+    {{- end}}
+  {{- end}}
+  </div>
+</div>
+{{template "bottom" .}}
+{{- end -}}
+
+{{- define "replay" -}}
+{{template "top" .}}
+{{- $r := .Replay -}}
+<div class="card runhead">
+  <div class="row1"><div>
+    <h1>Replay {{$r.ID}}</h1>
+    <div class="subtitle">of <a href="/sessions/{{$r.Source}}/{{$r.SessionID}}">{{$r.SessionTitle}}</a>
+      ({{sourceLabel $r.Source}} <span class="mono-sm">{{$r.SessionID}}</span>)</div>
+  </div>
+  <div class="runhead-actions">
+    {{- if $r.ReportID}}<a class="btn primary" href="/r/{{$r.ReportID}}">Open report</a>{{end}}
+    {{- if not $r.Finished}}
+    <form method="post" action="/replays/{{$r.ID}}/cancel"><input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit" class="btn danger">Cancel</button></form>
+    {{- end}}
+  </div></div>
+  <div class="chips">
+    <span class="chip">status {{template "status" $r.Status}}</span>
+    <span class="chip">harness <b>{{$r.Harness}}</b></span>
+    <span class="chip">skills <b>{{$r.Skill}}</b></span>
+    <span class="chip">model <b>{{or $r.Model "(default)"}}</b></span>
+    <span class="chip">asked <b>{{when $r.CreatedAt}}</b></span>
+    {{- if $r.EndedAt}}<span class="chip">ended <b>{{when (deref $r.EndedAt)}}</b></span>{{end}}
+    {{- if $r.RunID}}<span class="chip">run <b class="mono-sm">{{$r.RunID}}</b></span>{{end}}
+  </div>
+  {{- if $r.Error}}<div class="notice err mt"><b>The replay failed.</b> {{$r.Error}}</div>{{end}}
+  {{- if not $r.Finished}}<div class="notice info mt">This page refreshes every few seconds until the replay finishes. The report link appears here when it is ready.</div>{{end}}
+</div>
+<div class="card mt" style="padding:16px 20px">
+  <div class="section"><h2>Log</h2></div>
+  {{- if $r.Log}}<pre class="code nowrap">{{$r.Log}}</pre>{{else}}<div class="empty">Nothing yet.</div>{{end}}
+</div>
+<div class="card mt" style="padding:16px 20px">
+  <div class="section"><h2>Agent configuration</h2></div>
+  <pre class="code">{{.Spec}}</pre>
+</div>
+{{template "bottom" .}}
+{{- end -}}
+
+{{- define "replays" -}}
+{{template "top" .}}
+<div class="card runhead"><h1>Replays</h1>
+  <div class="subtitle">Every replay started from this server, newest first.</div></div>
+<div class="card mt">
+{{- if .Replays}}{{template "replay-rows" (rows .Replays true)}}
+{{- else}}<div class="empty">No replays yet. Open a session and press Replay.</div>{{end}}
+</div>
+{{template "bottom" .}}
+{{- end -}}

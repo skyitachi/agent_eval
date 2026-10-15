@@ -232,3 +232,49 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reports_kind    ON reports(kind, created_at DESC);
+
+-- Replays started from the web page: one row per press of the replay button.
+--
+-- A replay is a session collected into a dataset and run under the harness, the
+-- skill set and the model the person picked. The run it produced is an ordinary
+-- row in runs and the report is an ordinary row in reports; this table is what
+-- ties the three to the recording they came from, which neither of the others
+-- can say -- a run knows its dataset directory, not which transcript the
+-- dataset was collected from, and the session page has to list its replays.
+--
+-- The choices are stored as the names that were picked, beside the spec they
+-- resolved to. The names are what the person reads back; the spec is what ran,
+-- and it is kept because a preset file can be edited between two replays that
+-- carry the same name.
+CREATE TABLE IF NOT EXISTS replays (
+    id            TEXT PRIMARY KEY,
+    -- claude | cursor, and the session id inside that source.
+    source        TEXT NOT NULL DEFAULT '',
+    session_id    TEXT NOT NULL DEFAULT '',
+    -- The session's title at the time, kept because the transcript can be
+    -- deleted and the listing still has to say what was replayed.
+    session_title TEXT NOT NULL DEFAULT '',
+    harness       TEXT NOT NULL DEFAULT '',
+    skill         TEXT NOT NULL DEFAULT '',
+    model         TEXT NOT NULL DEFAULT '',
+    agent_spec_json TEXT NOT NULL DEFAULT '',
+    -- queued | running | completed | failed. A row the server finds as queued
+    -- or running when it starts belonged to a process that is gone, and is
+    -- closed as failed rather than left to look as though it is still going.
+    status        TEXT NOT NULL DEFAULT 'queued',
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
+    ended_at      TEXT,
+    dataset_dir   TEXT NOT NULL DEFAULT '',
+    -- Empty until the run row exists, and on a replay refused before it did.
+    run_id        TEXT NOT NULL DEFAULT '',
+    report_id     TEXT NOT NULL DEFAULT '',
+    error         TEXT NOT NULL DEFAULT '',
+    -- What the job printed while it ran: collection warnings, one line per
+    -- finished cell. It is the only progress a page can show for a replay
+    -- whose run row does not exist yet.
+    log           TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_replays_session ON replays(source, session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_replays_created ON replays(created_at DESC);

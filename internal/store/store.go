@@ -103,7 +103,12 @@ var schemaFS embed.FS
 // the harness does not own, which the next run over the dataset will not see.
 // An earlier row reads back as 0 and ”, which is not a gap: no build that wrote
 // those rows could work in place.
-const schemaVersion = 7
+//
+// v8 adds the replays table: the replays started from the web page, each tying
+// a recorded session to the run and the report it produced. Like v6 it adds a
+// table and changes nothing that was there, so an older database gains an
+// empty one -- no build before it could start a replay.
+const schemaVersion = 8
 
 // ErrNotFound is matched by every missing-record error. It is a sentinel, not a
 // message: the errors that match it carry their own text, which names the record
@@ -523,6 +528,7 @@ var migrations = []func(*Store) error{
 	upgradeV4ToV5,
 	upgradeV5ToV6,
 	upgradeV6ToV7,
+	upgradeV7ToV8,
 }
 
 // upgrade walks from a database's revision to this build's.
@@ -620,6 +626,11 @@ func upgradeV6ToV7(s *Store) error {
 	return s.addColumnIfMissing("attempts", "restore_notes", "TEXT NOT NULL DEFAULT ''")
 }
 
+// upgradeV7ToV8 is empty for the reason upgradeV5ToV6 is: v8 adds a table,
+// schema.sql creates it with CREATE TABLE IF NOT EXISTS before the chain is
+// walked, and repeating the DDL here would be a second definition to drift.
+func upgradeV7ToV8(s *Store) error { return nil }
+
 // addColumnIfMissing is why the steps above can be re-run: ADD COLUMN is not
 // idempotent, and a step interrupted before the version bump would otherwise
 // fail the next open with "duplicate column name" -- a message that names
@@ -684,7 +695,7 @@ func (s *Store) hasForeignTables() (bool, error) {
 	var n int
 	err := s.db.QueryRow(
 		`SELECT COUNT(*) FROM sqlite_master
-		 WHERE type='table' AND name NOT IN ('schema_meta','runs','attempts','reports','sqlite_sequence')`).Scan(&n)
+		 WHERE type='table' AND name NOT IN ('schema_meta','runs','attempts','reports','replays','sqlite_sequence')`).Scan(&n)
 	if err != nil {
 		return false, fmt.Errorf("store: inspect tables: %w", err)
 	}

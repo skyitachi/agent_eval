@@ -23,9 +23,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -3138,9 +3140,14 @@ func recordedID(t *testing.T, stdout string) string {
 // something else is already on it, and that failure says nothing about the
 // code. The address printed is the one that actually came back, which is the
 // only way to find out which port that was.
-func startServer(t *testing.T, db string) (string, func()) {
+func startServer(t *testing.T, db string, extra ...string) (string, func()) {
 	t.Helper()
-	cmd := exec.Command(cliPath, "serve", "--db", db, "--addr", "127.0.0.1:0")
+	args := []string{"serve", "--db", db, "--addr", "127.0.0.1:0"}
+	if len(extra) == 0 {
+		// The report tests have no business reading this machine's transcripts.
+		extra = []string{"--no-sessions"}
+	}
+	cmd := exec.Command(cliPath, append(args, extra...)...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -3242,7 +3249,7 @@ func TestCLIRefusesToServeAnAddressItCannotBind(t *testing.T) {
 	host := strings.TrimPrefix(busy, "http://")
 	host = strings.TrimSuffix(host, "/")
 
-	r := runCLI(t, "serve", "--db", db, "--addr", host)
+	r := runCLI(t, "serve", "--db", db, "--addr", host, "--no-sessions")
 	if r.exitCode != 1 {
 		t.Fatalf("serve on a taken port exited %d, want 1\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
 	}
@@ -3251,6 +3258,99 @@ func TestCLIRefusesToServeAnAddressItCannotBind(t *testing.T) {
 	}
 	if !strings.Contains(r.stderr, host) {
 		t.Errorf("the error does not name the address it could not bind:\n%s", r.stderr)
+	}
+}
+
+// TestCLIServesSessionsAndReplaysThemFromTheBrowser drives the whole button:
+// the built binary lists a transcript, renders its form, accepts the POST a
+// browser would send, runs the replay, and serves the report it registered.
+func TestCLIServesSessionsAndReplaysThemFromTheBrowser(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	root := filepath.Join(work, "claude-projects")
+	proj := filepath.Join(root, "-work-proj")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(repoRoot, "tests", "testdata", "session", "basic.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sid = "aaaabbbb-1111-2222-3333-444455556666"
+	if err := os.WriteFile(filepath.Join(proj, sid+".jsonl"), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	presets := filepath.Join(work, "presets.yaml")
+	if err := os.WriteFile(presets, []byte("models: [stand-in]\nharnesses:\n  - name: scripted\n"+
+		"    agent: {kind: mock, bin: "+filepath.Join(agents, "one-turn.sh")+"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	base, stop := startServer(t, db, "--claude-root", root, "--cursor-db", filepath.Join(work, "no-cursor.vscdb"),
+		"--replay-config", presets, "--replay-root", filepath.Join(work, "replays"))
+	defer stop()
+
+	if list := httpGet(t, base+"sessions"); !strings.Contains(list, "/sessions/claude/"+sid) {
+		t.Fatalf("the session list does not show the transcript:\n%s", list)
+	}
+	page := httpGet(t, base+"sessions/claude/"+sid)
+	m := regexp.MustCompile(`name="csrf" value="([0-9a-f]+)"`).FindStringSubmatch(page)
+	if m == nil {
+		t.Fatalf("the session page has no replay form:\n%s", page)
+	}
+
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.PostForm(base+"sessions/claude/"+sid+"/replay",
+		url.Values{"csrf": {m[1]}, "harness": {"scripted"}, "skill": {"none"}, "model": {"stand-in"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST replay = %d", resp.StatusCode)
+	}
+	replayURL := strings.TrimSuffix(base, "/") + resp.Header.Get("Location")
+
+	var reportID string
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		p := httpGet(t, replayURL)
+		if strings.Contains(p, `class="pill fail"`) {
+			t.Fatalf("the replay failed:\n%s", p)
+		}
+		if mm := regexp.MustCompile(`href="/r/([0-9a-f]{16})"`).FindStringSubmatch(p); mm != nil &&
+			strings.Contains(p, `class="pill pass">completed`) {
+			reportID = mm[1]
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if reportID == "" {
+		t.Fatal("the replay never finished with a report")
+	}
+	report := httpGet(t, base+"r/"+reportID)
+	if !strings.Contains(report, "Recorded report.") || !strings.Contains(report, `data-mode="run"`) {
+		t.Error("the replay's report is not served as a recorded run report")
+	}
+	if !strings.Contains(httpGet(t, base), reportID) {
+		t.Error("the report list does not include the replay's report")
+	}
+}
+
+// TestCLIServesSessionsOnLoopbackOnly: the session pages read every transcript
+// on the machine and launch agents, so they are never bound to the network.
+func TestCLIServesSessionsOnLoopbackOnly(t *testing.T) {
+	db := filepath.Join(t.TempDir(), "runs.db")
+	r := runCLI(t, "serve", "--db", db, "--addr", "0.0.0.0:0")
+	if r.exitCode != 2 || !strings.Contains(r.stderr, "loopback only") {
+		t.Fatalf("serve on 0.0.0.0 exited %d, want a usage error\n%s", r.exitCode, r.stderr)
+	}
+	if strings.Contains(r.stdout, "serving") {
+		t.Error("serve claimed to be up after refusing")
+	}
+	r = runCLI(t, "serve", "--db", db, "--no-sessions", "--replay-config", "x.yaml")
+	if r.exitCode != 2 {
+		t.Errorf("--replay-config with --no-sessions exited %d, want 2", r.exitCode)
 	}
 }
 

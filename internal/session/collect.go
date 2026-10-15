@@ -517,6 +517,20 @@ func orDash(s string) string {
 	return s
 }
 
+// Bindable reports whether --workspace-cwd can bind a recording that ran in
+// dir: the directory exists and is a repository with a commit. It is the
+// question bindCwd asks, for a caller that has to say the answer before
+// collecting.
+func Bindable(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return false
+	}
+	return hasCommit(dir)
+}
+
 // hasCommit reports whether dir is a git repository with at least one commit.
 //
 // The question decides how a directory can be reproduced, and the second half of

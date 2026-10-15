@@ -52,6 +52,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/dataset"
 	"github.com/skyitachi/agenteval/internal/machine"
+	"github.com/skyitachi/agenteval/internal/replay"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
 	"github.com/skyitachi/agenteval/internal/server"
@@ -119,7 +120,7 @@ usage: aeval <command> [flags]
   run       run a dataset against one agent
   matrix    sweep one axis, or attribute a sweep that already ran
   report    render an HTML report, comparison, attribution or run list
-  serve     serve the reports that were recorded over HTTP
+  serve     serve recorded reports, and this machine's sessions with a replay button, over HTTP
   list      list recorded runs
   version   print version and schema information
 
@@ -1923,6 +1924,12 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		addr   = fs.String("addr", "127.0.0.1:8080", "address to listen on")
 		limit  = fs.Int("limit", 200, "how many recorded reports the list shows")
 		title  = fs.String("title", "", "heading of the report list")
+
+		noSessions  = fs.Bool("no-sessions", false, "serve reports only: no session pages and no replay button")
+		presetsPath = fs.String("replay-config", "", "YAML file of the harnesses, skill sets and models a replay can pick")
+		claudeRoot  = fs.String("claude-root", "", "where Claude Code transcripts are read from (default ~/.claude/projects)")
+		cursorDB    = fs.String("cursor-db", "", "Cursor's state database (default: the platform's location)")
+		replayRoot  = fs.String("replay-root", "", "where replays keep their datasets and workspaces (default: beside the database)")
 	)
 	addCommon(fs, &common)
 	if ok, code := parse(fs, args, stderr); !ok {
@@ -1930,6 +1937,21 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	if strings.TrimSpace(*addr) == "" {
 		return usageFail(stderr, "serve: --addr may not be empty")
+	}
+	if *noSessions && (*presetsPath != "" || *claudeRoot != "" || *cursorDB != "" || *replayRoot != "") {
+		return usageFail(stderr, "serve: --replay-config, --claude-root, --cursor-db and --replay-root "+
+			"only mean something with the session pages, which --no-sessions turns off")
+	}
+	if !*noSessions {
+		// Checked before listening: the session pages serve every transcript on
+		// this machine and launch agents, and the defences against a hostile
+		// page in the user's own browser (see internal/server/sessions.go) do
+		// not cover a request from another machine.
+		if host, _, err := net.SplitHostPort(*addr); err == nil && !isLoopbackHost(host) {
+			return usageFail(stderr, "serve: the session pages read every transcript on this machine and start "+
+				"agents with permission prompts bypassed, so they are served on loopback only; %s is not. "+
+				"Bind 127.0.0.1, or pass --no-sessions to serve only the reports there", *addr)
+		}
 	}
 
 	st, err := openStore(&common)
@@ -1947,8 +1969,38 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, "serve: listen on %s: %v", *addr, err)
 	}
 
+	web := server.New(st, server.Options{Title: *title, Limit: *limit})
+	if !*noSessions {
+		presets := replay.DefaultPresets()
+		if *presetsPath != "" {
+			if presets, err = replay.LoadPresets(absFlagPath(*presetsPath)); err != nil {
+				ln.Close()
+				return usageFail(stderr, "serve: %v", err)
+			}
+		}
+		catalog := &session.Catalog{ClaudeRoot: session.DefaultRoot(), CursorDB: session.CursorDefaultDB()}
+		if *claudeRoot != "" {
+			catalog.ClaudeRoot = absFlagPath(*claudeRoot)
+		}
+		if *cursorDB != "" {
+			catalog.CursorDB = absFlagPath(*cursorDB)
+		}
+		mgr, err := replay.NewManager(replay.Config{
+			Store: st, Catalog: catalog, Presets: presets,
+			WorkRoot: absFlagPath(*replayRoot), ToolVersion: version,
+		})
+		if err != nil {
+			ln.Close()
+			return fail(stderr, "serve: %v", err)
+		}
+		defer mgr.Close()
+		if err := web.EnableSessions(server.SessionOptions{Catalog: catalog, Replays: mgr}); err != nil {
+			ln.Close()
+			return fail(stderr, "serve: %v", err)
+		}
+	}
 	srv := &http.Server{
-		Handler:           server.New(st, server.Options{Title: *title, Limit: *limit}).Handler(),
+		Handler:           web.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -1972,6 +2024,10 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		// difference between a page on this machine and one on the network.
 		fmt.Fprintln(stdout, "warning   bound to a non-loopback address: "+
 			"anything that can reach this port can read every recorded report")
+	}
+	if !*noSessions {
+		fmt.Fprintf(stdout, "sessions  %ssessions   (replays launch agents on this machine; --no-sessions turns this off)\n",
+			listenURL(ln.Addr().String()))
 	}
 	fmt.Fprintln(stdout, "press ctrl-c to stop")
 
@@ -2011,6 +2067,18 @@ func isLoopback(addr string) bool {
 	}
 	if host == "" || host == "::" || host == "0.0.0.0" {
 		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isLoopbackHost is the stricter question the session pages ask of an address
+// before anything is bound: only an explicit loopback name or address passes.
+// The wildcard ("", "0.0.0.0", "::") fails, because it listens on every
+// interface.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()

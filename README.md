@@ -601,9 +601,61 @@ what this read produced), `X-Aeval-Hash-Matches`, and `X-Aeval-Data-Version`. A
 registration whose run has since been deleted still answers: it says which run
 it was, and that the subject is gone.
 
-Only `aeval report` registers. The report `run` and `matrix` write alongside
-their own output is a convenience, not a registration — nobody asked for that
-view, and recording it would fill the log with views that were never requested.
+Only `aeval report` and the replay button register. The report `run` and
+`matrix` write alongside their own output is a convenience, not a registration —
+nobody asked for that view, and recording it would fill the log with views that
+were never requested.
+
+### Browsing this machine's sessions and replaying them
+
+`aeval serve` also serves the sessions recorded on this machine, by Claude Code
+(`~/.claude/projects`) and by Cursor (its `state.vscdb`):
+
+| route | what it is |
+| --- | --- |
+| `GET /sessions` | every session, newest first, titled by the tool's own name for it (Claude Code's generated title, Cursor's conversation name, else the first prompt); filter by source or text |
+| `GET /sessions/<source>/<id>` | the session in full — directory, branch, commit, models, tokens, cost, every prompt, answer and tool call — beside a replay form and the replays already made of it |
+| `POST /sessions/<source>/<id>/replay` | starts a replay under the picked harness, skill set and model |
+| `GET /replays`, `GET /replays/<id>` | replay status and log; the page refreshes until it finishes, then links the report |
+
+A replay is `collect --split turn --workspace-cwd` followed by `run
+--chain-sessions`, then a registered run report: each prompt becomes a task,
+the tasks run in order in one workspace checked out from the recording's
+repository (an empty one when the directory is not a repository, which the log
+says), and the report opens at `/r/<id>` like any other. Replays run one at a
+time, so two agents never contend for the machine whose busy time they are
+compared against. A replay left unfinished by a server that stopped is closed as
+failed when the next one starts.
+
+The harness and the skill set are **named presets**, not values the page sends:
+
+```sh
+aeval serve --replay-config examples/replay-presets.yaml
+```
+
+A harness is a partial agent block in the matrix vocabulary, and may not set
+the model or `plugin_dirs` — those are the other two choices, and a harness
+that set them would override the pick. A skill directory that does not exist is
+an error at startup. Picking skills under a harness that passes
+`--disable-slash-commands` is refused on the form, because the replay would load
+none of them. The model is free text with suggestions, checked against a model
+id pattern and forwarded to `--model` as one quoted word. Without a presets file
+the page offers `clean-room` and `host` (Claude Code with this machine's own
+settings), the skill set `none`, and the CLI's default model.
+
+These pages read every transcript on this machine and launch an agent with
+permission prompts bypassed, so they are guarded more strictly than the reports:
+
+- **Loopback only.** `serve` refuses a non-loopback `--addr` unless
+  `--no-sessions` is given, which serves the reports alone.
+- **No other host names.** Every session route answers only `localhost` or an IP
+  literal in `Host`, which is what stops a page whose DNS was rebound to
+  127.0.0.1 from reading the transcripts.
+- **No cross-site forms.** Every POST carries a token the server generated at
+  startup and an `Origin`, when present, of the server itself. A page on another
+  site cannot start a replay.
+- **There is no login.** Anything running as you on this machine that can open a
+  socket can use the pages.
 
 ## Package layout
 
@@ -619,7 +671,8 @@ internal/runner/   scheduling, timeouts, workspace lifecycle, recording
 internal/store/    the SQLite schema, runs and attempts
 internal/attrib/   factor axes, sweep plans, paired comparison, the sign test
 internal/report/   the view model, the loader, the HTML renderer, the report registry
-internal/server/   the HTTP server that serves recorded reports
+internal/server/   the HTTP server: recorded reports, this machine's sessions, the replay form
+internal/replay/   replay presets and the job queue behind the replay button
 internal/machine/  the machine identity collect stamps and replays check
 internal/llm/      the minimal client used by llm_judge
 tests/             end-to-end tests driving the built binary
@@ -643,6 +696,11 @@ model, no network and no credentials.
 ## Known gaps
 
 Stated here rather than discovered later:
+
+- **The session pages have no login.** They are loopback-only and refuse
+  foreign host names and cross-site forms, but any local process running as you
+  can read every transcript through them and start a replay. Pass
+  `--no-sessions` where that is not acceptable.
 
 - **Only one agent implementation.** Claude Code is the only real driver; the
   registry is the seam, and a second driver is a new file.

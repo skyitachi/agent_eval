@@ -1,0 +1,49 @@
+# What the replay button on `aeval serve` offers.
+#
+#   aeval serve --replay-config examples/replay-presets.yaml
+#
+# The page offers only what is named here. A browser picks a harness and a skill
+# set by name and cannot send their contents, so the executable, its arguments
+# and the directories handed to it stay in this file. The model is the one free
+# field, forwarded to --model as written.
+#
+# Without this file the server offers two harnesses (clean-room, host), one skill
+# set (none), and no model suggestions.
+
+# Shown as suggestions beside the model field; any model id can still be typed.
+models: [sonnet, opus, haiku]
+# Pre-filled in the field. Empty leaves it to the CLI's own default.
+default_model: sonnet
+
+# A harness is a partial agent block, in the same vocabulary as a matrix level.
+# It may not set model, fallback_model, effort or plugin_dirs: those are the
+# other two choices on the form, and a harness that set them would quietly
+# override what was picked.
+harnesses:
+  - name: clean-room
+    notes: no user hooks, memory, MCP servers, skills or CLAUDE.md
+    agent:
+      bin: claude
+
+  # Skills only load when slash commands are left on. A skill set picked under a
+  # harness that removes them is refused on the form, because the replay would
+  # load nothing and report that the skill made no difference.
+  - name: clean-with-skills
+    notes: the clean room, but with the picked skill directories loaded
+    agent:
+      bin: claude
+      isolation: {bare: true, strict_mcp_config: true, disable_slash_commands: false}
+
+  - name: host
+    notes: this machine's own settings, hooks and MCP servers
+    agent:
+      bin: claude
+      isolation: {bare: false, strict_mcp_config: false, disable_slash_commands: false}
+
+# Skill sets: directories handed to --plugin-dir, resolved against this file.
+# A directory that does not exist is an error when the server starts.
+skills:
+  - name: none
+  # - name: my-skills
+  #   notes: the team's shared skills
+  #   plugin_dirs: [../skills]

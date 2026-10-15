@@ -139,7 +139,7 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The database is built by taking today's schema and deleting what v2, v3,
-	// v4, v5, v6 and v7 added, rather than by pasting in an old DDL file: a copy
+	// v4, v5, v6, v7 and v8 added, rather than by pasting in an old DDL file: a copy
 	// of the old schema would drift from the migrations and stop testing them.
 	for _, stmt := range []string{
 		string(body),
@@ -152,6 +152,7 @@ func TestOpenUpgradesAV1Database(t *testing.T) {
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
 		`ALTER TABLE runs DROP COLUMN in_place`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','1')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id, baseline_tokens)
@@ -238,6 +239,7 @@ func TestOpenUpgradesAV2Database(t *testing.T) {
 		`ALTER TABLE attempts DROP COLUMN baseline_notes`,
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','2')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status, has_baseline, baseline_id,
@@ -328,6 +330,7 @@ func TestOpenUpgradesAV3Database(t *testing.T) {
 		string(body),
 		`ALTER TABLE runs DROP COLUMN agent_spec_json`,
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','3')`,
 		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model)
 		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet')`,
@@ -397,6 +400,7 @@ func TestOpenUpgradesAV4Database(t *testing.T) {
 	for _, stmt := range []string{
 		string(body),
 		`ALTER TABLE runs DROP COLUMN chain_sessions`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','4')`,
 		`INSERT INTO runs(id, name, status, started_at, agent_kind, agent_model, agent_spec_json)
 		 VALUES('r1','nightly','completed','2026-01-01T00:00:00Z','claude_code','sonnet',
@@ -1055,6 +1059,7 @@ func TestOpenUpgradesAV5Database(t *testing.T) {
 	for _, stmt := range []string{
 		string(body),
 		`DROP TABLE reports`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','5')`,
 		`INSERT INTO runs(id, name, status, started_at) VALUES('r1','nightly','completed','2026-01-01T00:00:00Z')`,
 	} {
@@ -1108,6 +1113,7 @@ func TestAV5DatabaseKeepsWorkingAfterTheUpgradeIsRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, stmt := range []string{string(body), `DROP TABLE reports`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','5')`} {
 		if _, err := raw.Exec(stmt); err != nil {
 			raw.Close()
@@ -1160,6 +1166,7 @@ func TestOpenUpgradesAV6Database(t *testing.T) {
 		string(body),
 		`ALTER TABLE attempts DROP COLUMN restore_notes`,
 		`ALTER TABLE runs DROP COLUMN in_place`,
+		`DROP TABLE replays`,
 		`INSERT INTO schema_meta(key, value) VALUES('version','6')`,
 		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
 		`INSERT INTO attempts(run_id, task_id, status) VALUES('r1','t1','ok')`,
