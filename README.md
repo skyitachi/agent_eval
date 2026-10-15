@@ -605,6 +605,31 @@ Only `aeval report` registers. The report `run` and `matrix` write alongside
 their own output is a convenience, not a registration — nobody asked for that
 view, and recording it would fill the log with views that were never requested.
 
+The server also browses this machine's own agent histories and re-runs them.
+`GET /sessions` lists the Claude Code and Cursor sessions recorded on this
+machine, newest first, with each session's first human prompt as its name;
+`GET /sessions/{source}/{id}` shows one — the environment it ran in, its
+prompts and its turns — and offers a replay form. Submitting it queues a
+background re-run of the session as a task set (harness and skill chosen from
+named presets, model typed in), and every replay that finishes registers a
+report like any other, openable at `/r/{id}`. `GET /replays` lists them and
+`GET /replays/{id}` follows one to its outcome.
+
+Replays run one at a time, and their presets come from a file rather than the
+form — the form never accepts a binary, a path or an MCP server, only the
+names of presets the server was started with:
+
+```sh
+aeval serve --replay-config replays.yaml
+```
+
+Without a file the form offers the two built-in harness postures (`clean-room`,
+`host`) and no skills; with a non-loopback bind the replay form is served
+disabled, for the reason under *Known gaps* below. `--no-replay` disables it
+everywhere. A queued or running replay when the server stops is marked
+`interrupted` at the next start — nothing resumes it, and a row that said
+`queued` forever would be promising work that is never coming.
+
 ## Package layout
 
 ```
@@ -666,6 +691,16 @@ Stated here rather than discovered later:
   write path and no per-user view. It binds to `127.0.0.1` by default and warns
   when told to listen anywhere else, because anyone who can reach the port can
   read every recorded report.
+- **The session and replay pages are a bigger exposure on the same port.** They
+  read this machine's own Claude Code and Cursor histories — anyone who can
+  reach the port can read every local session's content — and a submitted
+  replay launches an agent on this machine with `bypassPermissions`. The pages
+  refuse any request whose `Host` header is not a loopback name (DNS rebinding),
+  the form carries a per-process CSRF token and a same-origin check, and the
+  binding has to be loopback for the replay form to be enabled at all; but
+  there is still no authentication, and the host-and-token checks are what
+  stands between a browser on this machine and an agent run. `--no-replay`
+  serves the pages read-only.
 
 `docs/real-repo-eval.md` is the design for evaluating agents against a real
 repository rather than a three-file demo, and its §1 tables are kept current.

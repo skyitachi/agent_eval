@@ -1218,3 +1218,121 @@ func TestOpenUpgradesAV6Database(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenUpgradesAV7Database covers the replays table.
+//
+// The upgrade is empty by design -- v8 only added a table no old database has
+// rows in -- so what the test pins is the pair of half-truths an empty
+// migration could still tell: that the version was bumped (it is what stops
+// the next start from trying again) and that the table exists with the
+// columns the replay pages read and write (a missing column would fail the
+// writes below, not the upgrade).
+func TestOpenUpgradesAV7Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v7.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`DROP TABLE replays`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','7')`,
+		`INSERT INTO runs(id, status, started_at) VALUES('r1','completed','2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v7 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v7 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	if v, _ := s.existingVersion(); v != schemaVersion {
+		t.Errorf("version = %d, want %d once the upgrade has run", v, schemaVersion)
+	}
+
+	// The upgraded database takes the new rows.
+	ctx := context.Background()
+	if err := s.CreateReplay(ctx, Replay{
+		ID: "rep1", Source: "claude", SessionID: "aaaabbbb",
+		Harness: "clean-room", Skill: "none", Model: "sonnet", Split: "session",
+	}); err != nil {
+		t.Fatalf("create a replay in an upgraded database: %v", err)
+	}
+	got, err := s.GetReplay(ctx, "rep1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != ReplayQueued {
+		t.Errorf("status = %q, want the queued default", got.Status)
+	}
+}
+
+// TestRebootReplaysInterruptsUnfinishedWork pins what a start owes the rows a
+// previous process left behind: a replay is a background task of one server
+// process and nothing resumes it, so queued and running are marked
+// interrupted rather than left promising work that is never coming. Terminal
+// rows are not touched -- rewriting history is not cleanup.
+//
+// A missing check would leave an unfinished row waiting forever, which is the
+// same lie as a queue that never moves.
+func TestRebootReplaysInterruptsUnfinishedWork(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+
+	makeReplay := func(id, status string) {
+		t.Helper()
+		if err := s.CreateReplay(ctx, Replay{ID: id, Source: "claude", SessionID: "x", Status: status}); err != nil {
+			t.Fatalf("create %s as %s: %v", id, status, err)
+		}
+	}
+	// create-as-status covers queued and done; running and failed go through
+	// FinishReplay because that is the only way they exist in production.
+	makeReplay("q1", ReplayQueued)
+	makeReplay("d1", ReplayDone)
+	makeReplay("r1", ReplayQueued)
+	if err := s.FinishReplay(ctx, "r1", ReplayRunning, "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	makeReplay("f1", ReplayQueued)
+	if err := s.FinishReplay(ctx, "f1", ReplayFailed, "it failed before the stop", "", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err := s.RebootReplays(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("RebootReplays interrupted %d, want the queued and the running row", n)
+	}
+
+	for _, tc := range []struct{ id, want, why string }{
+		{"q1", ReplayInterrupted, "a queued row"},
+		{"r1", ReplayInterrupted, "a running row"},
+		{"d1", ReplayDone, "a finished row has nothing waiting"},
+		{"f1", ReplayFailed, "a failed row already ended"},
+	} {
+		got, err := s.GetReplay(ctx, tc.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != tc.want {
+			t.Errorf("%s after the reboot = %q, want %q", tc.why, got.Status, tc.want)
+		}
+	}
+
+	// A second reboot is a no-op: the interrupted rows are not unfinished
+	// work any more, and re-marking them would reset their finished_at.
+	if n, _ := s.RebootReplays(ctx); n != 0 {
+		t.Errorf("a second reboot interrupted %d, want 0", n)
+	}
+}

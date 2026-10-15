@@ -1919,10 +1919,12 @@ func safeName(id string) string {
 func cmdServe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
-		common commonFlags
-		addr   = fs.String("addr", "127.0.0.1:8080", "address to listen on")
-		limit  = fs.Int("limit", 200, "how many recorded reports the list shows")
-		title  = fs.String("title", "", "heading of the report list")
+		common       commonFlags
+		addr         = fs.String("addr", "127.0.0.1:8080", "address to listen on")
+		limit        = fs.Int("limit", 200, "how many recorded reports the list shows")
+		title        = fs.String("title", "", "heading of the report list")
+		replayConfig = fs.String("replay-config", "", "YAML file of named harness and skill presets the replay form offers")
+		noReplay     = fs.Bool("no-replay", false, "serve the session pages read-only: no replay form, no agent runs")
 	)
 	addCommon(fs, &common)
 	if ok, code := parse(fs, args, stderr); !ok {
@@ -1938,6 +1940,46 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	defer st.Close()
 
+	// A replay is a background task of one server process, so a row the last
+	// process left queued or running is work that is never coming. It is
+	// marked interrupted here rather than silently dropped, because the list
+	// is the record of what was asked for and what became of it.
+	if n, err := st.RebootReplays(context.Background()); err != nil {
+		return fail(stderr, "serve: %v", err)
+	} else if n > 0 {
+		fmt.Fprintf(stdout, "marked    %d replay(s) interrupted: they were queued by a previous server\n", n)
+	}
+
+	opts := server.Options{Title: *title, Limit: *limit, ToolVersion: version}
+	// Sessions and replays are on only when the bind is loopback: a replay
+	// launches an agent on this machine, and the session pages read its
+	// histories. Serving those to a network is a different product with the
+	// same port, so it is refused rather than warned about.
+	bindLoopback := isLoopback(*addr) && !isWildcard(*addr)
+	switch {
+	case *noReplay:
+		opts.ReplayEnabled = false
+		fmt.Fprintln(stdout, "replays   disabled by --no-replay")
+	case !bindLoopback:
+		opts.ReplayEnabled = false
+		fmt.Fprintln(stdout, "replays   disabled: the address is not loopback, and a replay launches an agent on this machine")
+	default:
+		opts.ReplayEnabled = true
+		if *replayConfig != "" {
+			presets, err := server.LoadReplayConfig(absFlagPath(*replayConfig))
+			if err != nil {
+				// Exit 2: the file was named on the command line, so this is
+				// the command line being wrong, not the environment failing.
+				return usageFail(stderr, "serve: %v", err)
+			}
+			opts.Replays = presets
+		} else {
+			opts.Replays = server.DefaultReplayPresets()
+		}
+	}
+
+	srv := server.New(st, opts)
+
 	// Listen before printing anything. The address that comes back is the one
 	// that is actually open, which is what makes `--addr 127.0.0.1:0` usable for
 	// taking a free port; and a port already in use has to fail before a line
@@ -1947,21 +1989,23 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, "serve: listen on %s: %v", *addr, err)
 	}
 
-	srv := &http.Server{
-		Handler:           server.New(st, server.Options{Title: *title, Limit: *limit}).Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
 	ctx, stop := signalContext()
 	defer stop()
+
+	httpSrv := &http.Server{
+		Handler:           srv.HandlerWithContext(ctx),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
 		<-ctx.Done()
 		// A fresh context rather than the cancelled one: Shutdown's job is to
 		// let in-flight requests finish, and a context that is already done
-		// would abort them instead.
+		// would abort them instead. The replay worker sees the same
+		// cancellation through its own context and marks an in-flight replay
+		// interrupted.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
 	fmt.Fprintf(stdout, "serving   %s\n", listenURL(ln.Addr().String()))
@@ -1975,14 +2019,29 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	fmt.Fprintln(stdout, "press ctrl-c to stop")
 
-	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fail(stderr, "serve: %v", err)
 	}
+	// Wait for the replay worker after Serve returns: the signal context is
+	// cancelled, so an in-flight replay is being stopped, and exiting now
+	// would leave it mid-write.
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelWait()
+	_ = srv.Shutdown(waitCtx)
 	fmt.Fprintln(stdout, "stopped")
 	// Stopping is how a server ends, not an interruption of work: the signal is
 	// the ordinary way to stop one, and the work -- serving -- finished. 130
 	// would make every script that kills its own server look like a failure.
 	return exitOK
+}
+
+// isWildcard reports whether an address binds every interface.
+func isWildcard(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	return host == "" || host == "::" || host == "0.0.0.0"
 }
 
 // listenURL renders a bound address as something a person can paste.

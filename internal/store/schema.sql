@@ -232,3 +232,40 @@ CREATE TABLE IF NOT EXISTS reports (
 
 CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reports_kind    ON reports(kind, created_at DESC);
+
+-- One replay: a request made from the web UI to re-run a recorded session on
+-- this machine, and what came of it.
+--
+-- What is stored is the request (which session, which named presets, which
+-- model, which collection switches) and the outcome (a run id, a report id, or
+-- an error). The presets themselves are resolved by name at execution time
+-- against the config file the server was started with -- the row names them
+-- rather than copying them, because a copied spec would still say "harness=..."
+-- after the file it came from had been edited into something else, and the row
+-- would be describing a replay that never ran.
+--
+-- error is the reason a failed or interrupted replay ended, in the words of the
+-- step that failed. It is stored rather than re-derived because the dataset and
+-- workspace of a failed replay may be gone by the time anyone reads the row.
+CREATE TABLE IF NOT EXISTS replays (
+    id         TEXT PRIMARY KEY,
+    -- claude | cursor: which local history the session was read from.
+    source     TEXT NOT NULL DEFAULT '',
+    -- The session id as the source names it (transcript uuid / composer uuid).
+    session_id TEXT NOT NULL DEFAULT '',
+    harness    TEXT NOT NULL DEFAULT '',
+    skill      TEXT NOT NULL DEFAULT '',
+    model      TEXT NOT NULL DEFAULT '',
+    -- session | turn: how the conversation was cut into tasks.
+    split      TEXT NOT NULL DEFAULT '',
+    workspace_cwd INTEGER NOT NULL DEFAULT 0,
+    -- queued | running | done | failed | interrupted.
+    status     TEXT NOT NULL DEFAULT 'queued',
+    error      TEXT NOT NULL DEFAULT '',
+    run_id     TEXT NOT NULL DEFAULT '',
+    report_id  TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_replays_created ON replays(created_at DESC);

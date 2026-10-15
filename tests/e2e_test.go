@@ -23,9 +23,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -3138,9 +3140,10 @@ func recordedID(t *testing.T, stdout string) string {
 // something else is already on it, and that failure says nothing about the
 // code. The address printed is the one that actually came back, which is the
 // only way to find out which port that was.
-func startServer(t *testing.T, db string) (string, func()) {
+func startServer(t *testing.T, db string, extraArgs ...string) (string, func()) {
 	t.Helper()
-	cmd := exec.Command(cliPath, "serve", "--db", db, "--addr", "127.0.0.1:0")
+	args := append([]string{"serve", "--db", db, "--addr", "127.0.0.1:0"}, extraArgs...)
+	cmd := exec.Command(cliPath, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -3495,4 +3498,164 @@ func TestCLIOnlyWorksInPlaceWhenAsked(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(repo, ".git", "agenteval")); !os.IsNotExist(err) {
 		t.Errorf("an ordinary run must not leave an in-place lock behind: %v", err)
 	}
+}
+
+// TestCLIServesSessionsAndReplays runs the whole web flow against the real
+// binary: browse a session, submit the replay form with the process's token,
+// wait for the background run, open the report it registered.
+//
+// Like TestCLIServesTheReportsItRecorded, this is one test because the join is
+// the feature: the form a session page renders has to carry the token the
+// POST checks and the preset names the config file holds, and none of the
+// halves can see that by passing alone.
+//
+// The harness preset is the mock agent, the way every other e2e run here
+// drives a command instead of a model -- the flow under test is the server's,
+// not an agent's judgment. The session fixture is pointed at by re-homing the
+// server's HOME, because that is where the real one finds its histories too.
+func TestCLIServesSessionsAndReplays(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+
+	// The fixture transcript sits where Claude Code puts one: under
+	// ~/.claude/projects/<dashed cwd>/<session id>.jsonl.
+	home := filepath.Join(work, "home")
+	root := filepath.Join(home, ".claude", "projects", "-work-proj")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const sessionID = "aaaabbbb-1111-2222-3333-444455556666"
+	raw, err := os.ReadFile(filepath.Join(repoRoot, "tests", "testdata", "session", "basic.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, sessionID+".jsonl"), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A replay config with one mock harness and no skills: the smallest
+	// document the form can work with, and one whose runs finish on their own.
+	cfg := filepath.Join(work, "replays.yaml")
+	if err := os.WriteFile(cfg, []byte(`
+harnesses:
+  - name: mock-harness
+    agent:
+      kind: mock
+      bin: /bin/true
+skills:
+  - name: none
+    agent: {}
+models: ["test-model"]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The server finds both histories under the user's home -- the Claude
+	// root at ~/.claude/projects, Cursor's database deeper in -- so re-homing
+	// the test's environment here re-homes the server along with it: the
+	// fixture home is the one it serves, and the machine's own histories stay
+	// unread.
+	t.Setenv("HOME", home)
+	base, stop := startServer(t, db, "--replay-config", cfg)
+	defer stop()
+
+	listing := httpGet(t, base+"sessions")
+	if !strings.Contains(listing, sessionID[:12]) {
+		t.Errorf("the session listing does not show the fixture session:\n%s", listing)
+	}
+
+	detail := httpGet(t, base+"sessions/claude/"+sessionID)
+	if !strings.Contains(detail, "name=\"csrf\"") {
+		t.Fatalf("the session page offers no replay form:\n%s", detail)
+	}
+	csrf := e2eFormValue(t, detail, "csrf")
+
+	// The POST is what a browser sends: the token of this process, the
+	// presets this config named, a model the field accepts. Redirects are not
+	// followed, because the 303's Location is the replay's id -- the one fact
+	// the rest of the test needs -- and following it would bury it in the
+	// status page's HTML.
+	form := url.Values{
+		"csrf":    {csrf},
+		"harness": {"mock-harness"},
+		"skill":   {"none"},
+		"model":   {"test-model"},
+		"split":   {"session"},
+	}
+	noRedirect := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	resp, err := noRedirect.PostForm(base+"sessions/claude/"+sessionID+"/replay", form)
+	if err != nil {
+		t.Fatalf("post the replay form: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("POST replay returned %d\n%s", resp.StatusCode, body)
+	}
+	loc := resp.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/replays/") {
+		t.Fatalf("Location = %q, want a replay status page", loc)
+	}
+	id := strings.TrimPrefix(loc, "/replays/")
+
+	// The replay is asynchronous with a single worker, so the status page is
+	// polled to a terminal state rather than asserted on directly.
+	var replayDoc string
+	var done bool
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		replayDoc = httpGet(t, base+"replays/"+id)
+		if strings.Contains(replayDoc, ">done<") || strings.Contains(replayDoc, ">failed<") || strings.Contains(replayDoc, ">interrupted<") {
+			done = true
+			break
+		}
+	}
+	if !done {
+		t.Fatalf("the replay never reached a terminal status:\n%s", replayDoc)
+	}
+	if !strings.Contains(replayDoc, ">done<") {
+		t.Fatalf("the replay did not finish:\n%s", replayDoc)
+	}
+
+	// The report the replay registered opens through the ordinary route, and
+	// the registry's hash contract holds for it like for any other.
+	reportHref := e2eHref(t, replayDoc, "/r/")
+	if reportHref == "" {
+		t.Fatalf("the replay page links no report:\n%s", replayDoc)
+	}
+	reportID := strings.TrimPrefix(reportHref, "/r/")
+	page := httpGet(t, base+reportHref)
+	if !strings.Contains(page, "Recorded report.") {
+		t.Errorf("the replay's report does not say it reproduces (X-Aeval-Hash-Matches):\n%s", page)
+	}
+
+	// And the reports listing knows about it too.
+	reports := httpGet(t, base)
+	if !strings.Contains(reports, reportID) {
+		t.Errorf("the report listing does not mention the replay's report %s", reportID)
+	}
+}
+
+// e2eFormValue pulls one input's value out of a server-rendered form, the way
+// a browser holding the page would.
+func e2eFormValue(t *testing.T, doc, name string) string {
+	t.Helper()
+	re := regexp.MustCompile(`name="` + regexp.QuoteMeta(name) + `" value="([^"]*)"`)
+	m := re.FindStringSubmatch(doc)
+	if m == nil {
+		t.Fatalf("the page has no %s field:\n%s", name, doc)
+	}
+	return m[1]
+}
+
+// e2eHref finds the first href on the page that starts with prefix.
+func e2eHref(t *testing.T, doc, prefix string) string {
+	t.Helper()
+	for _, m := range regexp.MustCompile(`href="([^"]+)"`).FindAllStringSubmatch(doc, -1) {
+		if strings.HasPrefix(m[1], prefix) {
+			return m[1]
+		}
+	}
+	return ""
 }
