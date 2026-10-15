@@ -1,0 +1,88 @@
+internal/server/server.go
+  s_33c785307764b9::t_56a67cd7403884 94
+  s_33c785307764b9::t_e6354bb8a45baa 59-64
+internal/store/schema.sql
+  s_33c785307764b9::t_853d9a64a9f152 235-280
+internal/store/replays_test.go
+  s_33c785307764b9::t_6cb8ae16f73a20 1-145
+internal/store/replays.go
+  s_33c785307764b9::t_4b42b2f5fec6e2 1-194
+internal/session/parse.go
+  s_33c785307764b9::t_4bde7e8e873e03 181-185
+  s_33c785307764b9::t_5c9f9533ebe601 493-498
+  s_33c785307764b9::t_ab0bba8d71ce2e 302-304
+internal/replay/replay_test.go
+  s_33c785307764b9::t_2037312cde6944 1-282
+internal/server/sessions_test.go
+  s_33c785307764b9::t_418fd28b254dda 67,89
+  s_33c785307764b9::t_f08c08792d7566 1-66,68-78,90-91,93-104,106-116,118-119,121-126,128-154,156-162,164-167,169-170,172-177,179-229,231-233
+  s_33c785307764b9::t_50bc55bfcaab83 79-88,92,105,117,120,127,155,163,168,171,178,230
+internal/replay/presets.go
+  s_33c785307764b9::t_9be0a236c92504 1-330
+tests/e2e_test.go
+  s_33c785307764b9::t_3540567c53af27 3252
+  s_33c785307764b9::t_72fad017463339 3264-3356
+  s_33c785307764b9::t_6a1a490d663179 3143,3145-3150
+  s_33c785307764b9::t_f4359433a92df1 26,30
+README.md
+  s_33c785307764b9::t_89498d01f11b96 700-704
+  s_33c785307764b9::t_a3f1bb60003927 604-658
+  s_33c785307764b9::t_7258c0448832b5 674-675
+examples/replay-presets.yaml
+  s_33c785307764b9::t_806aaa2385e757 1-49
+internal/store/store.go
+  s_33c785307764b9::t_179cf5892dc05a 698
+  s_33c785307764b9::t_17b1f4a6f93e51 531
+  s_33c785307764b9::t_3a5180fdd84bb7 106-111
+  s_33c785307764b9::t_6bd31e33dd1898 629-633
+internal/session/collect.go
+  s_33c785307764b9::t_3acf43959953da 520-533
+cmd/aeval/main.go
+  s_33c785307764b9::t_535dc949af5025 55
+  s_33c785307764b9::t_ee8404557abf94 2075-2086
+  s_33c785307764b9::t_8894bdd3a7409a 1927-1932,1941-1954
+  s_33c785307764b9::t_ca3e33bea98fa1 1972-2001,2003
+  s_33c785307764b9::t_49a3d45a8c321c 2028-2031
+  s_33c785307764b9::t_b9fc69140addd7 123
+internal/store/store_test.go
+  s_33c785307764b9::t_6cb8ae16f73a20 142
+  s_33c785307764b9::t_913ea2d9bd0671 155,242,333,403,1062,1116,1169
+internal/server/templates/sessions.html
+  s_33c785307764b9::t_29a7669b07606b 128-264
+  s_33c785307764b9::t_31de9fbe08c253 1-127
+internal/server/sessions.go
+  s_33c785307764b9::t_a3edf83a7481dc 370
+  s_33c785307764b9::t_49ce37da1af7f4 1-369,371-387
+README.zh-CN.md
+  s_33c785307764b9::t_7258c0448832b5 542-543
+  s_33c785307764b9::t_a6b7d6565ed630 566-568
+  s_33c785307764b9::t_cb20539e3a9323 488-526
+.workbuddy/memory/2026-10-14.md
+  s_33c785307764b9::t_b9fc69140addd7 61-71
+internal/session/cursor.go
+  s_33c785307764b9::t_a3ca8e1537e2be 612
+internal/session/catalog.go
+  s_33c785307764b9::t_c3274e0ae4c677 1-8,10-301,303-313
+  s_33c785307764b9::t_2f458bc03f6ac7 9,302
+internal/replay/manager.go
+  s_33c785307764b9::t_b52ee84363c3ea 1-177,183,190-246,253-443
+  s_33c785307764b9::t_b1b9e09966a4bf 178-182,184-189,247-252
+internal/replay/example_presets_test.go
+  s_33c785307764b9::t_7258c0448832b5 1-15
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.49-trip",
+  "base_commit_sha": "9d09af26013dd12d4a73ca7f5ab3e1e47b2c129d",
+  "prompts": {},
+  "sessions": {
+    "s_33c785307764b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "60c07568-dcf2-4058-a176-c62287d97abd",
+        "model": "claude-opus-5.5"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
