@@ -1,0 +1,21 @@
+internal/report/assets/app.css
+  s_a7a86a8a4a0bc7::t_d9886dffbfadb9 561-566
+internal/server/templates/sessions.html
+  s_a7a86a8a4a0bc7::t_a77237ba1f6321 121,154,181,188,244,248
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "14030c2a0cf8ca5fbee69b510cf49e576fe5582c",
+  "prompts": {},
+  "sessions": {
+    "s_a7a86a8a4a0bc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef0ab3b5-7efa-45d5-b59b-1e15611ebe5e",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
