@@ -29,6 +29,12 @@
 # `--out` points at; `git add -f` one deliberately if it should become an example.
 /datasets/local_claude_code/
 
+# Replays started from `aeval serve`. Without --replay-root they live beside the
+# database, i.e. the repository root by default: one directory per replay, holding
+# the dataset collected from a local session (absolute paths, machine identity,
+# real prompts) and its workspaces. Regenerable, and not for committing.
+/replays/
+
 # Reports written into the working tree by `aeval run --report` / `report` / `compare`.
 /report-*.html
 /compare.html
