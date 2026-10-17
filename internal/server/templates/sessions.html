@@ -118,7 +118,7 @@
   </tbody>
 </table>
 </div>
-{{- if .Truncated}}<p class="muted small" style="padding:0 16px 12px">Showing the {{len .Entries}} most recent; narrow the filter to see older ones.</p>{{end}}
+{{- if .Truncated}}<p class="muted small cardfoot">Showing the {{len .Entries}} most recent; narrow the filter to see older ones.</p>{{end}}
 {{- else}}
 <div class="empty">No sessions{{if .Filter}} match this filter{{else}} were found on this machine{{end}}.</div>
 {{- end}}
@@ -151,7 +151,7 @@
 </div>
 
 <div class="grid2 mt">
-<div class="card" style="padding:16px 20px">
+<div class="card pad">
   <div class="section"><h2>Replay this session</h2></div>
   {{- if .FormError}}<div class="notice err">{{.FormError}}</div>{{end}}
   <form method="post" action="/sessions/{{.Entry.Source}}/{{.Entry.ID}}/replay">
@@ -178,14 +178,14 @@
   </form>
 </div>
 
-<div class="card" style="padding:16px 20px">
+<div class="card pad">
   <div class="section"><h2>Replays of this session</h2></div>
   {{- if .Replays}}{{template "replay-rows" (rows .Replays false)}}
   {{- else}}<div class="empty">Not replayed yet.</div>{{end}}
 </div>
 </div>
 
-<div class="card mt" style="padding:16px 20px">
+<div class="card mt pad">
   <div class="section"><h2>Conversation</h2></div>
   {{- if .Clipped}}<div class="notice warn">Showing the first {{len .Turns}} of {{len $s.Turns}} turns.</div>{{end}}
   <div class="timeline">
@@ -241,11 +241,11 @@
   {{- if $r.Error}}<div class="notice err mt"><b>The replay failed.</b> {{$r.Error}}</div>{{end}}
   {{- if not $r.Finished}}<div class="notice info mt">This page refreshes every few seconds until the replay finishes. The report link appears here when it is ready.</div>{{end}}
 </div>
-<div class="card mt" style="padding:16px 20px">
+<div class="card mt pad">
   <div class="section"><h2>Log</h2></div>
   {{- if $r.Log}}<pre class="code nowrap">{{$r.Log}}</pre>{{else}}<div class="empty">Nothing yet.</div>{{end}}
 </div>
-<div class="card mt" style="padding:16px 20px">
+<div class="card mt pad">
   <div class="section"><h2>Agent configuration</h2></div>
   <pre class="code">{{.Spec}}</pre>
 </div>

@@ -558,6 +558,12 @@ pre.code.nowrap { white-space: pre; word-break: normal; }
 .small { font-size: 12px; }
 .nowrap { white-space: nowrap; }
 .mt { margin-top: 14px; }
+/* Padding for a card that holds text rather than a table. It lives here and
+ * not in a style attribute because the session pages send a CSP of
+ * default-src 'self', which blocks inline styles. */
+.pad { padding: 16px 20px; }
+/* The note under a table that fills its card. */
+.cardfoot { padding: 0 16px 12px; }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
 
