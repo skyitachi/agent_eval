@@ -1,0 +1,67 @@
+cmd/aeval/main.go
+  s_8243c3e3ff3443::t_ed69f1f2956c6d 850-890
+  s_8243c3e3ff3443::t_c116808fc95c7c 1020-1021,1023-1025
+  s_8243c3e3ff3443::t_34fbd57f409592 814-821,829,836
+README.zh-CN.md
+  s_8243c3e3ff3443::t_236b65d46533d8 265-268
+  s_8243c3e3ff3443::t_41958da8a2e240 501
+  s_8243c3e3ff3443::t_9c6eb884c0c310 504
+.gitignore
+  h_5a1c62fd74efa2 16-17
+internal/server/templates/sessions.html
+  s_8243c3e3ff3443::t_15c61e00e2db5d 261
+  s_8243c3e3ff3443::t_b19f25ec0420b6 72
+  s_8243c3e3ff3443::t_7433e25a1010e2 61
+  s_8243c3e3ff3443::t_6bcd4075bc7ea4 184
+internal/replay/replay_test.go
+  s_8243c3e3ff3443::t_6462db0e57e7b6 263-326
+cmd/aeval/main_test.go
+  s_8243c3e3ff3443::t_75bc1c2b68ed61 5-6,9
+  s_8243c3e3ff3443::t_53b4f575cfc858 143-207
+internal/session/catalog.go
+  s_8243c3e3ff3443::t_3ec5ebccde58b1 172-179
+internal/server/sessions_test.go
+  s_8243c3e3ff3443::t_fcf267ab7438b6 131-138,141-152,158-162,164-165,167-168,170
+  s_8243c3e3ff3443::t_73723cabaf034b 225-264
+  s_8243c3e3ff3443::t_106cebe8ecbfe3 139-140,153-157,163,166,169,171-173
+  s_8243c3e3ff3443::t_5fdd297f077286 27-32
+  s_8243c3e3ff3443::t_aa8c0b79262ecd 26
+docs/session-replay.md
+  s_8243c3e3ff3443::t_7709b84aae011d 31
+  s_8243c3e3ff3443::t_b000ba53d88957 26
+README.md
+  s_8243c3e3ff3443::t_1e5ad5aaf45492 300-304
+  s_8243c3e3ff3443::t_a299618d8b15e9 624
+  s_8243c3e3ff3443::t_5cb60a1ba30a9b 621
+internal/server/sessions.go
+  s_8243c3e3ff3443::t_bd5f3b0a1272a3 85-86
+  s_8243c3e3ff3443::t_af6f69b1ce7bbf 299
+internal/session/replay_test.go
+  s_8243c3e3ff3443::t_76e9be6c8cbb3b 1-19,21,26-105
+  s_8243c3e3ff3443::t_f96d27c6d6a08d 20,22-25
+internal/session/replay.go
+  s_8243c3e3ff3443::t_cf1e8cfc7f45d8 1-3,7-60,65,67-69,83
+  s_8243c3e3ff3443::t_1033f9ac6202f0 4-6
+  s_8243c3e3ff3443::t_1f1b8c806f1e53 61-64,66,70-82
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3e37304145b78fe35a8cb2171b505088b9db183c",
+  "prompts": {},
+  "humans": {
+    "h_5a1c62fd74efa2": {
+      "author": "skyitachi <skbysp@gmail.com>"
+    }
+  },
+  "sessions": {
+    "s_8243c3e3ff3443": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf4f0d40-6e60-44d2-a1ac-cc3a825d4caf",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
