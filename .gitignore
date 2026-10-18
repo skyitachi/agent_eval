@@ -13,6 +13,8 @@
 # trace of it.
 *.db-journal
 /reports/
+/collected/
+/tools/
 
 # Per-cell workspaces. `aeval run` puts them in <db dir>/workspaces, which is the
 # repository root whenever --db is left at its default. Each cell is a full copy

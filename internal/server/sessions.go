@@ -82,8 +82,8 @@ var sessionTemplates = template.Must(template.New("sessions").Funcs(template.Fun
 		return s
 	},
 	"describe": describeSpec,
-	"rows": func(r []store.Replay, withSession bool) map[string]any {
-		return map[string]any{"Rows": r, "WithSession": withSession}
+	"rows": func(r []store.Replay, withSession bool, csrf string) map[string]any {
+		return map[string]any{"Rows": r, "WithSession": withSession, "CSRF": csrf}
 	},
 }).ParseFS(sessionFS, "templates/sessions.html"))
 
@@ -296,7 +296,7 @@ func (s *Server) handleReplays(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.renderSessions(w, http.StatusOK, "replays", map[string]any{
-		"Title": "Replays", "Mode": "replays", "Replays": replays,
+		"Title": "Replays", "Mode": "replays", "Replays": replays, "CSRF": s.csrf,
 	})
 }
 

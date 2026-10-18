@@ -58,7 +58,7 @@
     <th class="nosort">Replay</th>
     {{- if .WithSession}}<th class="nosort">Session</th>{{end}}
     <th class="nosort">Harness</th><th class="nosort">Skills</th><th class="nosort">Model</th>
-    <th class="nosort">Status</th><th class="nosort">Started</th><th class="nosort">Report</th>
+    <th class="nosort">Status</th><th class="nosort">Started</th><th class="nosort">Report</th><th class="nosort">Action</th>
   </tr></thead>
   <tbody>
   {{- range .Rows}}
@@ -69,6 +69,7 @@
     <td>{{template "status" .Status}}</td>
     <td class="nowrap small">{{when .CreatedAt}}</td>
     <td>{{if .ReportID}}<a href="/r/{{.ReportID}}">open report</a>{{else}}<span class="muted">—</span>{{end}}</td>
+    <td>{{if not .Finished}}<form method="post" action="/replays/{{.ID}}/cancel"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="btn danger small">Cancel</button></form>{{else}}<span class="muted">—</span>{{end}}</td>
   </tr>
   {{- end}}
   </tbody>
@@ -180,7 +181,7 @@
 
 <div class="card pad">
   <div class="section"><h2>Replays of this session</h2></div>
-  {{- if .Replays}}{{template "replay-rows" (rows .Replays false)}}
+  {{- if .Replays}}{{template "replay-rows" (rows .Replays false .CSRF)}}
   {{- else}}<div class="empty">Not replayed yet.</div>{{end}}
 </div>
 </div>
@@ -257,7 +258,7 @@
 <div class="card runhead"><h1>Replays</h1>
   <div class="subtitle">Every replay started from this server, newest first.</div></div>
 <div class="card mt">
-{{- if .Replays}}{{template "replay-rows" (rows .Replays true)}}
+{{- if .Replays}}{{template "replay-rows" (rows .Replays true .CSRF)}}
 {{- else}}<div class="empty">No replays yet. Open a session and press Replay.</div>{{end}}
 </div>
 {{template "bottom" .}}

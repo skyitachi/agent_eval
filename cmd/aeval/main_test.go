@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/dataset"
@@ -135,5 +138,70 @@ func TestWarnUnresolvableCommandsSpeaksOnlyWhenItCanBeActedOn(t *testing.T) {
 	warnUnresolvableCommands(&buf, ordinary, cleanRoom)
 	if buf.Len() != 0 {
 		t.Errorf("prompts that invoke nothing warned:\n%s", buf.String())
+	}
+}
+
+// TestCollectLeavesOutTranscriptsAReplayWrote: a replay runs in its own
+// workspace and Claude Code records what the agent did there. That transcript
+// is the replay's output, and it is newer than the recording it came from, so
+// both `--latest` and `collect --list` used to pick the output over the
+// recording.
+func TestCollectLeavesOutTranscriptsAReplayWrote(t *testing.T) {
+	root := t.TempDir()
+	body, err := os.ReadFile("../../tests/testdata/session/basic.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		recordingID = "aaaabbbb-1111-2222-3333-444455556666"
+		producedID  = "ccccdddd-1111-2222-3333-444455556666"
+	)
+	replayCwd := "/tmp/aeval/replays/0123456789abcdef/work/run1/" + recordingID + "/s0"
+	produced := strings.ReplaceAll(string(body), `"cwd":"/work/proj"`, `"cwd":"`+replayCwd+`"`)
+	write := func(dir, id, contents string, at time.Time) {
+		t.Helper()
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, id+".jsonl")
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	write(filepath.Join(root, "-work-proj"), recordingID, string(body), now.Add(-time.Hour))
+	write(filepath.Join(root, "-tmp-aeval-replays-0123456789abcdef-work-run1-"+recordingID+"-s0"),
+		producedID, produced, now)
+
+	var stderr bytes.Buffer
+	srcs, code := collectSources(root, "", "", true, &stderr)
+	if code != exitOK {
+		t.Fatalf("--latest exited %d: %s", code, stderr.String())
+	}
+	if len(srcs) != 1 || srcs[0].SessionID != recordingID {
+		t.Fatalf("--latest picked %+v, want the recording %s", srcs, recordingID)
+	}
+
+	stderr.Reset()
+	_, code = collectSources(root, producedID, "", false, &stderr)
+	if code != exitError || !strings.Contains(stderr.String(), "written by a replay") {
+		t.Errorf("collecting a replay's output = %d: %s, want a refusal that says why", code, stderr.String())
+	}
+
+	var list, listErr bytes.Buffer
+	if code := cmdCollectList("claude", "", root, &list, &listErr); code != exitOK {
+		t.Fatalf("--list exited %d: %s", code, listErr.String())
+	}
+	if strings.Contains(list.String(), producedID) {
+		t.Errorf("--list shows a transcript a replay wrote:\n%s", list.String())
+	}
+	if !strings.Contains(list.String(), "written by replays are not listed") {
+		t.Errorf("--list does not say it left a replay's transcript out:\n%s", list.String())
+	}
+	if !strings.Contains(list.String(), recordingID) {
+		t.Errorf("--list dropped the recording too:\n%s", list.String())
 	}
 }

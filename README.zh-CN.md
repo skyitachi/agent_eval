@@ -262,6 +262,10 @@ aeval collect --latest --out datasets/mine
 aeval collect --cwd ~/code/proj --out datasets/mine
 ```
 
+回放会在自己的 workspace 里运行 agent，Claude Code 也会在那里写一份转录。那份转录是回放的  
+产物，不是录制：`collect` 不会在 `--list` 里列出它，`--latest` 也不会选中它，用 `--session`  
+显式指定会被拒绝。
+
 它产出的任务带一段 prompt、一个工作目录、一个 baseline（tokens、忙碌时间、轮次、工具调用），  
 以及**没有评分器**：转录里没有标准答案，所以这个任务是可测量但不可评分的。把它判成失败是  
 造一个判决，判成通过是造另一个。若你确实有评分依据，用 `--grader` 显式挂上去。
@@ -494,9 +498,10 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 
 | 路由 | 内容 |
 | --- | --- |
-| `GET /sessions` | 全部会话，最新在前，用工具自己的名字作标题（Claude Code 生成的标题、Cursor 的对话名，没有就取第一条 prompt）；可按来源或文本过滤 |
+| `GET /sessions` | 所有录制下来的会话，最新在前，用工具自己的名字作标题（Claude Code 生成的标题、Cursor 的对话名，没有就取第一条 prompt）；可按来源或文本过滤。回放本身产生的会话不是录制，不在这里列出 |
 | `GET /sessions/<source>/<id>` | 会话明细 —— 目录、分支、commit、模型、tokens、花费、每条 prompt / 回答 / 工具调用 —— 旁边是回放表单和它已有的回放 |
 | `POST /sessions/<source>/<id>/replay` | 按所选 harness、skill、model 开始一次回放 |
+| `POST /replays/<id>/cancel` | 终止排队中或正在运行的回放；运行中的会杀掉 agent 进程，并记为失败、原因 `cancelled` |
 | `GET /replays`、`GET /replays/<id>` | 回放状态与日志；未结束时页面自动刷新，结束后给出报告链接 |
 
 一次回放 = `collect --split turn --workspace-cwd` + `run --chain-sessions` + 登记 run 报告：每条 prompt 一个  

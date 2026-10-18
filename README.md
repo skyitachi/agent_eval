@@ -297,6 +297,11 @@ aeval collect --latest --out datasets/mine
 aeval collect --cwd ~/code/proj --out datasets/mine
 ```
 
+A replay runs the agent in a workspace of its own, and Claude Code records a
+transcript there too. That transcript is the replay's output, not a recording:
+`collect` leaves it out of `--list` and never picks it for `--latest`, and
+naming one with `--session` is refused.
+
 The tasks it emits have a prompt, a working directory, a baseline (tokens, busy
 time, turns, tool calls) and **no grader**: a transcript carries no ground truth,
 so the task is measurable and unscorable. Grading it as a failure would invent a
@@ -613,9 +618,10 @@ were never requested.
 
 | route | what it is |
 | --- | --- |
-| `GET /sessions` | every session, newest first, titled by the tool's own name for it (Claude Code's generated title, Cursor's conversation name, else the first prompt); filter by source or text |
+| `GET /sessions` | every recorded session, newest first, titled by the tool's own name for it (Claude Code's generated title, Cursor's conversation name, else the first prompt); filter by source or text. Transcripts a replay produced are not recordings, so they are left out |
 | `GET /sessions/<source>/<id>` | the session in full — directory, branch, commit, models, tokens, cost, every prompt, answer and tool call — beside a replay form and the replays already made of it |
 | `POST /sessions/<source>/<id>/replay` | starts a replay under the picked harness, skill set and model |
+| `POST /replays/<id>/cancel` | terminates a queued or running replay; a running one has its agent process killed and is recorded as failed with `cancelled` |
 | `GET /replays`, `GET /replays/<id>` | replay status and log; the page refreshes until it finishes, then links the report |
 
 A replay is `collect --split turn --workspace-cwd` followed by `run

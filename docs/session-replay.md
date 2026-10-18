@@ -23,11 +23,12 @@
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
-| GET | `/sessions` | 会话列表，Claude 与 Cursor 合并，按最近修改时间倒序，分页 |
+| GET | `/sessions` | 会话列表，Claude 与 Cursor 合并，按最近修改时间倒序，分页。回放本身产生的会话（工作区在回放根目录下）不列出 |
 | GET | `/sessions/{source}/{id}` | 会话明细和回放表单（`source` = `claude` 或 `cursor`） |
 | POST | `/sessions/{source}/{id}/replay` | 提交回放，返回 303 跳到 `/replays/{rid}` |
 | GET | `/replays` | 回放任务列表 |
 | GET | `/replays/{rid}` | 单个任务的状态。运行中用 meta refresh 跟进；完成后链接到 `/r/{reportId}` 和对应 run；失败时显示原因 |
+| POST | `/replays/{rid}/cancel` | 终止排队中或运行中的回放（列表和详情页都有按钮）；运行中的会取消 ctx，杀掉 agent 进程树 |
 
 已有的 `/`、`/r/{id}`、`/static/*` 保持不变，导航栏加上「Sessions」和「Replays」。
 

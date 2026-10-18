@@ -169,6 +169,14 @@ func (c *Catalog) claudeEntries() ([]Entry, error) {
 			h = cachedHead{size: src.Size, mtime: src.ModTime, head: head}
 			c.heads[src.Path] = h
 		}
+		if IsReplayWorkspace(h.head.cwd) {
+			// A replay is running its own copy of a recording in a workspace
+			// it owns. Its transcript is the replay's output, not another
+			// recording to offer back: listing it would invite replaying a
+			// replay, and its "prompt" would be the replay's input, not a
+			// request anyone typed in that directory.
+			continue
+		}
 		if h.head.firstPrompt == "" && h.head.title == "" {
 			// Machine-driven: an `aeval run` attempt, a hook, an SDK call.
 			// There is no human request in it to replay.

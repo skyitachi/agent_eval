@@ -24,8 +24,14 @@ const fixtureSession = "aaaabbbb-1111-2222-3333-444455556666"
 // one-turn stand-in so a replay finishes without a model.
 func sessionServer(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
+	return sessionServerAt(t, t.TempDir())
+}
+
+// sessionServerAt is sessionServer over a caller's transcript root, so a test
+// can put more transcripts beside the fixture before the server starts.
+func sessionServerAt(t *testing.T, root string) (http.Handler, *store.Store) {
+	t.Helper()
 	st := newStore(t)
-	root := t.TempDir()
 	body, err := os.ReadFile(sessionFixture)
 	if err != nil {
 		t.Fatal(err)
@@ -122,6 +128,49 @@ func TestTheSessionListAndDetailShowTheTranscript(t *testing.T) {
 	}
 }
 
+// TestTheSessionListDoesNotOfferTheOutputOfAReplay: a replay runs the agent in
+// a workspace of its own, and Claude Code records a transcript for that
+// workspace. It carries the replayed prompt, so it looks like a session with a
+// human request; it is the result of a replay, not another recording to offer.
+func TestTheSessionListDoesNotOfferTheOutputOfAReplay(t *testing.T) {
+	root := t.TempDir()
+	body, err := os.ReadFile(sessionFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const producedID = "ccccdddd-1111-2222-3333-444455556666"
+	replayCwd := "/tmp/aeval/replays/0123456789abcdef/work/run1/" + fixtureSession + "/s0"
+	produced := strings.ReplaceAll(string(body), `"cwd":"/work/proj"`, `"cwd":"`+replayCwd+`"`)
+	dir := filepath.Join(root, "-tmp-aeval-replays-0123456789abcdef-work-run1-"+fixtureSession+"-s0")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, producedID+".jsonl"), []byte(produced), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	h, _ := sessionServerAt(t, root)
+	list := getLocal(t, h, "/sessions")
+	if list.Code != http.StatusOK {
+		t.Fatalf("GET /sessions = %d\n%s", list.Code, list.Body)
+	}
+	page := list.Body.String()
+	if strings.Contains(page, producedID) {
+		t.Errorf("the list offers a transcript a replay produced:\n%s", page)
+	}
+	if !strings.Contains(page, "/sessions/claude/"+fixtureSession) {
+		t.Errorf("the recording beside it is missing:\n%s", page)
+	}
+	if rec := getLocal(t, h, "/sessions/claude/"+producedID); rec.Code != http.StatusNotFound {
+		t.Errorf("a replay's own transcript opened as a session page = %d, want 404", rec.Code)
+	}
+	// A replay of a real session still starts: only the replay's output is
+	// filtered, not the recording that was replayed.
+	if rec := getLocal(t, h, "/sessions/claude/"+fixtureSession); rec.Code != http.StatusOK {
+		t.Errorf("the recorded session's page = %d, want 200", rec.Code)
+	}
+}
+
 func TestTheReplayButtonRunsAReplayAndLinksItsReport(t *testing.T) {
 	h, st := sessionServer(t)
 	detail := getLocal(t, h, "/sessions/claude/"+fixtureSession).Body.String()
@@ -170,6 +219,46 @@ func TestTheReplayButtonRunsAReplayAndLinksItsReport(t *testing.T) {
 	}
 	if !strings.Contains(getLocal(t, h, "/replays").Body.String(), "/replays/"+id) {
 		t.Error("the replay list does not list it")
+	}
+}
+
+func TestAReplayCanBeCancelledFromTheList(t *testing.T) {
+	h, st := sessionServer(t)
+	ctx := context.Background()
+	if err := st.CreateReplay(ctx, store.Replay{
+		ID: "waiting", Source: "claude", SessionID: fixtureSession,
+		SessionTitle: "fixture", Status: store.ReplayQueued,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list := getLocal(t, h, "/replays")
+	if list.Code != http.StatusOK {
+		t.Fatalf("GET /replays = %d\n%s", list.Code, list.Body)
+	}
+	page := list.Body.String()
+	if !strings.Contains(page, `action="/replays/waiting/cancel"`) {
+		t.Fatalf("an unfinished replay in the list offers no way to cancel it:\n%s", page)
+	}
+	m := csrfField.FindStringSubmatch(page)
+	if m == nil {
+		t.Fatal("the replay list carries no CSRF token")
+	}
+	rec := post(h, "/replays/waiting/cancel", url.Values{"csrf": {m[1]}}, nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("POST cancel = %d\n%s", rec.Code, rec.Body)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/replays/waiting" {
+		t.Errorf("redirected to %q, want /replays/waiting", loc)
+	}
+	got, err := st.GetReplay(ctx, "waiting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.ReplayFailed || got.Error == "" {
+		t.Errorf("the cancelled replay = %+v, want failed with a reason", got)
+	}
+	if strings.Contains(getLocal(t, h, "/replays").Body.String(), `action="/replays/waiting/cancel"`) {
+		t.Error("a finished replay must not offer to be cancelled again")
 	}
 }
 

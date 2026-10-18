@@ -811,6 +811,14 @@ func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) (
 			fail(stderr, "collect: %v", err)
 			return nil, exitError
 		}
+		if produced, err := session.IsReplayTranscript(src.Path); err != nil {
+			fail(stderr, "collect: read %s: %v", src.Path, err)
+			return nil, exitError
+		} else if produced {
+			fail(stderr, "collect: %s was written by a replay, so it is a result and not a "+
+				"recording to collect; pick the session that was replayed instead", src.SessionID)
+			return nil, exitError
+		}
 		return []session.Source{src}, exitOK
 	case cwd != "":
 		srcs, err := session.SourcesForCwd(root, absFlagPath(cwd))
@@ -818,13 +826,14 @@ func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) (
 			fail(stderr, "collect: %v", err)
 			return nil, exitError
 		}
+		srcs = recordings(srcs)
 		if len(srcs) == 0 {
 			fail(stderr, "collect: no sessions recorded for %s", cwd)
 			return nil, exitError
 		}
 		return srcs, exitOK
 	case latest:
-		src, err := session.Latest(root)
+		src, err := latestRecording(root)
 		if err != nil {
 			fail(stderr, "collect: %v", err)
 			return nil, exitError
@@ -836,6 +845,47 @@ func collectSources(root, selector, cwd string, latest bool, stderr io.Writer) (
 				"       transcripts are read from %s", root)
 		return nil, exitUsage
 	}
+}
+
+// recordings drops the transcripts a replay wrote. A replay's output is
+// already a result in the reports; collecting it would record a replay of a
+// replay, and its prompt is the replay's input rather than something anyone
+// asked in that directory.
+func recordings(srcs []session.Source) []session.Source {
+	kept := srcs[:0]
+	for _, src := range srcs {
+		produced, err := session.IsReplayTranscript(src.Path)
+		if err != nil {
+			// Unreadable now; the next attempt may read it. Sources already
+			// skips what it cannot stat, and a listing should not fail on one
+			// transcript it cannot open.
+			continue
+		}
+		if !produced {
+			kept = append(kept, src)
+		}
+	}
+	return kept
+}
+
+// latestRecording is session.Latest with the transcripts replays wrote left
+// out. Without that, a machine that has just run a replay would answer
+// --latest with the replay's own output instead of the recording it wants.
+func latestRecording(root string) (session.Source, error) {
+	srcs, err := session.Sources(root)
+	if err != nil {
+		return session.Source{}, err
+	}
+	for _, src := range srcs {
+		produced, err := session.IsReplayTranscript(src.Path)
+		if err != nil {
+			continue
+		}
+		if !produced {
+			return src, nil
+		}
+	}
+	return session.Source{}, fmt.Errorf("no sessions under %s", root)
 }
 
 // collectCursorSessions reads the conversations the flags name out of Cursor's
@@ -967,7 +1017,12 @@ func cmdCollectList(srcKind, cursorDB, root string, stdout, stderr io.Writer) in
 		if err != nil {
 			return fail(stderr, "collect: %v", err)
 		}
+		all := len(sources)
+		sources = recordings(sources)
 		fmt.Fprintf(stdout, "%d claude code transcript(s) in %s\n\n", len(sources), root)
+		if produced := all - len(sources); produced > 0 {
+			fmt.Fprintf(stdout, "%d transcript(s) written by replays are not listed.\n\n", produced)
+		}
 		if len(sources) == 0 {
 			return exitOK
 		}

@@ -260,6 +260,70 @@ func TestCancellingAQueuedReplayKeepsItFromRunning(t *testing.T) {
 	}
 }
 
+func TestCancellingARunningReplayStopsTheAgent(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "slow.sh")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\ncat >/dev/null\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	presets := &Presets{
+		Harnesses: []Harness{{Name: "slow", Spec: agent.Spec{Kind: agent.KindMock, Bin: bin}}},
+		Skills:    []Skill{{Name: "none"}},
+	}
+	m, err := NewManager(Config{
+		Store:    st,
+		Catalog:  &session.Catalog{ClaudeRoot: claudeRoot(t)},
+		Presets:  presets,
+		WorkRoot: t.TempDir(),
+		Timeout:  time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+
+	ctx := context.Background()
+	rp, err := m.Submit(ctx, Request{Source: "claude", SessionID: sessionID, Choice: Choice{Harness: "slow"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the run row, not just the replay status: cancelling before
+	// runner.Run has created it would test a different path.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		runs, err := st.ListRuns(ctx, store.RunFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(runs) > 0 && runs[0].Status == store.RunRunning {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the replay never started a run: %+v", runs)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err := m.Cancel(ctx, rp.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	got := waitFinished(t, st, rp.ID)
+	if got.Status != store.ReplayFailed || !strings.Contains(got.Error, "cancelled") {
+		t.Errorf("a cancelled running replay = %+v, want failed/cancelled", got)
+	}
+	runs, err := st.ListRuns(ctx, store.RunFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != store.RunInterrupted {
+		t.Errorf("the run under a cancelled replay = %+v, want one interrupted run", runs)
+	}
+}
+
 func TestANewManagerClosesWhatAnEarlierProcessLeftRunning(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "runs.db"))
 	if err != nil {
