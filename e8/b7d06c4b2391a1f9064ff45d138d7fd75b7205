@@ -1,0 +1,19 @@
+internal/session/workbuddy.go
+  s_bd67f294752e1a::t_7eadf6cc43f342 1-691
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "e8b7d06c4b2391a1f9064ff45d138d7fd75b7205",
+  "prompts": {},
+  "sessions": {
+    "s_bd67f294752e1a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "756f1bb4-18ec-46ec-8837-c16475f922eb",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
