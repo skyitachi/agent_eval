@@ -1211,7 +1211,7 @@ func TestCLICollectsACursorConversation(t *testing.T) {
 		{"--root with --source cursor", []string{"--source", "cursor", "--cursor-db", cursorDB, "--root", work, "--out", filepath.Join(work, "x")},
 			"--root only means something with --source claude"},
 		{"an unknown source", []string{"--source", "vscode", "--out", filepath.Join(work, "x")},
-			`--source must be "claude" or "cursor"`},
+			`--source must be "claude", "cursor" or "workbuddy"`},
 		{"neither --out nor --dry-run", []string{"--source", "cursor", "--cursor-db", cursorDB, "--latest"},
 			"--out is required"},
 		{"no way to name a conversation", []string{"--source", "cursor", "--cursor-db", cursorDB, "--out", filepath.Join(work, "x")},

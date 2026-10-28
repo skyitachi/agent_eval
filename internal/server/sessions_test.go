@@ -128,6 +128,25 @@ func TestTheSessionListAndDetailShowTheTranscript(t *testing.T) {
 	}
 }
 
+// TestTheSourceFilterOffersEverySource: the dropdown has to list every source
+// the catalog can produce. A source the catalog lists but the filter omits is
+// unreachable for anyone whose sessions come from it -- they can still see it
+// under "All sources", but cannot narrow to it. This is a template detail no
+// other test reads, so a missing option would go unnoticed.
+func TestTheSourceFilterOffersEverySource(t *testing.T) {
+	h, _ := sessionServer(t)
+	page := getLocal(t, h, "/sessions").Body.String()
+	for _, want := range []string{
+		`<option value="claude"`,
+		`<option value="cursor"`,
+		`<option value="workbuddy"`,
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the source filter should offer %s", want)
+		}
+	}
+}
+
 // TestTheSessionListDoesNotOfferTheOutputOfAReplay: a replay runs the agent in
 // a workspace of its own, and Claude Code records a transcript for that
 // workspace. It carries the replayed prompt, so it looks like a session with a

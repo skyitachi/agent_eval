@@ -192,7 +192,7 @@ func TestCollectLeavesOutTranscriptsAReplayWrote(t *testing.T) {
 	}
 
 	var list, listErr bytes.Buffer
-	if code := cmdCollectList("claude", "", root, &list, &listErr); code != exitOK {
+	if code := cmdCollectList("claude", "", root, "", &list, &listErr); code != exitOK {
 		t.Fatalf("--list exited %d: %s", code, listErr.String())
 	}
 	if strings.Contains(list.String(), producedID) {

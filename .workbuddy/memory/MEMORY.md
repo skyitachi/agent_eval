@@ -6,6 +6,31 @@ Go 的 agent 评测框架。`/Users/skyitachi/lab/agent_eval`，module `github.c
 `report`/`serve`/`list`/`version`。回答「做得怎么样 / 差异归因给谁 / 真实会话花了多少」，**拒绝**回答
 「这个 agent 好不好」。
 
+## 会话来源（collect 识别的 session）
+
+- **三条来源**：Claude Code（`~/.claude/projects` JSONL，源码 `claude.go`）、Cursor（`cursor.db`
+  SQLite，`cursor.go`）、**WorkBuddy**（`~/.workbuddy/traces/<pid>/trace_*.jsonl` 的 OTel JSONL，
+  `workbuddy.go`）。Catalog 常量 `CatalogClaude`/`CatalogCursor`/`CatalogWorkBuddy`；CLI `--source`
+  取值 `claude`/`cursor`/`workbuddy`（互斥，与 `--root`/`--cursor-db`/`--workbuddy-root` 各自冲突）。
+- **WorkBuddy trace 是遥测、非权威记录**，解析时已知三处损失，已写进 `Session.BaselineNotes`：① 无工作目录
+  （`Cwd` 空，traces 不记录 cwd）；② payload 可能截断（`toolInput`/`toolOutput` 带
+  `tracePayloadTruncated` 标记）；③ token 只给会话总量（`trace_end.modelInfo.totalTokens`），无逐调用数。
+  对话内容在 span 里：`generation` span 的 `toolOutput` = `[{chat.completion: choices[0].message.content}]`
+  （assistant 轮），`function` span 的 `toolName`/`toolInput`/`toolOutput` = 工具调用（挂到上一个
+  assistant 轮）。`span_end` 才带完整 payload，`span_start` 的为空。
+- `agentName()`/`sourceLabel()`/`server sourceLabel` 三处都加了 `"workbuddy"` 分支（返回
+  `"workbuddy"` / `"WorkBuddy"`）。`--source` 校验报错文案含 workbuddy，e2e 与 `cmd/aeval` 测试已同步。
+- 真实目录 `aeval collect --source workbuddy --list` 实测列出 **68 条** trace（含仍在跑、无 modelInfo 的，
+  显示 `model=-`、`title=<id>`，属预期）。
+- **重放：没有 `aeval replay` 子命令**。重放只经 `aeval serve` 网页按钮（`replay.Manager.Submit` →
+  `execute`：collect→run→report）。引擎本身**来源无关**（`Catalog.Find`/`Catalog.Load`），所以 WorkBuddy
+  会话也能重放。**命令行等价做法是两步**：`collect --source workbuddy --session <id> --split turn --out DIR`
+  再 `run --dataset DIR`。三条 WorkBuddy 重放限制：① **很多 trace 没有开头 prompt**（`env.Prompt` 空且
+  generation 的 toolInput 里没可用 user 消息）→ collect 直接 `skipped ... with no human prompt`，无法重放
+  （实测 72 条里 `13feb0c1`/`140dea50` 被跳、`5965283c` 可出 1 个任务）；② **无 cwd** → 重放在空 workspace
+  里跑，要文件得用 `--workspace-repo`/`--assets`；③ **解析只取开头一条 prompt** → 即便 `--split turn` 也只
+  产 1 个任务（不是整段多轮）。
+
 **细节在 `notes/`，本文件只留「不带着上下文就会踩坑」的规则。**
 `collect.md`（来源/挑选/切片/`--chain-sessions`/`--workspace-cwd`）·
 `reporting.md`（模型与 skills 两种 chip、app.js 客户端、Chrome 渲染护栏）·
@@ -71,6 +96,11 @@ Go 的 agent 评测框架。`/Users/skyitachi/lab/agent_eval`，module `github.c
     为空**（在此重复 DDL 就会成为第二份定义并漂移），但仍必须存在，否则 upgrade 链会报 "no path from
     it"。版本→列的速查表见 `notes/trace-and-schema.md`；**低版本夹具要把所有更高版本加的列一起删**，只删
     一列得到的是「再降一版」而不是那个版本。
+
+15. **`tests/render_test.go` 用 Chrome `--dump-dom` 验报告渲染**：启动 Chrome 必须带 `--no-sandbox`
+    `--disable-dev-shm-usage`（外加既有的 `--headless --disable-gpu`），否则在本机沙箱里 Chrome 自带的
+    sandbox 起不来会 `trace/BPT trap` 崩（`Failed to initialize sandbox` / `GPU process isn't usable`）。
+    找不到浏览器时这些测试**跳过**而非失败（`findBrowser` 返回 ""），`AGENTEVAL_CHROME` 可覆盖路径。
 
 ## 报告登记 + HTTP 服务（`report` 写、`serve` 读）
 

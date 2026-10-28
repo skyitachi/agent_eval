@@ -78,6 +78,8 @@ var sessionTemplates = template.Must(template.New("sessions").Funcs(template.Fun
 			return "Claude Code"
 		case session.CatalogCursor:
 			return "Cursor"
+		case session.CatalogWorkBuddy:
+			return "WorkBuddy"
 		}
 		return s
 	},

@@ -685,8 +685,11 @@ func (s *Session) sourceName() string {
 // agentName is the agent the recorded session actually drove, which is not the
 // same question as how the record was captured.
 func (s *Session) agentName() string {
-	if s.sourceName() == CursorSourceName {
+	switch s.sourceName() {
+	case CursorSourceName:
 		return "cursor"
+	case WorkBuddySourceName:
+		return "workbuddy"
 	}
 	return "claude-code"
 }
@@ -1163,6 +1166,8 @@ func sourceLabel(source string) string {
 		return "Cursor"
 	case SourceName:
 		return "Claude Code"
+	case WorkBuddySourceName:
+		return "WorkBuddy"
 	default:
 		return source
 	}

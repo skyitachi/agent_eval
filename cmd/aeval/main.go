@@ -553,8 +553,9 @@ func orDefault(v, fallback string) string {
 func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("collect", flag.ContinueOnError)
 	var (
-		source   = fs.String("source", "claude", "whose history to read: claude (Claude Code transcripts) or cursor")
+		source   = fs.String("source", "claude", "whose history to read: claude (Claude Code transcripts), cursor, or workbuddy (OTel traces)")
 		cursorDB = fs.String("cursor-db", "", "Cursor state database (default: Cursor's own location for this platform)")
+		wbRoot   = fs.String("workbuddy-root", "", "WorkBuddy traces directory (default ~/.workbuddy/traces)")
 		list     = fs.Bool("list", false, "list the recorded sessions and exit; needs no --out")
 
 		root     = fs.String("root", "", "directory holding Claude Code transcripts (default ~/.claude/projects)")
@@ -595,9 +596,9 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 
 	srcKind := strings.ToLower(strings.TrimSpace(*source))
 	switch srcKind {
-	case "claude", "cursor":
+	case "claude", "cursor", "workbuddy":
 	default:
-		return usageFail(stderr, "collect: --source must be \"claude\" or \"cursor\", got %q", *source)
+		return usageFail(stderr, "collect: --source must be \"claude\", \"cursor\" or \"workbuddy\", got %q", *source)
 	}
 	if srcKind == "claude" && *cursorDB != "" {
 		return usageFail(stderr, "collect: --cursor-db only means something with --source cursor")
@@ -605,9 +606,12 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	if srcKind == "cursor" && *root != "" {
 		return usageFail(stderr, "collect: --root only means something with --source claude")
 	}
+	if srcKind == "workbuddy" && (*root != "" || *cursorDB != "") {
+		return usageFail(stderr, "collect: --root and --cursor-db only mean something with --source claude or cursor")
+	}
 
 	if *list {
-		return cmdCollectList(srcKind, *cursorDB, *root, stdout, stderr)
+		return cmdCollectList(srcKind, *cursorDB, *root, *wbRoot, stdout, stderr)
 	}
 
 	if *out == "" && !*dryRun {
@@ -638,6 +642,12 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 	case "cursor":
 		var code int
 		sessions, names, code = collectCursorSessions(*cursorDB, *selector, *cwd, *latest, stderr)
+		if code != exitOK {
+			return code
+		}
+	case "workbuddy":
+		var code int
+		sessions, names, code = collectWorkbuddySessions(*wbRoot, *selector, *cwd, *latest, stderr)
 		if code != exitOK {
 			return code
 		}
@@ -973,12 +983,101 @@ func collectCursorSessions(dbPath, selector, cwd string, latest bool, stderr io.
 	return kept, keptIDs, exitOK
 }
 
+// collectWorkbuddySessions reads the traces the flags name out of WorkBuddy's
+// trace directory.
+//
+// It returns the ids alongside the sessions for the same reason collectCursorSessions
+// does: the caller prints them, and re-deriving them from a parsed session would
+// be a second, subtly different answer.
+func collectWorkbuddySessions(root, selector, cwd string, latest bool, stderr io.Writer) ([]*session.Session, []string, int) {
+	if strings.TrimSpace(cwd) != "" {
+		return nil, nil, usageFail(stderr, "collect: --cwd only means something with --source claude or cursor; "+
+			"WorkBuddy traces record no working directory")
+	}
+	if strings.TrimSpace(root) == "" {
+		root = session.WorkBuddyDefaultRoot()
+	}
+	if strings.TrimSpace(root) == "" {
+		fail(stderr, "collect: cannot locate the WorkBuddy traces directory on this machine; pass --workbuddy-root")
+		return nil, nil, exitUsage
+	}
+	root = absFlagPath(root)
+
+	var ids []string
+	switch {
+	case selector != "":
+		tr, err := session.ResolveWorkBuddy(root, selector)
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, nil, exitError
+		}
+		ids = append(ids, tr.ID)
+	case latest:
+		tr, err := session.LatestWorkBuddy(root)
+		if err != nil {
+			fail(stderr, "collect: %v", err)
+			return nil, nil, exitError
+		}
+		ids = append(ids, tr.ID)
+	default:
+		fail(stderr,
+			"collect: name what to collect: --session <id or path>, or --latest\n"+
+				"       WorkBuddy traces are read from "+root+"\n"+
+				"       --list shows what is in there")
+		return nil, nil, exitUsage
+	}
+
+	traces, err := session.WorkBuddyTraces(root)
+	if err != nil {
+		fail(stderr, "collect: %v", err)
+		return nil, nil, exitError
+	}
+	byID := make(map[string]string, len(traces))
+	for _, t := range traces {
+		byID[t.ID] = t.Path
+	}
+
+	var (
+		sessions []*session.Session
+		keptIDs []string
+		dropped int
+	)
+	for _, id := range ids {
+		path, ok := byID[id]
+		if !ok {
+			fail(stderr, "collect: no WorkBuddy trace with id %s", id)
+			return nil, nil, exitError
+		}
+		s, err := session.ParseWorkBuddy(path)
+		if err != nil {
+			fail(stderr, "collect: parse %s: %v", path, err)
+			return nil, nil, exitError
+		}
+		// Collect refuses a session with no human prompt, and it is right to: a
+		// trace with no request in it is not a task.
+		if len(s.Prompts) == 0 {
+			dropped++
+			continue
+		}
+		sessions = append(sessions, s)
+		keptIDs = append(keptIDs, id)
+	}
+	if dropped > 0 {
+		fmt.Fprintf(stderr, "collect: skipped %d trace(s) with no human prompt\n", dropped)
+	}
+	if len(sessions) == 0 {
+		fail(stderr, "collect: none of the %d selected trace(s) contains a human prompt", len(ids))
+		return nil, nil, exitError
+	}
+	return sessions, keptIDs, exitOK
+}
+
 // cmdCollectList prints what is available to collect, without collecting it.
 //
 // It exists because naming a session is otherwise guesswork: a Cursor
 // conversation is a uuid in a database, and a Claude Code transcript is a uuid
 // in a directory whose name is lossy.
-func cmdCollectList(srcKind, cursorDB, root string, stdout, stderr io.Writer) int {
+func cmdCollectList(srcKind, cursorDB, root, wbRoot string, stdout, stderr io.Writer) int {
 	switch srcKind {
 	case "cursor":
 		dbPath := cursorDB
@@ -1007,6 +1106,35 @@ func cmdCollectList(srcKind, cursorDB, root string, stdout, stderr io.Writer) in
 		}
 		tw.Flush()
 		fmt.Fprintf(stdout, "\ncollect one with: aeval collect --source cursor --session <id prefix> --out <dir>\n")
+		return exitOK
+
+	case "workbuddy":
+		wr := wbRoot
+		if strings.TrimSpace(wr) == "" {
+			wr = session.WorkBuddyDefaultRoot()
+		}
+		if strings.TrimSpace(wr) == "" {
+			return usageFail(stderr, "collect: cannot locate the WorkBuddy traces directory on this machine; pass --workbuddy-root")
+		}
+		wr = absFlagPath(wr)
+
+		traces, err := session.WorkBuddyTraces(wr)
+		if err != nil {
+			return fail(stderr, "collect: %v", err)
+		}
+		fmt.Fprintf(stdout, "%d workbuddy trace(s) in %s\n\n", len(traces), wr)
+		if len(traces) == 0 {
+			return exitOK
+		}
+		tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "id\ttouched\tmodel\tstatus\ttitle")
+		for _, tr := range traces {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
+				tr.ID, shortWhen(tr.UpdatedAt), orDefault(tr.Model, "-"),
+				orDefault(tr.Status, "-"), oneLine(tr.Title, 48))
+		}
+		tw.Flush()
+		fmt.Fprintf(stdout, "\ncollect one with: aeval collect --source workbuddy --session <id prefix> --out <dir>\n")
 		return exitOK
 
 	default:
@@ -1984,6 +2112,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		presetsPath = fs.String("replay-config", "", "YAML file of the harnesses, skill sets and models a replay can pick")
 		claudeRoot  = fs.String("claude-root", "", "where Claude Code transcripts are read from (default ~/.claude/projects)")
 		cursorDB    = fs.String("cursor-db", "", "Cursor's state database (default: the platform's location)")
+		wbRoot      = fs.String("workbuddy-root", "", "WorkBuddy traces directory (default ~/.workbuddy/traces)")
 		replayRoot  = fs.String("replay-root", "", "where replays keep their datasets and workspaces (default: beside the database)")
 	)
 	addCommon(fs, &common)
@@ -1993,7 +2122,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	if strings.TrimSpace(*addr) == "" {
 		return usageFail(stderr, "serve: --addr may not be empty")
 	}
-	if *noSessions && (*presetsPath != "" || *claudeRoot != "" || *cursorDB != "" || *replayRoot != "") {
+	if *noSessions && (*presetsPath != "" || *claudeRoot != "" || *cursorDB != "" || *wbRoot != "" || *replayRoot != "") {
 		return usageFail(stderr, "serve: --replay-config, --claude-root, --cursor-db and --replay-root "+
 			"only mean something with the session pages, which --no-sessions turns off")
 	}
@@ -2033,12 +2162,15 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 				return usageFail(stderr, "serve: %v", err)
 			}
 		}
-		catalog := &session.Catalog{ClaudeRoot: session.DefaultRoot(), CursorDB: session.CursorDefaultDB()}
+		catalog := &session.Catalog{ClaudeRoot: session.DefaultRoot(), CursorDB: session.CursorDefaultDB(), WorkBuddyRoot: session.WorkBuddyDefaultRoot()}
 		if *claudeRoot != "" {
 			catalog.ClaudeRoot = absFlagPath(*claudeRoot)
 		}
 		if *cursorDB != "" {
 			catalog.CursorDB = absFlagPath(*cursorDB)
+		}
+		if *wbRoot != "" {
+			catalog.WorkBuddyRoot = absFlagPath(*wbRoot)
 		}
 		mgr, err := replay.NewManager(replay.Config{
 			Store: st, Catalog: catalog, Presets: presets,

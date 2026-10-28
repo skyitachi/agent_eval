@@ -209,6 +209,7 @@ func browserRender(t *testing.T, reportPath string) renderResult {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, browser,
 		"--headless", "--disable-gpu", "--hide-scrollbars",
+		"--no-sandbox", "--disable-dev-shm-usage",
 		"--window-size=1440,1000", "--virtual-time-budget=5000",
 		"--dump-dom", "file://"+page)
 	var stdout, stderr bytes.Buffer

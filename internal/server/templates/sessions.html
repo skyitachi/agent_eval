@@ -90,6 +90,7 @@
       <option value="">All sources</option>
       <option value="claude"{{if eq .Source "claude"}} selected{{end}}>Claude Code</option>
       <option value="cursor"{{if eq .Source "cursor"}} selected{{end}}>Cursor</option>
+      <option value="workbuddy"{{if eq .Source "workbuddy"}} selected{{end}}>WorkBuddy</option>
     </select>
     <input type="search" name="q" class="search" value="{{.Filter}}" placeholder="Title, directory or id" aria-label="Filter sessions">
     <button type="submit" class="btn">Filter</button>

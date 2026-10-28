@@ -17,8 +17,9 @@ import (
 // identify a capture format ("cursor-composer"), these identify where on this
 // machine a session was found.
 const (
-	CatalogClaude = "claude"
-	CatalogCursor = "cursor"
+	CatalogClaude   = "claude"
+	CatalogCursor   = "cursor"
+	CatalogWorkBuddy = "workbuddy"
 )
 
 // Entry is one session as a listing shows it: enough to recognise it and pick
@@ -55,6 +56,9 @@ type Catalog struct {
 	ClaudeRoot string
 	// CursorDB is Cursor's state database. Empty disables the source.
 	CursorDB string
+	// WorkBuddyRoot is where WorkBuddy keeps its OTel traces. Empty disables the
+	// source.
+	WorkBuddyRoot string
 
 	mu    sync.Mutex
 	heads map[string]cachedHead
@@ -68,7 +72,7 @@ type cachedHead struct {
 
 // NewCatalog builds a catalog over this machine's default locations.
 func NewCatalog() *Catalog {
-	return &Catalog{ClaudeRoot: DefaultRoot(), CursorDB: CursorDefaultDB()}
+	return &Catalog{ClaudeRoot: DefaultRoot(), CursorDB: CursorDefaultDB(), WorkBuddyRoot: WorkBuddyDefaultRoot()}
 }
 
 // List returns every session of every enabled source, newest first, and the
@@ -112,6 +116,23 @@ func (c *Catalog) List() ([]Entry, map[string]error) {
 			}
 		}
 	}
+	if c.WorkBuddyRoot != "" {
+		traces, err := WorkBuddyTraces(c.WorkBuddyRoot)
+		if err != nil {
+			errs[CatalogWorkBuddy] = err
+		}
+		for _, tr := range traces {
+			out = append(out, Entry{
+				Source:    CatalogWorkBuddy,
+				ID:        tr.ID,
+				Title:     tr.Title,
+				Model:     tr.Model,
+				UpdatedAt: tr.UpdatedAt,
+				Prompts:   -1,
+				Path:      tr.Path,
+			})
+		}
+	}
 	sortEntries(out)
 	return out, errs
 }
@@ -119,9 +140,9 @@ func (c *Catalog) List() ([]Entry, map[string]error) {
 // Find returns one listed session.
 func (c *Catalog) Find(source, id string) (Entry, error) {
 	switch source {
-	case CatalogClaude, CatalogCursor:
+	case CatalogClaude, CatalogCursor, CatalogWorkBuddy:
 	default:
-		return Entry{}, fmt.Errorf("no session source %q (want %s or %s)", source, CatalogClaude, CatalogCursor)
+		return Entry{}, fmt.Errorf("no session source %q (want %s, %s or %s)", source, CatalogClaude, CatalogCursor, CatalogWorkBuddy)
 	}
 	entries, errs := c.List()
 	for _, e := range entries {
@@ -142,6 +163,8 @@ func (c *Catalog) Load(e Entry) (*Session, error) {
 		return ParseFile(e.Path)
 	case CatalogCursor:
 		return ParseCursorChat(e.Path, e.ID)
+	case CatalogWorkBuddy:
+		return ParseWorkBuddy(e.Path)
 	}
 	return nil, fmt.Errorf("no session source %q", e.Source)
 }
