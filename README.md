@@ -626,12 +626,42 @@ were never requested.
 
 A replay is `collect --split turn --workspace-cwd` followed by `run
 --chain-sessions`, then a registered run report: each prompt becomes a task,
-the tasks run in order in one workspace checked out from the recording's
-repository (an empty one when the directory is not a repository, which the log
-says), and the report opens at `/r/<id>` like any other. Replays run one at a
-time, so two agents never contend for the machine whose busy time they are
-compared against. A replay left unfinished by a server that stopped is closed as
-failed when the next one starts.
+the tasks run in order in one workspace, and the report opens at `/r/<id>` like
+any other. Replays run one at a time, so two agents never contend for the
+machine whose busy time they are compared against. A replay left unfinished by a
+server that stopped is closed as failed when the next one starts.
+
+Where the agent works is the form's **Workspace** choice:
+
+| choice | what happens |
+| --- | --- |
+| In place when possible, else a copy (default) | `run --in-place` in the recorded directory, at the recorded commit, when it can be given back; otherwise a copy, and the log says why |
+| In place only | the same, but a directory that cannot be worked in place is refused on the form (and fails the replay if it changed before the replay started) |
+| Copy | a clone under `--replay-root`, as `aeval run` does without `--in-place` |
+
+Unlike `aeval run --in-place`, a replay takes a repository with **uncommitted
+changes**: they are set aside with `git stash push --include-untracked` before
+the checkout and re-applied with `git stash apply --index` once the tree is put
+back, so staged and unstaged changes and untracked files all come back as they
+were. The stash is moved off the stash list to `refs/agenteval/stash`, where the
+agent's own `git stash pop` cannot reach it, and its commit is written into the
+lock. If the re-applied tree does not read exactly as it did, the ref is kept and
+the replay's error says how to apply it by hand. A run cancelled between two
+turns still puts the tree back and re-applies the work.
+
+In place is not possible, and the default falls back to a copy, when the
+directory is gone or is not a repository, the recording names no commit or
+branch, the directory is a linked worktree, has submodules, is bare, or is
+already held by another run, or its uncommitted state is one a stash cannot
+carry: unresolved conflicts, a merge/rebase/cherry-pick/revert/bisect in
+progress, or an untracked repository inside it. The database and
+`--replay-root` must not be tracked by the repository; when they are inside it
+untracked, they are added to `.git/info/exclude` for the run so that neither the
+stash nor the restore takes them. A directory still holding work an earlier run
+set aside and never re-applied refuses every replay but an explicit copy, and
+says how to recover it. An in-place Claude Code replay runs with
+`--no-session-persistence`, so it does not leave a transcript among your
+recordings.
 
 The harness and the skill set are **named presets**, not values the page sends:
 

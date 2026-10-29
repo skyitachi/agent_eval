@@ -108,8 +108,26 @@ func (s *Server) handleListing(w http.ResponseWriter, r *http.Request) {
 			fmt.Sprintf("Reading the registry from %s failed: %v", s.st.Path(), err))
 		return
 	}
+	opts := report.RenderOptions{Home: "/"}
+	if s.sessions != nil {
+		// The session pages are the other half of the site, and the listing is
+		// where everyone lands, so the way there is a panel and not only a tab.
+		opts.Nav = []report.NavLink{
+			{Label: "Reports", Href: "/", Active: true},
+			{Label: "Sessions", Href: "/sessions"},
+			{Label: "Replays", Href: "/replays"},
+		}
+		opts.Callout = &report.Callout{
+			Head: "Replay a recorded session",
+			Note: "Browse the Claude Code, Cursor and WorkBuddy sessions on this machine, and replay one under another harness, skill set or model.",
+			Links: []report.NavLink{
+				{Label: "Browse sessions →", Href: "/sessions"},
+				{Label: "Replays", Href: "/replays"},
+			},
+		}
+	}
 	writeHTML(w, http.StatusOK, func(out io.Writer) error {
-		return report.RenderReports(out, listing, report.RenderOptions{Home: "/"})
+		return report.RenderReports(out, listing, opts)
 	})
 }
 

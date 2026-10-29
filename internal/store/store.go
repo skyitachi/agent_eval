@@ -108,7 +108,11 @@ var schemaFS embed.FS
 // a recorded session to the run and the report it produced. Like v6 it adds a
 // table and changes nothing that was there, so an older database gains an
 // empty one -- no build before it could start a replay.
-const schemaVersion = 8
+//
+// v9 adds replays.workspace_mode: whether a replay worked in the recorded
+// directory or in a copy of it. An earlier row reads back as ”, which is not a
+// gap: every replay before v9 worked in a copy.
+const schemaVersion = 9
 
 // ErrNotFound is matched by every missing-record error. It is a sentinel, not a
 // message: the errors that match it carry their own text, which names the record
@@ -529,6 +533,7 @@ var migrations = []func(*Store) error{
 	upgradeV5ToV6,
 	upgradeV6ToV7,
 	upgradeV7ToV8,
+	upgradeV8ToV9,
 }
 
 // upgrade walks from a database's revision to this build's.
@@ -630,6 +635,11 @@ func upgradeV6ToV7(s *Store) error {
 // schema.sql creates it with CREATE TABLE IF NOT EXISTS before the chain is
 // walked, and repeating the DDL here would be a second definition to drift.
 func upgradeV7ToV8(s *Store) error { return nil }
+
+// upgradeV8ToV9 adds the replay's workspace mode.
+func upgradeV8ToV9(s *Store) error {
+	return s.addColumnIfMissing("replays", "workspace_mode", "TEXT NOT NULL DEFAULT ''")
+}
 
 // addColumnIfMissing is why the steps above can be re-run: ADD COLUMN is not
 // idempotent, and a step interrupted before the version bump would otherwise

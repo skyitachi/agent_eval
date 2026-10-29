@@ -505,9 +505,29 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 | `GET /replays`、`GET /replays/<id>` | 回放状态与日志；未结束时页面自动刷新，结束后给出报告链接 |
 
 一次回放 = `collect --split turn --workspace-cwd` + `run --chain-sessions` + 登记 run 报告：每条 prompt 一个  
-任务，按顺序在同一个工作区里跑，工作区从录制所在仓库检出（目录不是仓库时从空目录起步，日志里会写明）；报告  
-像其他登记一样在 `/r/<id>` 打开。回放**一次只跑一个**，免得两个 agent 争抢机器、污染要对照的忙碌时间。服务  
-停掉时没跑完的回放，在下次启动时被标记为失败。
+任务，按顺序在同一个工作区里跑；报告像其他登记一样在 `/r/<id>` 打开。回放**一次只跑一个**，免得两个 agent  
+争抢机器、污染要对照的忙碌时间。服务停掉时没跑完的回放，在下次启动时被标记为失败。
+
+agent 在哪里干活，由表单的 **Workspace** 决定：
+
+| 选项 | 行为 |
+| --- | --- |
+| 能原地就原地，否则副本（默认） | 能还原现场时，在录制目录里、录制时的 commit 上 `run --in-place`；不能时用副本，日志写明原因 |
+| 只原地 | 同上，但不能原地的目录在表单上直接报错（提交后目录变了导致不能原地，回放失败） |
+| 副本 | 在 `--replay-root` 下 clone 一份，同不带 `--in-place` 的 `aeval run` |
+
+和 `aeval run --in-place` 不同，回放接受有**未提交改动**的仓库：checkout 前先 `git stash push --include-untracked`  
+暂存，现场还原后再 `git stash apply --index` 恢复，暂存区、工作区改动和未跟踪文件都按原样回来。stash 会从  
+stash 列表移到 `refs/agenteval/stash`（agent 自己执行 `git stash pop` 碰不到），commit 也写进锁文件。恢复后  
+`git status` 和之前对不上时，ref 会保留，回放的错误信息里给出手动恢复的命令。在两轮之间被取消的回放，同样会  
+还原现场并恢复改动。
+
+以下情况不能原地，默认模式会退回副本：目录不存在或不是仓库；录制没记下 commit 或分支；目录是 linked  
+worktree、带 submodule、是 bare 仓库，或正被另一个 run 占用；未提交状态是 stash 带不走的 —— 有未解决的冲突、  
+merge/rebase/cherry-pick/revert/bisect 进行到一半、目录里有未跟踪的独立仓库。数据库和 `--replay-root` 不能被  
+该仓库跟踪；它们在仓库里但未跟踪时，运行期间会被加进 `.git/info/exclude`，stash 和还原都不会动它们。目录里还  
+留着之前某次运行暂存后没恢复的改动时，除了显式选「副本」，所有回放都会被拒绝，并提示怎么恢复。原地的 Claude  
+Code 回放带 `--no-session-persistence`，不会在你的录制里留下转录。
 
 harness 与 skill 是**命名预设**，页面只能提交名字、提交不了内容：
 

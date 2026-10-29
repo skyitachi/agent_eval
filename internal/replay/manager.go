@@ -17,6 +17,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/machine"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
+	"github.com/skyitachi/agenteval/internal/sandbox"
 	"github.com/skyitachi/agenteval/internal/session"
 	"github.com/skyitachi/agenteval/internal/store"
 )
@@ -117,10 +118,115 @@ type Request struct {
 	Source    string
 	SessionID string
 	Choice    Choice
+	// Workspace is where the agent works: WorkspaceAuto (the default),
+	// WorkspaceInPlace or WorkspaceCopy.
+	Workspace string
+}
+
+// Where a replay works.
+//
+// In place is the default because it is what the recording had in front of it:
+// the real tree with its history, ignored files and tools, rather than a copy
+// with one commit in it. It is only ever done when the directory can be given
+// back -- uncommitted changes are set aside first and re-applied at the end --
+// so the default falls back to a copy when it cannot be, and saying "in place"
+// explicitly turns that fallback into a refusal.
+const (
+	WorkspaceAuto    = "auto"
+	WorkspaceInPlace = "in-place"
+	WorkspaceCopy    = "copy"
+)
+
+// normalWorkspace validates a requested workspace mode, with empty meaning
+// the default.
+func normalWorkspace(w string) (string, error) {
+	switch w = strings.TrimSpace(w); w {
+	case "":
+		return WorkspaceAuto, nil
+	case WorkspaceAuto, WorkspaceInPlace, WorkspaceCopy:
+		return w, nil
+	}
+	return "", fmt.Errorf("there is no workspace mode %q (offered: %s, %s, %s)",
+		w, WorkspaceAuto, WorkspaceInPlace, WorkspaceCopy)
+}
+
+// InPlaceStatus says whether a replay of a session can work in the directory
+// the session was recorded in, for the form to show before anything runs.
+type InPlaceStatus struct {
+	// Repo is the directory, when the session names one.
+	Repo string
+	// OK is whether a replay can work there and give it back.
+	OK bool
+	// Reason is why not, when it cannot.
+	Reason string
+	// Dirty counts the uncommitted paths that would be set aside.
+	Dirty int
+	// Stranded is set when the reason is an earlier run that left the
+	// directory mid-way. No replay starts until it is repaired, a copy
+	// included, because the user's work is what is out of place.
+	Stranded bool
+}
+
+// CheckInPlace answers InPlaceStatus for one session.
+func (m *Manager) CheckInPlace(ctx context.Context, sess *session.Session) InPlaceStatus {
+	st := InPlaceStatus{Repo: sess.Cwd}
+	ds, err := m.inPlaceDataset(sess)
+	if err == nil {
+		err = checkRefs(ds)
+	}
+	if err == nil {
+		err = runner.Preflight(ctx, ds, m.inPlaceConfig())
+	}
+	if err != nil {
+		st.Reason = err.Error()
+		st.Stranded = errors.Is(err, sandbox.ErrStranded)
+		return st
+	}
+	st.OK = true
+	if paths, err := sandbox.UncommittedPaths(ctx, sess.Cwd, m.protected()); err == nil {
+		st.Dirty = len(paths)
+	}
+	return st
+}
+
+// inPlaceDataset collects the session bound to its directory, without writing
+// it anywhere, so that the in-place questions can be asked of it. A session
+// that cannot be bound cannot be replayed in place.
+func (m *Manager) inPlaceDataset(sess *session.Session) (*dataset.Dataset, error) {
+	items, notes, err := collect(sess)
+	if err != nil {
+		return nil, err
+	}
+	if len(notes) > 0 {
+		return nil, errors.New(strings.Join(notes, "; "))
+	}
+	ds := &dataset.Dataset{}
+	for _, it := range items {
+		ds.Tasks = append(ds.Tasks, it.Task)
+	}
+	return ds, nil
+}
+
+// inPlaceConfig is the part of an in-place run's configuration the checks
+// depend on.
+func (m *Manager) inPlaceConfig() runner.Config {
+	return runner.Config{InPlace: true, Stash: true, Protect: m.protected()}
+}
+
+// protected are the paths this process writes while a replay runs. A
+// repository that holds one of them un-ignored cannot be worked in: setting its
+// changes aside would carry the database off mid-run, and putting it back would
+// delete it.
+func (m *Manager) protected() []string {
+	db := m.cfg.Store.Path()
+	return []string{db, db + "-wal", db + "-shm", db + "-journal", m.cfg.WorkRoot}
 }
 
 // ErrBusy is returned when the queue is full.
 var ErrBusy = errors.New("replay: the queue is full")
+
+// ErrNotInPlace is returned when a replay asked to work in place cannot.
+var ErrNotInPlace = errors.New("this session cannot be replayed in the directory it was recorded in")
 
 // Submit validates a request, records it, and queues it.
 //
@@ -136,6 +242,27 @@ func (m *Manager) Submit(ctx context.Context, req Request) (store.Replay, error)
 	spec, choice, err := m.cfg.Presets.Resolve(req.Choice)
 	if err != nil {
 		return store.Replay{}, err
+	}
+	mode, err := normalWorkspace(req.Workspace)
+	if err != nil {
+		return store.Replay{}, err
+	}
+	if mode != WorkspaceCopy {
+		// Asked here so that a refusal is answered on the form. It is asked
+		// again when the replay starts, because the directory can change in
+		// between, and that answer is the one the run acts on.
+		sess, err := m.cfg.Catalog.Load(entry)
+		if err != nil {
+			return store.Replay{}, fmt.Errorf("read the session: %w", err)
+		}
+		st := m.CheckInPlace(ctx, sess)
+		switch {
+		case st.OK:
+		case mode == WorkspaceInPlace:
+			return store.Replay{}, fmt.Errorf("%w: %s", ErrNotInPlace, st.Reason)
+		case st.Stranded:
+			return store.Replay{}, errors.New(st.Reason)
+		}
 	}
 	blob, err := json.Marshal(spec)
 	if err != nil {
@@ -154,6 +281,7 @@ func (m *Manager) Submit(ctx context.Context, req Request) (store.Replay, error)
 		Skill:         choice.Skill,
 		Model:         choice.Model,
 		AgentSpecJSON: string(blob),
+		WorkspaceMode: mode,
 		Status:        store.ReplayQueued,
 		CreatedAt:     time.Now().UTC(),
 	}
@@ -317,6 +445,18 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 	}
 	j.logf("collected %d task(s) into %s", len(ds.Tasks), dsDir)
 
+	inPlace, err := m.decideInPlace(ctx, j, ds, len(notes) > 0)
+	if err != nil {
+		return err
+	}
+	if inPlace && spec.Kind == agent.KindClaudeCode {
+		// The agent now runs in the recorded directory, so the transcript it
+		// would write is filed under that directory beside the recordings, and
+		// nothing about its path says it is a replay. Not writing one is what
+		// keeps it from being listed, collected and replayed as a recording.
+		spec.ExtraArgs = append(spec.ExtraArgs, "--no-session-persistence")
+	}
+
 	cfg := runner.Config{
 		Store:       m.cfg.Store,
 		Agent:       spec,
@@ -333,7 +473,13 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 		Progress: func(p runner.Progress) {
 			j.logf("[%d/%d] %s  %s  %d tokens  %s", p.Done, p.Total, p.Cell.TaskID, cellState(p.Cell),
 				p.Cell.TokenTotal(), (time.Duration(p.Cell.DurationMs) * time.Millisecond).Round(time.Second))
+			if p.Cell.RestoreNotes != "" {
+				j.logf("%s", p.Cell.RestoreNotes)
+			}
 		},
+	}
+	if inPlace {
+		cfg.InPlace, cfg.Stash, cfg.Protect = true, true, m.protected()
 	}
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -347,6 +493,9 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 		j.mu.Lock()
 		j.rp.RunID = res.Run.ID
 		j.mu.Unlock()
+		for _, n := range res.InPlaceNotes {
+			j.logf("%s", n)
+		}
 	}
 	if err != nil {
 		return err
@@ -375,6 +524,77 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 	j.rp.ReportID = reg.ID
 	j.mu.Unlock()
 	j.logf("report %s recorded", reg.ID)
+	return nil
+}
+
+// decideInPlace settles where the replay works, records it on the row, and
+// says why in the log.
+//
+// It is asked of the dataset the run will use, after it is written, so the
+// answer is about the tasks that will actually run. unbound reports that the
+// session could not be tied to its directory at all.
+func (m *Manager) decideInPlace(ctx context.Context, j *job, ds *dataset.Dataset, unbound bool) (bool, error) {
+	j.mu.Lock()
+	asked := j.rp.WorkspaceMode
+	j.mu.Unlock()
+	if asked == "" {
+		asked = WorkspaceAuto
+	}
+	settle := func(mode string) {
+		j.mu.Lock()
+		j.rp.WorkspaceMode = mode
+		j.mu.Unlock()
+		j.save()
+	}
+	if asked == WorkspaceCopy {
+		settle(WorkspaceCopy)
+		j.logf("working in a copy, as asked")
+		return false, nil
+	}
+
+	var why error
+	if unbound {
+		why = errors.New("the session is not tied to a repository on this machine")
+	} else {
+		why = checkRefs(ds)
+		if why == nil {
+			why = runner.Preflight(ctx, ds, m.inPlaceConfig())
+		}
+	}
+	switch {
+	case why == nil:
+		settle(WorkspaceInPlace)
+		repos := runner.InPlaceRepos(ds, m.inPlaceConfig())
+		note := "working in place in " + strings.Join(repos, ", ")
+		if len(repos) == 1 {
+			if paths, err := sandbox.UncommittedPaths(ctx, repos[0], m.protected()); err == nil && len(paths) > 0 {
+				note += fmt.Sprintf("; its %d uncommitted path(s) are set aside first and re-applied when the "+
+					"replay ends", len(paths))
+			}
+		}
+		j.logf("%s", note)
+		return true, nil
+	case asked == WorkspaceInPlace:
+		return false, fmt.Errorf("%w: %v", ErrNotInPlace, why)
+	case errors.Is(why, sandbox.ErrStranded):
+		// A copy would run, but the directory would stay where the earlier
+		// run left it, with nothing on this page saying so.
+		return false, why
+	}
+	settle(WorkspaceCopy)
+	j.logf("working in a copy, because this replay cannot work in place: %v", why)
+	return false, nil
+}
+
+// checkRefs refuses a dataset whose tasks name no commit or branch: in a copy
+// that clones the default branch, but in place there is nothing to check out.
+func checkRefs(ds *dataset.Dataset) error {
+	for _, t := range ds.Tasks {
+		if t.Workspace.Type == dataset.WorkspaceGit && strings.TrimSpace(t.Workspace.Ref) == "" {
+			return fmt.Errorf("the recording names neither the commit nor the branch it started from, so "+
+				"there is nothing in %s to check out", t.Workspace.Repo)
+		}
+	}
 	return nil
 }
 

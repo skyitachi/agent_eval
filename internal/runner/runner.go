@@ -112,6 +112,15 @@ type Config struct {
 	// do, and the run row records which of the two happened so that a reader of
 	// the report is never left guessing.
 	InPlace bool
+	// Stash lets an in-place run take a repository with uncommitted changes:
+	// they are set aside when the run takes it and re-applied when the run
+	// gives it back. Without it such a repository is refused.
+	Stash bool
+	// Protect names paths the caller writes while the run is going, such as
+	// the database. An in-place run refuses a repository that holds one of
+	// them un-ignored, because setting changes aside or putting the tree back
+	// would take it away.
+	Protect []string
 
 	// Timeout and MaxTurns are the fallbacks for tasks that declare none.
 	Timeout  time.Duration
@@ -160,6 +169,10 @@ type Result struct {
 	Run      store.Run
 	Attempts []store.Attempt
 	Summary  Summary
+	// InPlaceNotes say what giving the repositories back did beyond the cells'
+	// own restores: a chain put back after the run stopped between its cells,
+	// and the uncommitted work re-applied. Empty for any other run.
+	InPlaceNotes []string
 }
 
 // Summary is the run's arithmetic, computed once so the CLI and the report
@@ -246,7 +259,13 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 	if err != nil {
 		return nil, err
 	}
-	defer releaseInPlace(held)
+	// Given back on every way out, including the early returns below. The
+	// ordinary path gives them back explicitly first, to report how it went;
+	// a second give-back does nothing.
+	defer func() {
+		_, _ = giveBackInPlace(ctx, held)
+		releaseInPlace(held)
+	}()
 
 	drive, err := agent.New(cfg.Agent.Kind)
 	if err != nil {
@@ -322,6 +341,23 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 	// The per-cell rows are read back below rather than taken from the return
 	// value, so that a resumed leg's rows are included too.
 	_, err = execute(ctx, ds, cfg, drive, cells, held)
+	// Before the run row is finished, so that a repository left mid-chain or
+	// still holding the user's work set aside counts as stranded like any other.
+	inPlaceNotes, gaveBack := giveBackInPlace(ctx, held)
+	if len(gaveBack) > 0 {
+		var re *restoreError
+		switch {
+		case errors.As(err, &re):
+			re.stranded = dedupeStrings(append(re.stranded, gaveBack...))
+		case err == nil:
+			err = &restoreError{stranded: gaveBack}
+		default:
+			// A run that was cancelled or failed is still recorded as that, and
+			// the repository it could not give back rides along in the message,
+			// which is the part the user has to act on.
+			err = fmt.Errorf("%w; %s", err, (&restoreError{stranded: gaveBack}).Error())
+		}
+	}
 	var restoreErr *restoreError
 	stranded := errors.As(err, &restoreErr)
 	status, errMsg := store.RunCompleted, ""
@@ -357,7 +393,7 @@ func Run(ctx context.Context, ds *dataset.Dataset, cfg Config) (*Result, error) 
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Run: final, Attempts: all, Summary: Summarize(all, len(ds.Tasks))}, nil
+	return &Result{Run: final, Attempts: all, Summary: Summarize(all, len(ds.Tasks)), InPlaceNotes: inPlaceNotes}, nil
 }
 
 // Summarize computes the run's arithmetic over its cells.
@@ -425,6 +461,10 @@ func (c Config) Validate() error {
 			"%d cells in flight at once: two cells can name the same directory, and nothing would "+
 			"stop them checking out over each other and putting back a state neither of them "+
 			"started from", c.Concurrency)
+	}
+	if c.Stash && !c.InPlace {
+		return errors.New("setting uncommitted changes aside only applies to a run that works in the " +
+			"recorded repositories themselves; a run in copies never touches them")
 	}
 	if c.InPlace && c.KeepWorkspaces {
 		return errors.New("this run creates no workspaces to keep: it works in the recorded " +
@@ -532,7 +572,7 @@ func Preflight(ctx context.Context, ds *dataset.Dataset, cfg Config) error {
 		}
 	}
 	for _, repo := range InPlaceRepos(ds, cfg) {
-		if err := sandbox.CheckInPlace(ctx, repo); err != nil {
+		if err := sandbox.CheckInPlaceWith(ctx, repo, inPlaceOptions(cfg)); err != nil {
 			return err
 		}
 	}
@@ -627,14 +667,41 @@ func acquireInPlace(ctx context.Context, ds *dataset.Dataset, cfg Config) (map[s
 	}
 	held := map[string]*sandbox.InPlace{}
 	for _, repo := range InPlaceRepos(ds, cfg) {
-		ip, err := sandbox.AcquireInPlace(ctx, repo)
+		ip, err := sandbox.AcquireInPlaceWith(ctx, repo, inPlaceOptions(cfg))
 		if err != nil {
+			// The ones already taken may hold work set aside, which has to go
+			// back before their locks do.
+			_, _ = giveBackInPlace(ctx, held)
 			releaseInPlace(held)
 			return nil, err
 		}
 		held[repo] = ip
 	}
 	return held, nil
+}
+
+func inPlaceOptions(cfg Config) sandbox.InPlaceOptions {
+	return sandbox.InPlaceOptions{Stash: cfg.Stash, Protect: cfg.Protect}
+}
+
+// giveBackInPlace finishes every held repository, in a fixed order, and
+// returns what that did and what it could not do.
+func giveBackInPlace(ctx context.Context, held map[string]*sandbox.InPlace) (notes, stranded []string) {
+	repos := make([]string, 0, len(held))
+	for repo := range held {
+		repos = append(repos, repo)
+	}
+	sort.Strings(repos)
+	for _, repo := range repos {
+		note, err := held[repo].Finish(ctx)
+		if note != "" {
+			notes = append(notes, note)
+		}
+		if err != nil {
+			stranded = append(stranded, err.Error())
+		}
+	}
+	return notes, stranded
 }
 
 func releaseInPlace(held map[string]*sandbox.InPlace) {

@@ -173,8 +173,24 @@
       <dd><input id="model" name="model" class="search" list="models" value="{{.Pick.Model}}" placeholder="the CLI's default" autocomplete="off" maxlength="128">
         <datalist id="models">{{range .Models}}<option value="{{.}}">{{end}}</datalist>
         <div class="small muted">Passed to <code>--model</code> as written. Empty uses the CLI's default.</div></dd>
+      <dt><label for="workspace">Workspace</label></dt>
+      <dd><select id="workspace" name="workspace" class="search">
+        <option value="auto"{{if eq .Workspace "auto"}} selected{{end}}>In place when possible, else a copy</option>
+        <option value="in-place"{{if eq .Workspace "in-place"}} selected{{end}}>In place only</option>
+        <option value="copy"{{if eq .Workspace "copy"}} selected{{end}}>Copy</option>
+      </select>
+      {{- with .InPlace}}
+      {{- if .OK}}
+      <div class="small muted">In place works in <span class="mono-sm">{{.Repo}}</span> itself, checked out at the recorded commit, and puts it back when the replay ends.
+        {{- if .Dirty}} Its {{.Dirty}} uncommitted path(s) are set aside with <code>git stash</code> first and re-applied afterwards.{{end}}</div>
+      {{- else if .Stranded}}
+      <div class="notice err mt"><b>No replay can start until this directory is repaired.</b> {{.Reason}}</div>
+      {{- else}}
+      <div class="small muted">In place is not possible here, so a replay works in a copy and “In place only” is refused: {{.Reason}}</div>
+      {{- end}}
+      {{- end}}</dd>
     </dl>
-    <p class="small muted">Each prompt becomes one task, run in order in one workspace{{if .Bound}} checked out from <span class="mono-sm">{{$s.Cwd}}</span>{{else}} that starts empty{{end}}.
+    <p class="small muted">Each prompt becomes one task, run in order in one workspace{{if .Bound}} from <span class="mono-sm">{{$s.Cwd}}</span>{{else}} that starts empty{{end}}.
       The agent runs on this machine with permission prompts bypassed.</p>
     <button type="submit" class="btn primary">Replay</button>
   </form>
@@ -236,6 +252,7 @@
     <span class="chip">harness <b>{{$r.Harness}}</b></span>
     <span class="chip">skills <b>{{$r.Skill}}</b></span>
     <span class="chip">model <b>{{or $r.Model "(default)"}}</b></span>
+    <span class="chip">workspace <b>{{workspaceLabel $r.WorkspaceMode}}</b></span>
     <span class="chip">asked <b>{{when $r.CreatedAt}}</b></span>
     {{- if $r.EndedAt}}<span class="chip">ended <b>{{when (deref $r.EndedAt)}}</b></span>{{end}}
     {{- if $r.RunID}}<span class="chip">run <b class="mono-sm">{{$r.RunID}}</b></span>{{end}}

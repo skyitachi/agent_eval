@@ -31,6 +31,9 @@ type Replay struct {
 	Skill         string `json:"skill"`
 	Model         string `json:"model"`
 	AgentSpecJSON string `json:"agent_spec_json"`
+	// WorkspaceMode is where the agent was asked to work -- auto, in-place or
+	// copy -- until the replay starts, and where it actually worked after.
+	WorkspaceMode string `json:"workspace_mode"`
 
 	Status    string     `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
@@ -51,7 +54,7 @@ func (r Replay) Finished() bool {
 
 const replayColumns = `id, source, session_id, session_title, harness, skill, model,
 	agent_spec_json, status, created_at, started_at, ended_at,
-	dataset_dir, run_id, report_id, error, log`
+	dataset_dir, run_id, report_id, error, log, workspace_mode`
 
 // CreateReplay records a replay that has been asked for.
 func (s *Store) CreateReplay(ctx context.Context, r Replay) error {
@@ -67,10 +70,10 @@ func (s *Store) CreateReplay(ctx context.Context, r Replay) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO replays(`+replayColumns+`) VALUES(`+placeholders(17)+`)`,
+		`INSERT INTO replays(`+replayColumns+`) VALUES(`+placeholders(18)+`)`,
 		r.ID, r.Source, r.SessionID, r.SessionTitle, r.Harness, r.Skill, r.Model,
 		r.AgentSpecJSON, r.Status, fmtTime(r.CreatedAt), nullTime(r.StartedAt), nullTime(r.EndedAt),
-		r.DatasetDir, r.RunID, r.ReportID, r.Error, r.Log)
+		r.DatasetDir, r.RunID, r.ReportID, r.Error, r.Log, r.WorkspaceMode)
 	if err != nil {
 		return fmt.Errorf("store: create replay: %w", err)
 	}
@@ -86,9 +89,9 @@ func (s *Store) UpdateReplay(ctx context.Context, r Replay) error {
 	defer s.mu.Unlock()
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE replays SET status=?, started_at=?, ended_at=?, dataset_dir=?, run_id=?,
-		 report_id=?, error=?, log=?, agent_spec_json=? WHERE id=?`,
+		 report_id=?, error=?, log=?, agent_spec_json=?, workspace_mode=? WHERE id=?`,
 		r.Status, nullTime(r.StartedAt), nullTime(r.EndedAt), r.DatasetDir, r.RunID,
-		r.ReportID, r.Error, r.Log, r.AgentSpecJSON, r.ID)
+		r.ReportID, r.Error, r.Log, r.AgentSpecJSON, r.WorkspaceMode, r.ID)
 	if err != nil {
 		return fmt.Errorf("store: update replay %s: %w", r.ID, err)
 	}
@@ -177,7 +180,7 @@ func scanReplay(sc scanner) (Replay, error) {
 	)
 	err := sc.Scan(&r.ID, &r.Source, &r.SessionID, &r.SessionTitle, &r.Harness, &r.Skill, &r.Model,
 		&r.AgentSpecJSON, &r.Status, &created, &started, &ended,
-		&r.DatasetDir, &r.RunID, &r.ReportID, &r.Error, &r.Log)
+		&r.DatasetDir, &r.RunID, &r.ReportID, &r.Error, &r.Log, &r.WorkspaceMode)
 	if err != nil {
 		return Replay{}, err
 	}

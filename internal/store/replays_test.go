@@ -143,3 +143,54 @@ func TestOpenUpgradesAV7Database(t *testing.T) {
 		t.Errorf("the upgraded database cannot record a replay: %v", err)
 	}
 }
+
+// TestOpenUpgradesAV8Database covers replays.workspace_mode, which v9 adds. A
+// replay recorded before it reads back as "", which the pages show as a copy.
+func TestOpenUpgradesAV8Database(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v8.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := schemaFS.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		string(body),
+		`ALTER TABLE replays DROP COLUMN workspace_mode`,
+		`INSERT INTO schema_meta(key, value) VALUES('version','8')`,
+		`INSERT INTO replays(id, created_at) VALUES('old','2026-01-01T00:00:00Z')`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			raw.Close()
+			t.Fatalf("build a v8 database (%s): %v", stmt, err)
+		}
+	}
+	raw.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("a v8 database must upgrade rather than be refused: %v", err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	old, err := s.GetReplay(ctx, "old")
+	if err != nil {
+		t.Fatalf("the replay recorded before v9 must still read: %v", err)
+	}
+	if old.WorkspaceMode != "" {
+		t.Errorf("workspace mode of an old replay = %q, want empty", old.WorkspaceMode)
+	}
+	if err := s.CreateReplay(ctx, Replay{ID: "new", WorkspaceMode: "auto"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetReplay(ctx, "new")
+	got.WorkspaceMode = "in-place"
+	if err := s.UpdateReplay(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetReplay(ctx, "new"); got.WorkspaceMode != "in-place" {
+		t.Errorf("workspace mode = %q, want the one the update wrote", got.WorkspaceMode)
+	}
+}

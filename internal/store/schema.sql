@@ -273,7 +273,11 @@ CREATE TABLE IF NOT EXISTS replays (
     -- What the job printed while it ran: collection warnings, one line per
     -- finished cell. It is the only progress a page can show for a replay
     -- whose run row does not exist yet.
-    log           TEXT NOT NULL DEFAULT ''
+    log           TEXT NOT NULL DEFAULT '',
+    -- auto | in-place | copy: what was asked for until the replay starts, and
+    -- where the agent actually worked once it has. Empty on a row from before
+    -- v9, when every replay worked in a copy.
+    workspace_mode TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_replays_session ON replays(source, session_id, created_at DESC);

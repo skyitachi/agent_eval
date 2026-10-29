@@ -333,9 +333,57 @@ func TestTheSessionPagesAnswerOnlyThisServersHostNames(t *testing.T) {
 	}
 }
 
+func TestTheReplayFormOffersInPlaceAndRefusesItWhereItCannotBeDone(t *testing.T) {
+	// The fixture's recorded directory does not exist here, so in place is
+	// impossible: the form says so, the default falls back to a copy, and
+	// "in place only" is refused on the form.
+	h, _ := sessionServer(t)
+	page := getLocal(t, h, "/sessions/claude/"+fixtureSession).Body.String()
+	for _, want := range []string{`name="workspace"`, `value="auto" selected`, `value="in-place"`, `value="copy"`,
+		"In place is not possible here"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the form should contain %q", want)
+		}
+	}
+	token := csrfField.FindStringSubmatch(page)[1]
+	rec := post(h, "/sessions/claude/"+fixtureSession+"/replay",
+		url.Values{"csrf": {token}, "harness": {"scripted"}, "skill": {"none"}, "workspace": {"in-place"}}, nil)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("in place only = %d, want 409\n%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "cannot be replayed in the directory it was recorded in") {
+		t.Error("the refusal must say why on the form")
+	}
+	if !strings.Contains(body, `value="in-place" selected`) {
+		t.Error("the form must keep the pick it refused")
+	}
+}
+
 func TestWithoutSessionsTheRoutesDoNotExist(t *testing.T) {
 	h := New(newStore(t), Options{}).Handler()
 	if r := getLocal(t, h, "/sessions"); r.Code != http.StatusNotFound {
 		t.Errorf("GET /sessions on a reports-only server = %d, want 404", r.Code)
+	}
+	if page := getLocal(t, h, "/").Body.String(); strings.Contains(page, `href="/sessions"`) {
+		t.Error("a reports-only listing links to session pages it does not serve")
+	}
+}
+
+func TestTheListingLinksToTheSessions(t *testing.T) {
+	h, _ := sessionServer(t)
+	rec := getLocal(t, h, "/")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET / = %d\n%s", rec.Code, rec.Body)
+	}
+	page := rec.Body.String()
+	if !strings.Contains(page, `class="calloutbar"`) {
+		t.Error("the listing has no session panel")
+	}
+	if !strings.Contains(page, `class="btn primary" href="/sessions"`) {
+		t.Error("the listing's primary action is not a link to /sessions")
+	}
+	if !strings.Contains(page, `<a href="/replays">Replays</a>`) {
+		t.Error("the listing's nav does not offer the replay list")
 	}
 }

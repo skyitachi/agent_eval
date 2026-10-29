@@ -78,7 +78,7 @@ models: [sonnet, opus]   # 只是表单里的建议，仍然可以自由填写
    1. 解析会话，调用 `session.Collect`，`Machine` 填 `machine.Current()`，split 和是否 `--workspace-cwd` 由表单决定。
    2. 写数据集到 `<db 所在目录>/replays/<rid>/dataset`。
    3. 依次调用 `dataset.Load`、`runner.CheckMachine`、`runner.Preflight`。
-   4. `runner.Run`：用副本，不用 in-place；`RunName` = `replay <会话短 id>`；Notes 记下预设名和 model。
+   4. `runner.Run`：表单的 workspace 默认 `auto`，即能还原现场就 in-place（`Stash: true`，未提交改动先暂存到 `refs/agenteval/stash`、结束后恢复），否则用副本；`in-place` 不能原地时报错；`copy` 总用副本。实际用的模式写回任务行的 `workspace_mode`。`RunName` = `replay <会话短 id>`；Notes 记下预设名和 model。
    5. `report.Load` 之后调用 `report.Save`（kind `run`，params `{run: <id>}`），把 report id 写回任务行。
 4. 任务状态：`queued → running → done | failed`。失败时记下错误原文。
 5. `serve` 收到 SIGINT 时，取消正在跑的回放（ctx 传进 `runner.Run`），任务标记为 `interrupted`。

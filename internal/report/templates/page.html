@@ -62,6 +62,22 @@
   <div class="notice {{.Record.Severity}}"><b>{{.Record.Head}}</b> {{.Record.Note}}</div>
 </div>
 {{- end}}
+{{- /* The callout sits outside <main> for the same reason as the banner. */}}
+{{- if .Callout}}
+<div class="calloutbar">
+  <div class="card callout">
+    <div class="callout-text">
+      <div class="callout-head">{{.Callout.Head}}</div>
+      {{- if .Callout.Note}}<div class="callout-note">{{.Callout.Note}}</div>{{end}}
+    </div>
+    <div class="callout-links">
+      {{- range $i, $l := .Callout.Links}}
+      <a class="btn{{if eq $i 0}} primary{{end}}" href="{{$l.Href}}">{{$l.Label}}</a>
+      {{- end}}
+    </div>
+  </div>
+</div>
+{{- end}}
 <main id="main"></main>
 <aside id="drawer" class="drawer" hidden aria-live="polite"></aside>
 

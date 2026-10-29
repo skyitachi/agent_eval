@@ -199,6 +199,28 @@ main {
 }
 .recordbar .notice { margin-bottom: 0; }
 
+/* A panel of links above the document, outside main for the same reason. */
+.calloutbar {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 16px 20px 0;
+}
+.callout {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 16px 20px;
+  border-left: 4px solid var(--accent);
+  background: color-mix(in srgb, var(--accent-soft) 60%, var(--panel));
+}
+.callout-text { flex: 1; min-width: 240px; }
+.callout-head { font-size: 15px; font-weight: 640; color: var(--text); }
+.callout-note { color: var(--text-soft); font-size: 13px; margin-top: 3px; }
+.callout-links { display: flex; gap: 8px; flex-wrap: wrap; }
+.callout-links .btn { font-size: 14px; padding: 8px 16px; font-weight: 560; }
+a.btn:hover { text-decoration: none; }
+
 /* The failure page's explanation. It is prose rather than a value, so it takes
  * the body size and a comfortable line height instead of the card's tighter
  * heading styling. */
@@ -587,7 +609,7 @@ pre.code.nowrap { white-space: pre; word-break: normal; }
 /* ------------------------------------------------------------------ print */
 
 @media print {
-  .topbar, .drawer, .filters, .bar-actions, .metric .infobtn { display: none !important; }
+  .topbar, .calloutbar, .drawer, .filters, .bar-actions, .metric .infobtn { display: none !important; }
   body { background: #fff; }
   .card, .metric { box-shadow: none; break-inside: avoid; }
   main { max-width: none; padding: 0; }

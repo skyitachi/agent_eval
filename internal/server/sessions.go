@@ -83,6 +83,17 @@ var sessionTemplates = template.Must(template.New("sessions").Funcs(template.Fun
 		}
 		return s
 	},
+	"workspaceLabel": func(m string) string {
+		switch m {
+		case replay.WorkspaceInPlace:
+			return "in place"
+		case replay.WorkspaceCopy, "":
+			// Empty is a row from before the mode was recorded, when every
+			// replay worked in a copy.
+			return "copy"
+		}
+		return "in place if possible"
+	},
 	"describe": describeSpec,
 	"rows": func(r []store.Replay, withSession bool, csrf string) map[string]any {
 		return map[string]any{"Rows": r, "WithSession": withSession, "CSRF": csrf}
@@ -221,10 +232,11 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
-	s.renderSessionPage(w, r, http.StatusOK, replay.Choice{}, "")
+	s.renderSessionPage(w, r, http.StatusOK, replay.Choice{}, "", "")
 }
 
-func (s *Server) renderSessionPage(w http.ResponseWriter, r *http.Request, status int, pick replay.Choice, formErr string) {
+func (s *Server) renderSessionPage(w http.ResponseWriter, r *http.Request, status int, pick replay.Choice,
+	workspace, formErr string) {
 	source, id := r.PathValue("source"), r.PathValue("id")
 	entry, err := s.sessions.Catalog.Find(source, id)
 	if err != nil {
@@ -261,11 +273,15 @@ func (s *Server) renderSessionPage(w http.ResponseWriter, r *http.Request, statu
 	if len(turns) > maxTurnsShown {
 		turns, clipped = turns[:maxTurnsShown], true
 	}
+	if workspace == "" {
+		workspace = replay.WorkspaceAuto
+	}
 	s.renderSessions(w, status, "session", map[string]any{
 		"Title": entry.Title, "Mode": "session",
 		"Entry": entry, "Session": sess, "Turns": turns, "Clipped": clipped,
 		"Replays": replays, "Presets": presets, "Models": models, "Pick": pick,
 		"FormError": formErr, "CSRF": s.csrf, "Bound": bindable(sess.Cwd),
+		"InPlace": s.sessions.Replays.CheckInPlace(r.Context(), sess), "Workspace": workspace,
 	})
 }
 
@@ -275,15 +291,19 @@ func (s *Server) handleStartReplay(w http.ResponseWriter, r *http.Request) {
 		Skill:   r.PostForm.Get("skill"),
 		Model:   r.PostForm.Get("model"),
 	}
+	workspace := r.PostForm.Get("workspace")
 	rp, err := s.sessions.Replays.Submit(r.Context(), replay.Request{
-		Source: r.PathValue("source"), SessionID: r.PathValue("id"), Choice: pick,
+		Source: r.PathValue("source"), SessionID: r.PathValue("id"), Choice: pick, Workspace: workspace,
 	})
 	if err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, replay.ErrBusy) {
+		switch {
+		case errors.Is(err, replay.ErrBusy):
 			status = http.StatusServiceUnavailable
+		case errors.Is(err, replay.ErrNotInPlace):
+			status = http.StatusConflict
 		}
-		s.renderSessionPage(w, r, status, pick, err.Error())
+		s.renderSessionPage(w, r, status, pick, workspace, err.Error())
 		return
 	}
 	// Post/redirect/get, so a reload of the replay page does not start a

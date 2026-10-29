@@ -90,6 +90,16 @@ type NavLink struct {
 	Active bool
 }
 
+// Callout is a panel of links drawn above the document, for a way out of the
+// page that has to be found rather than noticed in the nav -- the server uses it
+// to point the report listing at the session pages.
+type Callout struct {
+	Head string
+	Note string
+	// Links are drawn as buttons, the first one as the primary action.
+	Links []NavLink
+}
+
 // RenderOptions shapes the emitted document.
 type RenderOptions struct {
 	// Title overrides the payload's own title.
@@ -109,6 +119,8 @@ type RenderOptions struct {
 	// Record, when set, renders a banner above the document saying which
 	// registration the page came from and whether it still reproduces.
 	Record *Record
+	// Callout, when set, renders a panel of links above the document.
+	Callout *Callout
 }
 
 func (o RenderOptions) withDefaults() RenderOptions {
@@ -141,11 +153,12 @@ type shellHead struct {
 }
 
 type pageView struct {
-	Head   shellHead
-	Mode   string
-	Home   string
-	Nav    []NavLink
-	Record *Record
+	Head    shellHead
+	Mode    string
+	Home    string
+	Nav     []NavLink
+	Record  *Record
+	Callout *Callout
 	// JS is the client, inlined when the document is standalone.
 	JS      template.JS
 	Payload template.JS
@@ -363,6 +376,7 @@ func render(w io.Writer, mode Mode, payload any, title string, opts RenderOption
 		Home:    opts.Home,
 		Nav:     opts.Nav,
 		Record:  opts.Record,
+		Callout: opts.Callout,
 		Payload: js,
 	}
 	if opts.Standalone {
