@@ -317,6 +317,35 @@ type Grader interface {
 	Grade(ctx context.Context, gc *Context, spec dataset.GraderSpec) (*Result, error)
 }
 
+// Sandboxed is implemented by graders that cannot run without a live workspace.
+//
+// Most graders read only what a finished cell recorded -- the diff and the final
+// answer. That is what makes it possible to re-grade a stored run without
+// paying for the agent a second time. pytest and command are different: they
+// execute programs inside the workspace, so they need a sandbox, and a re-grade
+// has none.
+//
+// Declaring the dependency here, rather than recognising the type name at the
+// call site, keeps the list from drifting: a new grader that shells out has to
+// say so, and the re-grade refuses it by name instead of reporting a verdict
+// produced from a nil workspace.
+type Sandboxed interface {
+	// RequiresSandbox reports whether this grader executes inside a workspace.
+	RequiresSandbox() bool
+}
+
+// NeedsWorkspace reports whether a registered grader type cannot run from a
+// stored row. Unknown types report false; the caller resolves those first and
+// gets a better error there.
+func NeedsWorkspace(typ string) bool {
+	g, err := Get(typ)
+	if err != nil {
+		return false
+	}
+	s, ok := g.(Sandboxed)
+	return ok && s.RequiresSandbox()
+}
+
 var (
 	regMu    sync.RWMutex
 	registry = map[string]Grader{}

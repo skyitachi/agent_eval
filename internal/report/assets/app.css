@@ -606,10 +606,34 @@ pre.code.nowrap { white-space: pre; word-break: normal; }
   box-shadow: var(--shadow);
 }
 
+/* -------------------------------------------------------------- re-grading */
+
+/* The only control here that writes. It gets a column of its own so it cannot
+ * be mistaken for a measurement, and it is smaller than the top-bar buttons
+ * because a click rewrites a row and may spend an API call: it should read as
+ * an operation on one cell, not as another way to look at the page. */
+.gradecell { width: 1%; white-space: nowrap; }
+.btn.grade { padding: 3px 9px; font-size: 12px; }
+.gradecell .btn.grade:hover { border-color: var(--accent); color: var(--accent); }
+
+/* The picker in the drawer. Dashed rather than solid: it is an offer to
+ * change the record, and it should look like one next to the cards that only
+ * report what happened. */
+.gradebox {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--panel-2);
+}
+.gradebox .bar-actions { margin: 8px 0 0; }
+
 /* ------------------------------------------------------------------ print */
 
 @media print {
   .topbar, .calloutbar, .drawer, .filters, .bar-actions, .metric .infobtn { display: none !important; }
+  /* A printed page cannot post, so the control that does is not printed. */
+  .gradecell { display: none !important; }
   body { background: #fff; }
   .card, .metric { box-shadow: none; break-inside: avoid; }
   main { max-width: none; padding: 0; }

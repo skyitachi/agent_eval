@@ -946,6 +946,68 @@ func (s *Store) SaveAttempt(ctx context.Context, a Attempt) error {
 	return nil
 }
 
+// GradeUpdate is the part of a cell that grading owns.
+//
+// It exists because a verdict can be reached twice: once by the run, and again
+// later when someone re-grades one task from what the row already holds. That
+// second pass must not rewrite the measurement -- tokens, duration and cost are
+// facts about a process that has already finished -- so the columns it may touch
+// are listed here rather than being implied by a whole-row save.
+type GradeUpdate struct {
+	Graded    bool
+	Passed    bool
+	Score     float64
+	Threshold float64
+	Grades    []grader.Result
+	// Error, when non-nil, replaces the cell's error text. A re-grade that
+	// succeeds uses it to withdraw the "grade: ..." note an earlier attempt at
+	// grading left behind, which would otherwise contradict the verdict stored
+	// beside it.
+	Error *string
+}
+
+// UpdateGrade writes a new verdict onto one cell, leaving the measurement alone.
+//
+// The row must exist: a re-grade of a cell that was never recorded is a
+// question about the wrong database, and the error names the file so it reads
+// that way.
+func (s *Store) UpdateGrade(ctx context.Context, runID, taskID string, sample int, u GradeUpdate) error {
+	if runID == "" || taskID == "" {
+		return fmt.Errorf("store: a grade needs a run id and a task id")
+	}
+	grades, err := json.Marshal(nonNilResults(u.Grades))
+	if err != nil {
+		return fmt.Errorf("store: encode grades: %w", err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var errText any
+	if u.Error != nil {
+		errText = *u.Error
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE attempts SET
+			graded=?, passed=?, score=?, threshold=?, grades_json=?,
+			error=CASE WHEN ? IS NULL THEN error ELSE ? END
+		WHERE run_id=? AND task_id=? AND sample_index=?`,
+		boolInt(u.Graded), boolInt(u.Passed), u.Score, u.Threshold, string(grades),
+		errText, errText,
+		runID, taskID, sample)
+	if err != nil {
+		return fmt.Errorf("store: save grade %s#%d: %w", taskID, sample, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("store: save grade %s#%d: %w", taskID, sample, err)
+	}
+	if n == 0 {
+		return &NotFoundError{Kind: "attempt", ID: runID + "/" + taskID, Path: s.path}
+	}
+	return nil
+}
+
 // checkArity turns an off-by-one between a column list and its values into a
 // named error instead of a SQL message that says only "N values for M columns"
 // and leaves the reader to count by hand. It has happened here before.

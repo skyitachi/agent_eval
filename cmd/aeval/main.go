@@ -52,6 +52,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/dataset"
 	"github.com/skyitachi/agenteval/internal/machine"
+	"github.com/skyitachi/agenteval/internal/regrade"
 	"github.com/skyitachi/agenteval/internal/replay"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
@@ -96,6 +97,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdReport(rest, stdout, stderr)
 	case "serve":
 		return cmdServe(rest, stdout, stderr)
+	case "grade":
+		return cmdGrade(rest, stdout, stderr)
 	case "list", "ls":
 		return cmdList(rest, stdout, stderr)
 	case "version", "--version", "-v":
@@ -120,7 +123,8 @@ usage: aeval <command> [flags]
   run       run a dataset against one agent
   matrix    sweep one axis, or attribute a sweep that already ran
   report    render an HTML report, comparison, attribution or run list
-  serve     serve recorded reports, and this machine's sessions with a replay button, over HTTP
+  serve     serve recorded reports and this machine's sessions over HTTP; grade a cell from its page
+  grade     reach a verdict for one recorded task without re-running the agent
   list      list recorded runs
   version   print version and schema information
 
@@ -1039,8 +1043,8 @@ func collectWorkbuddySessions(root, selector, cwd string, latest bool, stderr io
 
 	var (
 		sessions []*session.Session
-		keptIDs []string
-		dropped int
+		keptIDs  []string
+		dropped  int
 	)
 	for _, id := range ids {
 		path, ok := byID[id]
@@ -2108,7 +2112,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		limit  = fs.Int("limit", 200, "how many recorded reports the list shows")
 		title  = fs.String("title", "", "heading of the report list")
 
-		noSessions  = fs.Bool("no-sessions", false, "serve reports only: no session pages and no replay button")
+		noSessions  = fs.Bool("no-sessions", false, "serve reports only: no session pages and no replay button (a report page can still be graded)")
 		presetsPath = fs.String("replay-config", "", "YAML file of the harnesses, skill sets and models a replay can pick")
 		claudeRoot  = fs.String("claude-root", "", "where Claude Code transcripts are read from (default ~/.claude/projects)")
 		cursorDB    = fs.String("cursor-db", "", "Cursor's state database (default: the platform's location)")
@@ -2208,10 +2212,15 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	if !isLoopback(ln.Addr().String()) {
 		// Worth a line: the database holds every recorded transcript, diff and
 		// answer, so the difference between this and the default is the
-		// difference between a page on this machine and one on the network.
+		// difference between a page on this machine and one on the network --
+		// and since a page can re-grade a cell, the difference is not only
+		// about reading.
 		fmt.Fprintln(stdout, "warning   bound to a non-loopback address: "+
-			"anything that can reach this port can read every recorded report")
+			"anything that can reach this port can read every recorded report, and grade a cell from one")
 	}
+	// The one thing here that writes, said out loud rather than discovered by
+	// pressing a button whose consequences were not stated.
+	fmt.Fprintln(stdout, "grading   a cell can be re-graded from its report page; that writes to this database")
 	if !*noSessions {
 		fmt.Fprintf(stdout, "sessions  %ssessions   (replays launch agents on this machine; --no-sessions turns this off)\n",
 			listenURL(ln.Addr().String()))
@@ -2338,6 +2347,165 @@ func distinct(attempts []store.Attempt) map[string]bool {
 		seen[a.TaskID] = true
 	}
 	return seen
+}
+
+// ---------------------------------------------------------------------------
+// grade
+// ---------------------------------------------------------------------------
+
+// cmdGrade re-grades one task of a finished run from what the row recorded.
+//
+// It exists because a verdict is not always reachable when the agent stops: a
+// collected session has no ground truth, a judge may have been missing its
+// credentials, a rubric may have been wrong. Re-running the task would answer a
+// different question -- a new attempt, at a new cost -- so this scores the work
+// that was actually done.
+func cmdGrade(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("grade", flag.ContinueOnError)
+	var (
+		common commonFlags
+		runID  = fs.String("run", "", "run that holds the task (required)")
+		tasks  stringList
+		sample = fs.Int("sample", -1, "which pass of a task with several samples to grade (-1: the first recorded)")
+		dsPath = fs.String("dataset", "",
+			"dataset manifest to read the task and its graders from (default: the one the run recorded)")
+		gtype  = fs.String("grader", "", "grade with this grader type instead of the ones the task declares")
+		gname  = fs.String("grader-name", "", "label for --grader in the report (default: its type)")
+		gconf  = fs.String("grader-config", "", "JSON config for --grader")
+		thresh = fs.Float64("threshold", 0, "score the task must reach to pass (default: the cutoff recorded on the cell, else 1.0)")
+		asJSON = fs.Bool("json", false, "print the verdicts as JSON")
+	)
+	fs.Var(&tasks, "task", "task id to grade (repeatable)")
+	addCommon(fs, &common)
+	if ok, code := parse(fs, args, stderr); !ok {
+		return code
+	}
+	if *runID == "" {
+		return usageFail(stderr, "grade: --run is required")
+	}
+	if len(tasks) == 0 {
+		return usageFail(stderr, "grade: --task is required; this command grades the tasks you name, not the run")
+	}
+
+	var specs []dataset.GraderSpec
+	switch {
+	case *gtype != "":
+		spec := dataset.GraderSpec{Type: *gtype, Name: *gname}
+		switch {
+		case *gconf != "":
+			if err := json.Unmarshal([]byte(*gconf), &spec.Config); err != nil {
+				return usageFail(stderr, "grade: --grader-config is not a JSON object: %v", err)
+			}
+		case *gtype == replay.DefaultGrader:
+			// The same rubric the web replay attaches. A verdict reached from
+			// the command line and one reached from the page have to be
+			// comparable, or the choice of entry point becomes a variable.
+			spec.Config = replay.DefaultGraderConfig()
+			fmt.Fprintf(stdout, "note: %s with the rubric a web replay attaches; "+
+				"pass --grader-config to replace it\n", *gtype)
+		}
+		specs = []dataset.GraderSpec{spec}
+	case *gconf != "" || *gname != "":
+		return usageFail(stderr, "grade: --grader-config and --grader-name only mean something with --grader")
+	}
+
+	ctx, stop := signalContext()
+	defer stop()
+
+	st, err := openStore(&common)
+	if err != nil {
+		return fail(stderr, "grade: %v", err)
+	}
+	defer st.Close()
+
+	opts := regrade.Options{Dataset: absFlagPath(*dsPath), Graders: specs, Threshold: *thresh}
+	code := exitOK
+	var outcomes []*regrade.Outcome
+	for _, id := range tasks {
+		o, err := regrade.One(ctx, st, *runID, id, *sample, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "aeval: grade: %v\n", err)
+			code = exitError
+			continue
+		}
+		outcomes = append(outcomes, o)
+	}
+
+	if *asJSON {
+		// An empty list rather than nothing: a script that decodes the output
+		// must not have to tell "no verdicts" from "the command printed garbage".
+		if outcomes == nil {
+			outcomes = []*regrade.Outcome{}
+		}
+		if jcode := emitJSON(stdout, stderr, outcomes); jcode != exitOK {
+			return jcode
+		}
+		return code
+	}
+	for i, o := range outcomes {
+		if i > 0 {
+			fmt.Fprintln(stdout)
+		}
+		printVerdict(stdout, o)
+	}
+	if len(outcomes) > 0 {
+		// The stored page was rendered from the row as it was. Its hash no
+		// longer describes what the database holds, and saying so is the
+		// difference between a stale page and a page a reader can trust.
+		fmt.Fprintf(stdout, "\nthe recorded page for this run no longer matches; re-render it with: %s\n",
+			reportCommand(*runID, common.db))
+	}
+	return code
+}
+
+// printVerdict renders one re-graded cell.
+func printVerdict(w io.Writer, o *regrade.Outcome) {
+	verdict := "FAIL"
+	if o.Grade.Passed {
+		verdict = "PASS"
+	}
+	fmt.Fprintf(w, "task %s#%d  %s  score %.2f (threshold %.2f)\n",
+		o.TaskID, o.Sample, verdict, o.Grade.Score, o.Grade.Threshold)
+	fmt.Fprintf(w, "  was: %s\n", wasVerdict(o.Before))
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, r := range o.Grade.Results {
+		v := "fail"
+		if r.Passed {
+			v = "pass"
+		}
+		note := r.Reason
+		if r.Error != "" {
+			note = "ERROR: " + r.Error
+		}
+		fmt.Fprintf(tw, "  %s\t%s\t%.2f\t%s\n", r.Grader, v, r.Score, truncate(note, 120))
+	}
+	tw.Flush()
+	if len(o.Grade.Errors) > 0 {
+		fmt.Fprintf(w, "  this verdict is unreliable: %s\n", strings.Join(o.Grade.Errors, "; "))
+	}
+}
+
+// wasVerdict names the state the row was in before the re-grade.
+func wasVerdict(a store.Attempt) string {
+	switch {
+	case !a.Graded:
+		return "not graded"
+	case a.Passed:
+		return fmt.Sprintf("pass, score %.2f", a.Score)
+	default:
+		return fmt.Sprintf("fail, score %.2f", a.Score)
+	}
+}
+
+// reportCommand spells out the command that regenerates a run's page, with the
+// --db it was read from when that is not the default. A hint that omits the
+// database is a hint that fails for anyone whose file is somewhere else.
+func reportCommand(runID, db string) string {
+	cmd := "aeval report --run " + runID
+	if db != defaultDB {
+		cmd += " --db " + hintArg(db)
+	}
+	return cmd
 }
 
 // ---------------------------------------------------------------------------

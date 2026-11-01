@@ -108,6 +108,12 @@ func (j *LLMJudge) Grade(ctx context.Context, gc *Context, spec dataset.GraderSp
 
 	reference := cfg.Reference
 	if cfg.ReferenceFile != "" {
+		// A reference file is read out of the workspace. Re-grading a stored row
+		// has no workspace, and the read below would panic rather than say so.
+		if gc.Sandbox == nil {
+			return nil, fmt.Errorf("reference_file %s: no workspace to read it from; "+
+				"put the text in config.reference instead", cfg.ReferenceFile)
+		}
 		data, err := gc.Sandbox.ReadFile(cfg.ReferenceFile)
 		if err != nil {
 			// Fall back to a dataset-relative read so a reference can live beside

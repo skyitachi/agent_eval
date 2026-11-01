@@ -26,6 +26,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/skyitachi/agenteval/internal/report"
+	"github.com/skyitachi/agenteval/internal/store"
 )
 
 // browser is the browser the render tests drive, or "" when none was found.
@@ -192,6 +195,22 @@ type renderResult struct {
 // browserRender loads a report in a browser and returns what the client drew.
 func browserRender(t *testing.T, reportPath string) renderResult {
 	t.Helper()
+	raw := browserProbe(t, reportPath, renderProbe)
+	var res renderResult
+	if err := json.Unmarshal([]byte(raw), &res); err != nil {
+		t.Fatalf("parse probe payload: %v", err)
+	}
+	return res
+}
+
+// browserProbe appends an arbitrary probe to a page, loads it, and returns the
+// JSON the probe reported.
+//
+// The probe is a parameter because a page has more than one question to answer:
+// the run report's client draws a table and a drawer, and the same client has to
+// withhold controls on a document that has no server behind it.
+func browserProbe(t *testing.T, reportPath, probe string) string {
+	t.Helper()
 	doc, err := os.ReadFile(reportPath)
 	if err != nil {
 		t.Fatalf("read report: %v", err)
@@ -200,7 +219,7 @@ func browserRender(t *testing.T, reportPath string) renderResult {
 		t.Fatalf("report has %d </body> tags; the probe expects exactly one", n)
 	}
 	page := filepath.Join(t.TempDir(), "probe.html")
-	probed := strings.Replace(string(doc), "</body>", renderProbe, 1)
+	probed := strings.Replace(string(doc), "</body>", probe, 1)
 	if err := os.WriteFile(page, []byte(probed), 0o644); err != nil {
 		t.Fatalf("write probe page: %v", err)
 	}
@@ -234,11 +253,7 @@ func browserRender(t *testing.T, reportPath string) renderResult {
 	if err != nil {
 		t.Fatalf("decode probe payload: %v", err)
 	}
-	var res renderResult
-	if err := json.Unmarshal(raw, &res); err != nil {
-		t.Fatalf("parse probe payload: %v", err)
-	}
-	return res
+	return string(raw)
 }
 
 func tail(s string, n int) string {
@@ -596,4 +611,151 @@ tasks:
 	write("dataset.yaml", manifest)
 	write(filepath.Join("baselines", "recorded.json"), baseline)
 	return dir
+}
+
+// gradeProbe reads the one control on the page that writes: whether the client
+// offered it, and whether the picker behind it lists what the server accepts.
+const gradeProbe = `<script>
+setTimeout(function () {
+  var out = { rows: 0, buttons: 0, action: false, picker: false, graders: [], notice: '', banner: '' };
+  out.action = !!document.body.getAttribute('data-grade-url');
+  out.rows = document.querySelectorAll('#main tbody tr').length;
+  /* Only the table's own buttons count: a control anywhere else on the page
+   * would be a second place to press, and this asserts there is one. */
+  out.buttons = document.querySelectorAll('#main tbody .btn.grade').length;
+  var heads = document.querySelectorAll('#main thead th');
+  out.columns = heads.length;
+  var first = document.querySelector('#main tbody tr');
+  if (first) first.click();
+  var tab = document.querySelector('.drawer-body [data-tab="graders"]');
+  if (tab) tab.click();
+  var run = document.querySelector('#grader-run');
+  out.picker = !!run;
+  var sel = document.querySelector('#grader-choice');
+  if (sel) {
+    out.graders = Array.prototype.map.call(sel.options, function (o) { return o.value; });
+  }
+  var notice = document.querySelector('.recordbar .notice');
+  out.notice = notice ? notice.textContent : '';
+  var pre = document.createElement('pre');
+  pre.textContent = 'PROBE64=' + btoa(unescape(encodeURIComponent(JSON.stringify(out))));
+  document.documentElement.appendChild(pre);
+}, 700);
+</script>
+</body>`
+
+type gradeView struct {
+	Rows    int      `json:"rows"`
+	Buttons int      `json:"buttons"`
+	Action  bool     `json:"action"`
+	Picker  bool     `json:"picker"`
+	Graders []string `json:"graders"`
+	Columns int      `json:"columns"`
+	Notice  string   `json:"notice"`
+}
+
+// TestReportGradeControlOnlyExistsOnAServedPage is the client half of the
+// promise the server keeps in its template: a report is graded from a page that
+// has a server, and a report that was saved is still only a document.
+//
+// The two pages here differ in exactly one thing -- the GradeAction the server
+// passes in -- and the assertions are the two directions of that difference. A
+// control that appears on a saved file is a button that cannot work; a control
+// the client fails to draw from a served page is the feature not existing, and
+// neither shows up in the artifact, because both pages contain the same client
+// source.
+func TestReportGradeControlOnlyExistsOnAServedPage(t *testing.T) {
+	requireBrowser(t)
+	work := t.TempDir()
+	ds := writeOneAnswerDataset(t, filepath.Join(work, "ds"))
+	db := filepath.Join(work, "grade.db")
+
+	bin := filepath.Join(work, "answer.sh")
+	writeExecutable(t, bin, "#!/bin/sh\ncat >/dev/null\necho done\n")
+	r := runCLI(t, "run", "--dataset", ds, "--bin", bin, "--name", "gradable",
+		"--db", db, "--work-root", filepath.Join(work, "work"), "--quiet")
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+	runID := onlyRunID(t, db)
+
+	st, err := store.Open(db)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	data, err := report.Load(context.Background(), st, runID, report.Options{}.Resolve())
+	if err != nil {
+		t.Fatalf("load run: %v", err)
+	}
+
+	// The document as `aeval report` writes it.
+	inert := filepath.Join(work, "inert.html")
+	if err := report.RenderRunFile(inert, data, report.RenderOptions{}); err != nil {
+		t.Fatalf("render file: %v", err)
+	}
+	plain := probeGrades(t, inert)
+	if plain.Rows == 0 {
+		t.Fatal("the client drew no cells, so the rest of this test proves nothing")
+	}
+	if plain.Action || plain.Buttons != 0 || plain.Picker {
+		t.Errorf("a saved report offers grading (action=%v buttons=%d picker=%v)",
+			plain.Action, plain.Buttons, plain.Picker)
+	}
+	// The column goes with the control: a header that promises a button the
+	// page does not have is the same mistake drawn differently.
+	served := filepath.Join(work, "served.html")
+	var buf bytes.Buffer
+	err = report.RenderRun(&buf, data, report.RenderOptions{
+		Standalone: true,
+		Grade: &report.GradeAction{
+			URL:     "/r/abc123/grade",
+			Token:   "0123456789abcdef",
+			Graders: []string{"auto", "llm_judge", "patch"},
+		},
+		Notice: &report.Notice{
+			Severity: "info",
+			Head:     "The verdict on record is PASS.",
+			Note:     "Task answer scores 1.00 against a threshold of 1.00.",
+		},
+	})
+	if err != nil {
+		t.Fatalf("render served page: %v", err)
+	}
+	if err := os.WriteFile(served, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write served page: %v", err)
+	}
+	live := probeGrades(t, served)
+	if !live.Action {
+		t.Fatal("the served page does not carry the grade action, so its client cannot offer one")
+	}
+	if live.Buttons != live.Rows {
+		t.Errorf("the table drew %d grade button(s) for %d rows, want one each", live.Buttons, live.Rows)
+	}
+	if live.Columns != plain.Columns+1 {
+		t.Errorf("the served table has %d columns and the saved one %d: the grade column is not the only difference",
+			live.Columns, plain.Columns)
+	}
+	if !live.Picker {
+		t.Error("the graders tab offers no way to choose what to grade with")
+	}
+	if strings.Join(live.Graders, ",") != "auto,llm_judge,patch" {
+		t.Errorf("the picker offers %v, want the values the server accepts", live.Graders)
+	}
+	// The banner is outside the payload, so the client must not have painted
+	// over it: a page that just changed its mind about a cell has to say so.
+	if !strings.Contains(live.Notice, "The verdict on record is PASS.") {
+		t.Errorf("the notice above the document was lost: %q", live.Notice)
+	}
+}
+
+// probeGrades renders a page with the grade probe and decodes what it reported.
+func probeGrades(t *testing.T, path string) gradeView {
+	t.Helper()
+	raw := browserProbe(t, path, gradeProbe)
+	var v gradeView
+	if err := json.Unmarshal([]byte(raw), &v); err != nil {
+		t.Fatalf("parse grade probe: %v\n%s", err, raw)
+	}
+	return v
 }

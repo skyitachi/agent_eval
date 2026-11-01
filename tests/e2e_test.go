@@ -3596,3 +3596,171 @@ func TestCLIOnlyWorksInPlaceWhenAsked(t *testing.T) {
 		t.Errorf("an ordinary run must not leave an in-place lock behind: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Re-grading one task
+// ---------------------------------------------------------------------------
+
+// A verdict is not always reachable when the agent stops. This covers the case
+// that motivated the command: the row holds the work, the rubric was wrong, and
+// the answer is to score that work again rather than to pay for a second
+// attempt at a task that was already run.
+func TestCLIGradesOneRecordedTaskWithoutRerunningIt(t *testing.T) {
+	work := t.TempDir()
+	ds := filepath.Join(work, "ds")
+	if err := os.MkdirAll(ds, 0o755); err != nil {
+		t.Fatalf("mkdir dataset: %v", err)
+	}
+	writeFile(t, filepath.Join(ds, "dataset.yaml"), "name: grade-fixture\nversion: 1.0.0\ntasks_file: tasks.jsonl\n")
+	// The agent answers "done"; the task's own rubric wants "31", so the run
+	// records a graded failure. Re-grading with a rubric that accepts the
+	// recorded answer must flip the row without touching the agent.
+	writeFile(t, filepath.Join(ds, "tasks.jsonl"), `{"id":"answer","prompt":"answer the question",`+
+		`"workspace":{"type":"files","files":{"a.txt":"x"}},`+
+		`"output":{"type":"stdout"},`+
+		`"graders":[{"type":"exact_match","config":{"expected":"31"}}]}`+"\n")
+
+	// A plain-text answer, because the subject here is the verdict and not how
+	// a stream is parsed.
+	bin := filepath.Join(work, "answer.sh")
+	writeExecutable(t, bin, "#!/bin/sh\ncat >/dev/null\necho done\n")
+
+	db := filepath.Join(work, "grade.db")
+	r := runCLI(t, "run", "--dataset", ds, "--agent", "mock",
+		"--bin", bin, "--db", db,
+		"--work-root", filepath.Join(work, "cells"), "--quiet")
+	if r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+	runID := onlyRunID(t, db)
+
+	before := filepath.Join(work, "before.html")
+	if r := runCLI(t, "report", "--run", runID, "--db", db, "-o", before); r.exitCode != 0 {
+		t.Fatalf("report exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	if p := payloadFromHTML(t, before); p.Counts.Graded != 1 || p.Counts.Passed != 0 {
+		t.Fatalf("before: graded %d passed %d, want 1 and 0", p.Counts.Graded, p.Counts.Passed)
+	}
+
+	g := runCLI(t, "grade", "--run", runID, "--task", "answer", "--db", db,
+		"--grader", "exact_match", "--grader-config", `{"expected":"done","normalize":["trim"]}`)
+	if g.exitCode != 0 {
+		t.Fatalf("grade exited %d\nstdout:\n%s\nstderr:\n%s", g.exitCode, g.stdout, g.stderr)
+	}
+	if !strings.Contains(g.stdout, "PASS") {
+		t.Errorf("grade printed no verdict:\n%s", g.stdout)
+	}
+	// The row it replaced has to be on screen: a verdict without the one it
+	// replaced cannot be read as a change.
+	if !strings.Contains(g.stdout, "was: fail") {
+		t.Errorf("grade did not say what the row held before:\n%s", g.stdout)
+	}
+	if !strings.Contains(g.stdout, "aeval report --run "+runID) {
+		t.Errorf("grade did not say how to re-render the page:\n%s", g.stdout)
+	}
+
+	after := filepath.Join(work, "after.html")
+	if r := runCLI(t, "report", "--run", runID, "--db", db, "-o", after); r.exitCode != 0 {
+		t.Fatalf("report after grade exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	p := payloadFromHTML(t, after)
+	if p.Counts.Graded != 1 || p.Counts.Passed != 1 {
+		t.Errorf("after: graded %d passed %d, want 1 and 1", p.Counts.Graded, p.Counts.Passed)
+	}
+	if len(p.Tasks) != 1 || len(p.Tasks[0].Graders) != 1 {
+		t.Fatalf("tasks = %+v", p.Tasks)
+	}
+	if got := p.Tasks[0].Graders[0]; got.Type != "exact_match" || !got.Passed {
+		t.Errorf("re-graded verdict = %+v, want the exact_match grader passing", got)
+	}
+	if strings.TrimSpace(p.Tasks[0].Answer) != "done" {
+		t.Errorf("answer = %q: the re-grade should have kept the recorded one", p.Tasks[0].Answer)
+	}
+
+	// Still one run: the point of the command is that it does not start another.
+	if got := countRuns(t, db); got != 1 {
+		t.Errorf("%d runs recorded, want 1: grading started the agent again", got)
+	}
+}
+
+// A grader that executes inside the workspace has nothing to execute in once the
+// run is over. Refusing it is the honest answer; running it against nothing
+// would produce a failure that reads as the agent's.
+func TestCLIRefusesToGradeWithAGraderThatNeedsTheWorkspace(t *testing.T) {
+	work := t.TempDir()
+	ds := filepath.Join(work, "ds")
+	if err := os.MkdirAll(ds, 0o755); err != nil {
+		t.Fatalf("mkdir dataset: %v", err)
+	}
+	writeFile(t, filepath.Join(ds, "dataset.yaml"), "name: grade-fixture\nversion: 1.0.0\ntasks_file: tasks.jsonl\n")
+	writeFile(t, filepath.Join(ds, "tasks.jsonl"), `{"id":"answer","prompt":"answer the question",`+
+		`"workspace":{"type":"files","files":{"a.txt":"x"}},`+
+		`"output":{"type":"stdout"},`+
+		`"graders":[{"type":"exact_match","config":{"expected":"31","normalize":["trim"]}}]}`+"\n")
+
+	db := filepath.Join(work, "grade.db")
+	if r := runCLI(t, "run", "--dataset", ds, "--agent", "mock",
+		"--bin", filepath.Join(agents, "one-turn.sh"), "--db", db,
+		"--work-root", filepath.Join(work, "cells"), "--quiet"); r.exitCode != 0 {
+		t.Fatalf("run exited %d\nstderr:\n%s", r.exitCode, r.stderr)
+	}
+	runID := onlyRunID(t, db)
+
+	r := runCLI(t, "grade", "--run", runID, "--task", "answer", "--db", db, "--grader", "pytest")
+	if r.exitCode == 0 {
+		t.Fatalf("graded with a grader that needs a workspace:\n%s", r.stdout)
+	}
+	if !strings.Contains(r.stderr, "workspace") {
+		t.Errorf("stderr does not say why:\n%s", r.stderr)
+	}
+
+	// Naming no task is a usage error rather than "grade everything": the
+	// command grades what the caller asks for.
+	if u := runCLI(t, "grade", "--run", runID, "--db", db); u.exitCode != 2 {
+		t.Errorf("grade without --task exited %d, want 2\nstderr:\n%s", u.exitCode, u.stderr)
+	}
+}
+
+// writeExecutable writes a shell script the harness can run as an agent.
+func writeExecutable(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// writeFile writes one test fixture.
+func writeFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// onlyRunID returns the id of the single run in a database.
+func onlyRunID(t *testing.T, db string) string {
+	t.Helper()
+	if n := countRuns(t, db); n != 1 {
+		t.Fatalf("%d runs recorded, want 1", n)
+	}
+	r := runCLI(t, "list", "--db", db, "--json")
+	var runs []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &runs); err != nil {
+		t.Fatalf("decode run list: %v\n%s", err, r.stdout)
+	}
+	return runs[0].ID
+}
+
+func countRuns(t *testing.T, db string) int {
+	t.Helper()
+	r := runCLI(t, "list", "--db", db, "--json")
+	var runs []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(r.stdout), &runs); err != nil {
+		t.Fatalf("decode run list: %v\n%s", err, r.stdout)
+	}
+	return len(runs)
+}

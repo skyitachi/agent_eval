@@ -30,6 +30,10 @@ type Pytest struct{}
 
 func (p *Pytest) Type() string { return "pytest" }
 
+// RequiresSandbox: the suite is executed inside the workspace the agent worked
+// in, so there is nothing this grader can do with a stored row alone.
+func (p *Pytest) RequiresSandbox() bool { return true }
+
 type pytestConfig struct {
 	// Paths are test targets passed to pytest, e.g. ["tests/test_x.py"]. Empty
 	// runs whole-project collection.

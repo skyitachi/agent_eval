@@ -35,7 +35,12 @@
 <!doctype html>
 <html lang="en" data-theme="auto">
 {{template "shell-head" .Head}}
-<body data-mode="{{.Mode}}">
+{{/* The grade attributes are the whole difference between a served page and a
+     saved one: the client offers the control when they are here and renders no
+     control at all when they are not. The token is in the shell rather than in
+     the payload because it changes every time the server starts, and the
+     payload is the bytes the recorded hash covers. */}}
+<body data-mode="{{.Mode}}"{{if .Grade}} data-grade-url="{{.Grade.URL}}" data-grade-csrf="{{.Grade.Token}}" data-grade-graders="{{csv .Grade.Graders ","}}"{{end}}>
 <header class="topbar">
   <div class="topbar-inner">
     <a class="brand" id="brand" href="{{.Home}}"></a>
@@ -57,6 +62,11 @@
      describes the page itself would be erased by the first repaint. Every value
      in it is escaped by default: the note names a hash and a timestamp, and
      none of it is trusted markup. */}}
+{{- if .Notice}}
+<div class="recordbar">
+  <div class="notice {{.Notice.Severity}}"><b>{{.Notice.Head}}</b> {{.Notice.Note}}</div>
+</div>
+{{- end}}
 {{- if .Record}}
 <div class="recordbar">
   <div class="notice {{.Record.Severity}}"><b>{{.Record.Head}}</b> {{.Record.Note}}</div>

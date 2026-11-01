@@ -1225,3 +1225,98 @@ func TestOpenUpgradesAV6Database(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Re-grading one cell
+// ---------------------------------------------------------------------------
+
+// A verdict can be reached after the run has finished. Writing it must touch
+// only the columns that hold a verdict: the tokens, the duration and the cost
+// describe a process that has already exited, and a re-grade that rewrote them
+// would put a number beside a verdict that no longer measured anything.
+func TestUpdateGradeTouchesOnlyTheVerdict(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	before := sampleAttempt("r1", "t1")
+	before.Graded = false
+	if err := s.SaveAttempt(ctx, before); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+
+	cleared := ""
+	if err := s.UpdateGrade(ctx, "r1", "t1", before.Sample, GradeUpdate{
+		Graded: true, Passed: true, Score: 0.9, Threshold: 1,
+		Grades: []grader.Result{{Grader: "patch", Type: "patch", Score: 0.9, Weight: 1}},
+		Error:  &cleared,
+	}); err != nil {
+		t.Fatalf("UpdateGrade: %v", err)
+	}
+
+	after, err := s.ListAttempts(ctx, "r1")
+	if err != nil || len(after) != 1 {
+		t.Fatalf("list attempts: %v (%d rows)", err, len(after))
+	}
+	got := after[0]
+	if !got.Graded || !got.Passed || got.Score != 0.9 || got.Threshold != 1 {
+		t.Errorf("verdict = graded %v passed %v score %v threshold %v",
+			got.Graded, got.Passed, got.Score, got.Threshold)
+	}
+	if len(got.Grades) != 1 || got.Grades[0].Grader != "patch" {
+		t.Errorf("grades = %+v", got.Grades)
+	}
+	if got.Error != "" {
+		t.Errorf("error = %q, want it cleared", got.Error)
+	}
+	if got.DurationMs != before.DurationMs || got.CostUSD != before.CostUSD ||
+		got.InputTokens != before.InputTokens || got.OutputTokens != before.OutputTokens ||
+		got.Turns != before.Turns || got.ToolCalls != before.ToolCalls {
+		t.Errorf("measurement changed:\nbefore %+v\nafter  %+v", before, got)
+	}
+	if got.Diff != before.Diff || got.Answer != before.Answer {
+		t.Error("the re-grade rewrote the work it was grading")
+	}
+}
+
+// The error is only replaced when the caller says so: a re-grade that reaches a
+// verdict through a grader that then errors must not erase the reason the cell
+// was in trouble in the first place.
+func TestUpdateGradeLeavesTheErrorAloneWhenNotAsked(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	att := sampleAttempt("r1", "t1")
+	att.Error = "diff: workspace vanished"
+	if err := s.SaveAttempt(ctx, att); err != nil {
+		t.Fatalf("save attempt: %v", err)
+	}
+	if err := s.UpdateGrade(ctx, "r1", "t1", att.Sample, GradeUpdate{Graded: true, Threshold: 1}); err != nil {
+		t.Fatalf("UpdateGrade: %v", err)
+	}
+	rows, err := s.ListAttempts(ctx, "r1")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("list: %v", err)
+	}
+	if rows[0].Error != "diff: workspace vanished" {
+		t.Errorf("error = %q, want it untouched", rows[0].Error)
+	}
+}
+
+func TestUpdateGradeOnAMissingCellNamesTheDatabase(t *testing.T) {
+	ctx := context.Background()
+	s := openTemp(t)
+	if err := s.CreateRun(ctx, sampleRun("r1")); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	err := s.UpdateGrade(ctx, "r1", "absent", 0, GradeUpdate{Graded: true})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if !strings.Contains(err.Error(), s.Path()) {
+		t.Errorf("err = %q, want the database it looked in", err)
+	}
+}

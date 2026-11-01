@@ -27,6 +27,10 @@ type Command struct{}
 
 func (c *Command) Type() string { return "command" }
 
+// RequiresSandbox: the command runs in the workspace, so a stored row is not
+// enough to evaluate it.
+func (c *Command) RequiresSandbox() bool { return true }
+
 type commandConfig struct {
 	// Command is the shell command. These placeholders are substituted:
 	//

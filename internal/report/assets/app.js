@@ -150,6 +150,28 @@
 
   var MODE = document.body.getAttribute('data-mode') || 'run';
 
+  /* Re-grading is offered only by a page that was served. The marker is the
+   * server's own: `aeval report` writes no grade attributes, so a report saved
+   * to disk or attached to an email has no control to press and no server to
+   * post to -- it stays the inert document it is, without a flag anyone has to
+   * remember to set. */
+  var GRADE = (function () {
+    var body = document.body;
+    var url = body.getAttribute('data-grade-url');
+    if (!url) return null;
+    var list = body.getAttribute('data-grade-graders') || '';
+    return {
+      url: url,
+      csrf: body.getAttribute('data-grade-csrf') || '',
+      graders: list ? list.split(',') : []
+    };
+  })();
+
+  /* The one label this file invents. Every other option is named by the value
+   * the server accepts, so the vocabulary on screen and the vocabulary on the
+   * wire cannot drift into disagreeing. */
+  var GRADE_LABELS = { auto: 'as declared by the dataset' };
+
   /* ------------------------------------------------------------------ state */
 
   var S = {
@@ -477,6 +499,51 @@
     return (v > 0 ? '+' : '-') + dur(Math.abs(v));
   }
 
+  /* ----------------------------------------------------------- re-grading */
+
+  /* Posting a real form, rather than fetching, is deliberate. The answer is a
+   * redirect back to this page, and the page that comes back is rebuilt from
+   * the row the verdict was written to -- so the reader sees the state that
+   * resulted instead of a toast claiming one. A fetch would have to rebuild
+   * the table itself, which is a second renderer to keep in step. */
+  function gradeForm(t, grader) {
+    var f = document.createElement('form');
+    f.method = 'post';
+    f.action = GRADE.url;
+    field(f, 'csrf', GRADE.csrf);
+    field(f, 'task', t.id);
+    field(f, 'sample', String(t.sample_index == null ? 0 : t.sample_index));
+    field(f, 'grader', grader || 'auto');
+    return f;
+  }
+
+  function field(form, name, value) {
+    var i = document.createElement('input');
+    i.type = 'hidden';
+    i.name = name;
+    i.value = value;
+    form.appendChild(i);
+  }
+
+  /* The row's own click opens the drawer, so the button has to stop the event:
+   * otherwise pressing "grade" would also select a cell whose verdict is about
+   * to be replaced by a different page. */
+  function gradeCell(t) {
+    if (!GRADE) return '';
+    return raw(tpl`<button type="button" class="btn grade" data-grade="${t.key}" title="Reach a verdict for this cell from what it recorded; the agent is not run again">grade</button>`);
+  }
+
+  function wireGrades(scope) {
+    scope.querySelectorAll('[data-grade]').forEach(function (b) {
+      b.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var key = b.getAttribute('data-grade');
+        var t = (P.tasks || []).filter(function (x) { return x.key === key; })[0];
+        if (t) gradeForm(t).submit();
+      });
+    });
+  }
+
   var COLUMNS = [
     { key: 'task', label: 'Task', sortable: true },
     { key: 'status', label: 'Status', sortable: true },
@@ -488,7 +555,9 @@
     { key: 'turns', label: 'Turns', sortable: true, num: true },
     { key: 'tool_calls', label: 'Tools', sortable: true, num: true },
     { key: 'stop_reason', label: 'Stop reason', sortable: true },
-    { key: 'detail', label: 'Detail', sortable: false }
+    { key: 'detail', label: 'Detail', sortable: false },
+    /* Last, and only when this page was served: a click here writes. */
+    { key: 'grade', label: 'Grade', sortable: false, cls: 'gradecell' }
   ];
 
   function filteredTasks() {
@@ -579,7 +648,12 @@
     var frag = document.createDocumentFragment();
     frag.appendChild(filterBar());
 
-    var head = COLUMNS.map(function (c) {
+    /* A saved report has no server, so it gets no column to press. Dropping the
+     * column rather than blanking it keeps a printed page from carrying a
+     * heading that promises something it cannot do. */
+    var cols = COLUMNS.filter(function (c) { return c.key !== 'grade' || GRADE; });
+
+    var head = cols.map(function (c) {
       /* Wrapped, because the header is built by one template and this fragment
        * is interpolated into it: an unwrapped tpl() result is a plain string,
        * so the arrow was escaped a second time and the sorted column read
@@ -587,7 +661,7 @@
        * clicks a header to sort, which is why it went unnoticed. */
       var arrow = '';
       if (S.sortKey === c.key) arrow = raw(tpl`<span class="arrow">${S.sortDir > 0 ? '▲' : '▼'}</span>`);
-      return raw(tpl`<th class="${c.num ? 'num' : ''}${c.sortable ? '' : ' nosort'}" data-key="${c.sortable ? c.key : ''}">${c.label} ${arrow}</th>`);
+      return raw(tpl`<th class="${c.num ? 'num' : ''}${c.sortable ? '' : ' nosort'}${c.cls ? ' ' + c.cls : ''}" data-key="${c.sortable ? c.key : ''}">${c.label} ${arrow}</th>`);
     });
 
     var shown = tasks.slice(0, S.limit);
@@ -609,6 +683,7 @@
           <td class="num">${toolCell(t)}</td>
           <td class="mono-sm">${t.stop_reason || '-'}</td>
           <td>${detail}</td>
+          ${GRADE ? raw(tpl`<td class="gradecell">${gradeCell(t)}</td>`) : ''}
         </tr>`);
     });
 
@@ -636,6 +711,7 @@
         render();
       });
     });
+    wireGrades(table);
 
     frag.appendChild(table);
 
@@ -1006,8 +1082,20 @@
   }
 
   function gradersTab(t) {
+    var box = document.createElement('div');
+    var picker = GRADE ? el(graderPicker(t)) : null;
+    if (picker) {
+      box.appendChild(picker);
+      picker.querySelector('#grader-run').addEventListener('click', function () {
+        gradeForm(t, picker.querySelector('#grader-choice').value).submit();
+      });
+    }
+
     var gs = t.graders || [];
-    if (!gs.length) return el('<div class="empty">No grader verdicts recorded.</div>');
+    if (!gs.length) {
+      box.appendChild(el('<div class="empty">No grader verdicts recorded. Grading this cell writes one; the run is not touched.</div>'));
+      return box;
+    }
     var cards = gs.map(function (g) {
       var cls = g.error ? 'fail' : (g.passed ? 'pass' : 'fail');
       var details = g.details ? raw(tpl`<details><summary>details</summary><div class="inner"><pre class="code">${JSON.stringify(g.details, null, 2)}</pre></div></details>`) : raw('');
@@ -1026,7 +1114,26 @@
           ${details ? raw(tpl`<div class="mt">${details}</div>`) : ''}
         </div>`);
     });
-    return el(tpl`<div>${cards}</div>`);
+    box.appendChild(el(tpl`<div>${cards}</div>`));
+    return box;
+  }
+
+  /* The picker names values the server accepts, not labels this file made up.
+   * The default is "auto", which is the policy the page documents: the graders
+   * the dataset declares, and the judge when it declares none. */
+  function graderPicker(t) {
+    var opts = GRADE.graders.map(function (v) {
+      return raw(tpl`<option value="${v}">${GRADE_LABELS[v] || v}</option>`);
+    });
+    return tpl`
+      <div class="gradebox">
+        <div class="small muted">Grading reads the diff and the answer this cell recorded and writes a verdict back to it.
+          The agent is not run again, so the verdict is about this attempt rather than a new one.</div>
+        <div class="bar-actions">
+          <select class="btn" id="grader-choice" aria-label="grader">${opts}</select>
+          <button type="button" class="btn primary" id="grader-run">Grade this cell</button>
+        </div>
+      </div>`;
   }
 
   function toolsTab(t) {

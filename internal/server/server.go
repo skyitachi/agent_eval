@@ -17,16 +17,36 @@
 // a run that has since been deleted, should land somewhere that looks like the
 // tool, says which record was missing, and offers the list. An HTTP status
 // alone leaves them on a blank page wondering whether the server is up.
+//
+// # Why a report page can now write
+//
+// It could not, and the reason it could not was stated as a guarantee: the
+// server rebuilt documents and served them. That guarantee is withdrawn on
+// purpose. Looking at a cell that says "not graded" and having no way to score
+// it without going back to a shell is the moment the page stops being useful --
+// the row already holds everything a verdict needs, and re-running the agent to
+// reach one would judge a different attempt.
+//
+// So POST /r/{id}/grade reaches a verdict for one cell and writes it back. What
+// remains true is the part that mattered: every read is still a rebuild from
+// the rows, and the banner above the document still says whether the page
+// matches the registration. A page that was graded re-reads as "not the
+// recorded document", which is exactly what happened -- and that is why the
+// write did not need a second, softer promise.
 package server
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -71,12 +91,25 @@ func New(st *store.Store, opts Options) *Server {
 	if opts.Limit <= 0 {
 		opts.Limit = defaultLimit
 	}
-	return &Server{
+	s := &Server{
 		st:      st,
 		opts:    opts,
 		cssETag: etag(report.CSS()),
 		jsETag:  etag(report.JS()),
 	}
+	// The form token is generated even when the session pages are off, because
+	// re-grading a report is a write too. It is per process: a form rendered by
+	// an earlier server is refused rather than honoured, which is what keeps a
+	// page left open across a restart from submitting a stale token.
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is not a condition to degrade through: without a
+		// token every POST would be refused, so the server would come up
+		// looking healthy and refuse every write.
+		panic("server: cannot generate a form token: " + err.Error())
+	}
+	s.csrf = hex.EncodeToString(b[:])
+	return s
 }
 
 // Handler returns the site's routes.
@@ -89,6 +122,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleListing)
 	mux.HandleFunc("GET /r/{id}", s.handleReport)
+	mux.HandleFunc("POST /r/{id}/grade", s.gradeGuard(s.handleGrade))
 	mux.HandleFunc("GET /static/app.css", s.handleCSS)
 	mux.HandleFunc("GET /static/app.js", s.handleJS)
 	s.sessionRoutes(mux)
@@ -194,6 +228,11 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 			// The record is what the registration claimed and what the rebuild
 			// produced, side by side. It is the whole reason the hash is stored.
 			Record: recordFor(reg, current),
+			// The notice is what the page's own last action produced. It comes
+			// first because it is the most recent fact on the page, and it is
+			// read back from the row rather than taken from the URL.
+			Notice: s.gradeNotice(r, reg),
+			Grade:  s.gradeAction(reg, mode),
 		})
 	})
 }
@@ -283,6 +322,72 @@ func etag(body string) string {
 }
 
 // ---------------------------------------------------------------------------
+// Guards shared by every write
+// ---------------------------------------------------------------------------
+
+// guardHeaders are the headers a page that can change something must carry.
+//
+// X-Frame-Options and frame-ancestors stop the page being framed by another
+// site, which matters most for the one control that costs money: a framed
+// report is a button a stranger can put under the reader's cursor. The policy
+// deliberately constrains framing only -- the report page's own client is an
+// inline script, and a default-src that forbade it would break the page to
+// protect a control the token already protects.
+func guardHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-store")
+}
+
+// checkPost enforces the two rules a state-changing request must satisfy: it
+// came from a form this server rendered (the token), and from a page on this
+// site (the Origin, when the browser sends one).
+//
+// It answers the request itself when a rule fails, and reports whether the
+// caller should carry on. Returning the response instead of writing it is what
+// keeps the two entry points -- the session pages and the report's grade
+// button -- from drifting into two slightly different checks.
+func (s *Server) checkPost(w http.ResponseWriter, r *http.Request) bool {
+	if origin := r.Header.Get("Origin"); origin != "" && origin != "null" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host != r.Host {
+			s.failure(w, http.StatusForbidden, "This form was sent from another site.",
+				fmt.Sprintf("The request came from %s, not from this server. Open the page here and press the button again.", origin))
+			return false
+		}
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := r.ParseForm(); err != nil {
+		s.failure(w, http.StatusBadRequest, "The form could not be read.", err.Error())
+		return false
+	}
+	got := r.PostForm.Get("csrf")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.csrf)) != 1 {
+		s.failure(w, http.StatusForbidden, "This form is out of date.",
+			"The form token does not match this server's. It changes every time the server starts: "+
+				"reload the page and press the button again.")
+		return false
+	}
+	return true
+}
+
+// allowedHost accepts the names this server can legitimately be reached by: an
+// IP literal (whatever it was bound to) or localhost. A DNS name is refused
+// because a rebound one is indistinguishable from a real one.
+func allowedHost(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	return net.ParseIP(host) != nil
+}
+
+// ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
@@ -365,12 +470,21 @@ func writeHTML(w http.ResponseWriter, status int, render func(io.Writer) error) 
 
 // failure renders an error page in the report shell.
 func (s *Server) failure(w http.ResponseWriter, status int, title, message string) {
+	s.failureWith(w, status, title, message, "/", "All recorded reports")
+}
+
+// failureWith renders an error page whose way back is the caller's choice.
+//
+// It exists because a failure reached from a report should return there: the
+// reader arrived from a page and should not have to rebuild its URL from the
+// address bar to get back to it.
+func (s *Server) failureWith(w http.ResponseWriter, status int, title, message, home, homeText string) {
 	writeHTML(w, status, func(out io.Writer) error {
 		return report.RenderError(out, report.ErrorOptions{
 			Title:    title,
 			Message:  message,
-			Home:     "/",
-			HomeText: "All recorded reports",
+			Home:     home,
+			HomeText: homeText,
 		}, report.RenderOptions{})
 	})
 }

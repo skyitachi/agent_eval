@@ -14,6 +14,7 @@ import (
 
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/llm"
 	"github.com/skyitachi/agenteval/internal/machine"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/runner"
@@ -21,6 +22,32 @@ import (
 	"github.com/skyitachi/agenteval/internal/session"
 	"github.com/skyitachi/agenteval/internal/store"
 )
+
+// DefaultGrader is the grader a web replay attaches to every collected task
+// when the caller does not name one.
+//
+// A replay is pressed by a person looking at a page, not configured by someone
+// with a dataset in front of them: there is no grader[] block to fill in, and a
+// replay that reports only cost and time answers half the question. The judge
+// is the one correctness criterion that needs no ground truth, so it is the
+// default. Set Grader to "none" to keep the old measurable-but-unscorable
+// behaviour.
+const DefaultGrader = "llm_judge"
+
+// DefaultGraderConfig is the rubric sent to the judge when the caller supplies
+// none.
+//
+// A collected task is usually a coding session bound to its repository, so the
+// diff is where the work is and the final answer is often just "done". Judging
+// both is what makes the verdict about the change rather than the prose.
+func DefaultGraderConfig() map[string]any {
+	return map[string]any{
+		"input": "both",
+		"rubric": "The work is correct if it accomplishes what the task prompt asked for, " +
+			"the change is coherent and complete, and it is not a no-op, an unrelated rewrite, " +
+			"or a deletion of the tests. Judge the outcome, not the length or style of the reply.",
+	}
+}
 
 // Config shapes a Manager.
 type Config struct {
@@ -34,6 +61,16 @@ type Config struct {
 	Timeout time.Duration
 	// ToolVersion is recorded on the run row.
 	ToolVersion string
+
+	// Grader is the grader attached to every task a replay collects. Empty
+	// means DefaultGrader; "none" (or "-"/"off") collects measurable but
+	// unscorable tasks, which is how tests stay offline.
+	Grader string
+	// GraderName labels it in the report. Empty derives the name from the type.
+	GraderName string
+	// GraderConfig is the grader's config block. Nil under the default grader
+	// means DefaultGraderConfig.
+	GraderConfig map[string]any
 }
 
 // Manager runs replays one at a time, in the order they were asked for.
@@ -78,6 +115,18 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 30 * time.Minute
+	}
+	// Resolve the grader once, here, so every path that later inspects the
+	// config sees the same choice rather than "empty means judge" in one place
+	// and "empty means nothing" in another.
+	switch strings.ToLower(strings.TrimSpace(cfg.Grader)) {
+	case "", "default":
+		cfg.Grader = DefaultGrader
+		if cfg.GraderConfig == nil {
+			cfg.GraderConfig = DefaultGraderConfig()
+		}
+	case "none", "-", "off":
+		cfg.Grader, cfg.GraderName, cfg.GraderConfig = "", "", nil
 	}
 	if _, err := cfg.Store.AbandonReplays(context.Background(), AbandonedReason); err != nil {
 		return nil, err
@@ -193,7 +242,10 @@ func (m *Manager) CheckInPlace(ctx context.Context, sess *session.Session) InPla
 // it anywhere, so that the in-place questions can be asked of it. A session
 // that cannot be bound cannot be replayed in place.
 func (m *Manager) inPlaceDataset(sess *session.Session) (*dataset.Dataset, error) {
-	items, notes, err := collect(sess)
+	// No grader: this dataset is built to ask the repository a question, not to
+	// produce a verdict. Attaching the run's grader here would spend a judge
+	// call for a form field, and none of the checks below look at graders.
+	items, notes, err := collect(sess, "", "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -428,12 +480,24 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 	j.rp.DatasetDir = dsDir
 	j.mu.Unlock()
 
-	items, notes, err := collect(sess)
+	grader, graderName, graderCfg := m.cfg.Grader, m.cfg.GraderName, m.cfg.GraderConfig
+	if grader == DefaultGrader && !judgeAvailable(graderCfg) {
+		// Collecting without a grader leaves the old measurable-but-unscorable
+		// behaviour, which is honest; attaching a judge that cannot authenticate
+		// would mark every task failed and look like the agent's fault.
+		j.logf("no judge credentials (%s or %s); collecting tasks that are measurable but not scorable",
+			llm.EnvAPIKey, llm.EnvAuthToken)
+		grader, graderName, graderCfg = "", "", nil
+	}
+	items, notes, err := collect(sess, grader, graderName, graderCfg)
 	if err != nil {
 		return err
 	}
 	for _, n := range notes {
 		j.logf("note: %s", n)
+	}
+	if grader != "" {
+		j.logf("grading with %s", grader)
 	}
 	name := "replay " + shortID(rp.SessionID)
 	if err := session.WriteDataset(dsDir, name, "replay of "+rp.Source+" session "+rp.SessionID, items); err != nil {
@@ -607,8 +671,20 @@ func checkRefs(ds *dataset.Dataset) error {
 // empty directory of a session that worked on files is measuring a different
 // task; when it cannot be (no directory, not a repository) the replay still
 // runs, and the reason goes into the log and onto every baseline.
-func collect(sess *session.Session) ([]session.Item, []string, error) {
-	opts := session.Options{Split: session.SplitTurn, WorkspaceCwd: true}
+//
+// A non-empty grader is attached to every emitted task. The caller passes an
+// empty one only when it has decided the replay should be measured and not
+// scored -- either because it was asked for that, or because the judge has no
+// credentials.
+func collect(sess *session.Session, grader, graderName string, graderCfg map[string]any) ([]session.Item, []string, error) {
+	opts := session.Options{
+		Split:        session.SplitTurn,
+		WorkspaceCwd: true,
+		// The judge is what turns a replay from a cost report into a verdict.
+		Grader:       grader,
+		GraderName:   graderName,
+		GraderConfig: graderCfg,
+	}
 	if id, err := machine.Current(); err == nil {
 		opts.Machine = &id
 	}
@@ -623,6 +699,21 @@ func collect(sess *session.Session) ([]session.Item, []string, error) {
 		return nil, nil, fmt.Errorf("collect the session: %w", err2)
 	}
 	return items, []string{note}, nil
+}
+
+// judgeAvailable reports whether the judge has credentials to call a model.
+//
+// It reads the same environment the grader will, including a per-run override
+// of the variable names, so "attached" and "can authenticate" cannot disagree.
+func judgeAvailable(cfg map[string]any) bool {
+	c := llm.Config{}
+	if v, ok := cfg["api_key_env"].(string); ok {
+		c.APIKeyEnv = v
+	}
+	if v, ok := cfg["auth_token_env"].(string); ok {
+		c.AuthTokenEnv = v
+	}
+	return llm.New(c).Available()
 }
 
 func cellState(a store.Attempt) string {

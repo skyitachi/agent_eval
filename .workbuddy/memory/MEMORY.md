@@ -102,6 +102,14 @@ Go 的 agent 评测框架。`/Users/skyitachi/lab/agent_eval`，module `github.c
     sandbox 起不来会 `trace/BPT trap` 崩（`Failed to initialize sandbox` / `GPU process isn't usable`）。
     找不到浏览器时这些测试**跳过**而非失败（`findBrowser` 返回 ""），`AGENTEVAL_CHROME` 可覆盖路径。
 
+16. **verdict 可能事后才可达 → `aeval grade`（`internal/regrade`）**：用 row 里已存的 diff/answer/
+    trace 重跑 grader，**只写 verdict 那几列**（`store.UpdateGrade`；tokens/耗时/花费是已退出进程的测量
+    值，重判改它就是造假）。`grader.Sandboxed{RequiresSandbox()}` 让「需要活工作区」这件事由 grader 自己
+    声明（pytest/command），离线重判**按名字拒绝**而不是对着 nil sandbox 跑出被读成 agent 失败的
+    verdict；新增这类 grader 必须实现它。`grader.Context.DiffOverride` 就是为这条路准备的（2016 行注释里
+    早写着，之前一直无调用方）。重判成功后要摘掉 runner 留下的 `; grade: ...` 段，否则一行同时写着
+    passed 和 grade 报错。
+
 ## 报告登记 + HTTP 服务（`report` 写、`serve` 读）
 
 `report` 每次渲染都往 `reports` 表写一行。前提仍是约定 1：报告是 db 的函数，所以登记行**只存无法重新推

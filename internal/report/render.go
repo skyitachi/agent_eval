@@ -83,6 +83,40 @@ type Record struct {
 	Note string
 }
 
+// Notice is a sentence about the page itself, shown above the document.
+//
+// It exists for the result of something the page just did -- reaching a verdict
+// -- which is neither part of the payload (the payload is the bytes the hash
+// covers, and a verdict written after the fact would silently change it) nor
+// part of the registration. It is derived from the row every time it is shown,
+// so a crafted link cannot make the page claim a verdict the database does not
+// hold.
+type Notice struct {
+	// Severity picks the colour: "info", "warn" or "err".
+	Severity string
+	Head     string
+	Note     string
+}
+
+// GradeAction is what a page needs to offer "grade this cell".
+//
+// It lives on the shell for the same reason Record does, and one more: Token
+// changes every time the server starts. Inside the payload it would make every
+// restart re-hash a document nobody could reproduce.
+//
+// A page built by `aeval report` has no GradeAction, so a report saved to disk
+// stays readable and inert without needing a flag -- the difference is whether
+// there is a server to post to at all.
+type GradeAction struct {
+	// URL is where the form posts.
+	URL string
+	// Token is the per-process form token the POST must carry.
+	Token string
+	// Graders are the values the picker offers, in order. They are the contract
+	// with the server: the page labels them, but it does not invent them.
+	Graders []string
+}
+
 // NavLink is one header navigation entry.
 type NavLink struct {
 	Label  string
@@ -121,6 +155,14 @@ type RenderOptions struct {
 	Record *Record
 	// Callout, when set, renders a panel of links above the document.
 	Callout *Callout
+	// Notice, when set, renders one more banner above the document. It is the
+	// result of an action the page just performed, which the Record banner
+	// cannot describe: Record is about what was registered, not about what has
+	// happened since.
+	Notice *Notice
+	// Grade, when set, lets the page offer to reach a verdict for a cell
+	// without re-running the agent. Nil on a document meant to be inert.
+	Grade *GradeAction
 }
 
 func (o RenderOptions) withDefaults() RenderOptions {
@@ -159,6 +201,8 @@ type pageView struct {
 	Nav     []NavLink
 	Record  *Record
 	Callout *Callout
+	Notice  *Notice
+	Grade   *GradeAction
 	// JS is the client, inlined when the document is standalone.
 	JS      template.JS
 	Payload template.JS
@@ -174,7 +218,11 @@ type errorView struct {
 	HomeText string
 }
 
-var pageTemplate = template.Must(template.New("page.html").ParseFS(templateFS, "templates/*.html"))
+var pageTemplate = template.Must(template.New("page.html").Funcs(template.FuncMap{
+	// csv joins the grader values for one data attribute. The client splits it
+	// back apart, so the list the page offers is the list the server accepts.
+	"csv": strings.Join,
+}).ParseFS(templateFS, "templates/*.html"))
 
 // ---------------------------------------------------------------------------
 // Public renderers
@@ -377,6 +425,8 @@ func render(w io.Writer, mode Mode, payload any, title string, opts RenderOption
 		Nav:     opts.Nav,
 		Record:  opts.Record,
 		Callout: opts.Callout,
+		Notice:  opts.Notice,
+		Grade:   opts.Grade,
 		Payload: js,
 	}
 	if opts.Standalone {

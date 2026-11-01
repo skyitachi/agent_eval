@@ -120,6 +120,7 @@ export ANTHROPIC_API_KEY=...
 | `aeval matrix` | Run a sweep over one factor axis, or attribute one that already ran. |
 | `aeval report` | Render a run, a comparison, a sweep, or the whole index as HTML, and record what was rendered. |
 | `aeval serve` | Serve the recorded reports over HTTP. |
+| `aeval grade` | Re-grade one recorded task from what its cell holds, without running the agent again. |
 | `aeval list` | List recorded runs, filtered by sweep or axis. |
 | `aeval version` | Print the build, schema and payload versions and the registered agents. |
 
@@ -503,6 +504,46 @@ fails is recorded on the cell, rendered as a failure in the report, and returned
 as a non-zero exit — a person whose repository is at the wrong commit must not
 be told by a zero exit that everything is fine.
 
+## Re-grading one task
+
+A verdict is not always reachable when the agent stops. A collected session has
+a baseline and no ground truth; a judge may have had no credentials; a rubric may
+have been wrong. Re-running the task would answer a different question — a
+different attempt, at a different cost — so `aeval grade` scores the work that
+was actually done, from what the cell recorded:
+
+```sh
+aeval grade --run 4d92d2be --task 3c11e6dc-p0 --grader llm_judge --db aeval.db
+```
+
+- Without `--grader` it runs the graders the task's dataset declares, which is
+  the reproducible choice. `--grader` replaces them for this pass, which is what
+  a collected task needs: it declares none, and the error says so.
+- `--grader-config` is that grader's JSON config, e.g.
+  `--grader-config '{"input":"both","rubric":"..."}'`. `--grader llm_judge`
+  without one uses the rubric a web replay attaches, so a verdict reached here
+  and one reached from the page stay comparable.
+- `--dataset` points at the manifest when the original has moved.
+- `--sample` picks which pass of a `--samples k` task to grade (the first by
+  default). `--threshold` overrides the cutoff recorded on the cell; an
+  ungraded cell records none, and grading follows the default 1.0 there.
+
+Only the verdict columns are written. Tokens, duration and cost describe a
+process that has already exited, and a re-grade that rewrote them would put a
+number beside a verdict that measured nothing. The command prints the new
+verdict beside the one it replaced, and says that the page recorded for the run
+no longer matches what the database holds: `aeval report --run <id>` renders and
+records a new one.
+
+Two things it will not do. It does not start an agent, so the work is the work
+that was recorded. And it refuses a grader that cannot reach a verdict rather
+than writing one: `pytest` and `command` execute inside a workspace the run no
+longer has, and a judge with no credentials would turn a missing key into a
+failed task. Re-run the task for the first, and set the key for the second.
+
+The same operation is a button on the report page that serves the run — see
+[Grading a cell from the page that serves it](#grading-a-cell-from-the-page-that-serves-it).
+
 ## Reports
 
 `aeval report` writes a self-contained `.html` file — CSS and JS inlined — that
@@ -589,7 +630,8 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 ```
 
 `GET /` lists the recorded reports, `GET /r/<id>` rebuilds one from the database
-and renders it, and `GET /r/<id>.json` returns the same document as JSON. Every
+and renders it, `GET /r/<id>.json` returns the same document as JSON, and
+`POST /r/<id>/grade` reaches a verdict for one of its cells (see below). Every
 page carries a banner saying how the document it just rebuilt relates to the one
 that was recorded:
 
@@ -610,6 +652,34 @@ Only `aeval report` and the replay button register. The report `run` and
 `matrix` write alongside their own output is a convenience, not a registration —
 nobody asked for that view, and recording it would fill the log with views that
 were never requested.
+
+### Grading a cell from the page that serves it
+
+These pages used to be read-only, and that was stated as a guarantee. It is
+withdrawn on purpose. A cell that reads `not graded` now has a `grade` button on
+its row, and `POST /r/<id>/grade` reaches a verdict from what the row already
+holds — the diff, the answer, the normalized trajectory — without running the
+agent again. Re-running would judge a second attempt, and pay for it.
+
+The picker in the cell's **graders** tab chooses the criterion:
+
+| value | what it grades with |
+| --- | --- |
+| `auto` | the graders the dataset declares; the judge when it declares none |
+| `llm_judge` | the judge, with the rubric a web replay attaches (`input: both`, judge the outcome not the prose) |
+| `patch` | the shape of the change only: something changed, and it is not a repository-wide rewrite |
+
+Everything that cannot work on a finished row is refused before anything is
+written: `pytest` and `command` need a workspace the run no longer has, and a
+judge with no credentials would record a harness error as an agent failure. The
+refusal names what is missing — the two variables to set, or the graders that do
+run offline.
+
+What did not change is the part that mattered: every read is still a rebuild
+from the rows, so a page that was graded comes back saying `This page is not the
+recorded document.` — which is exactly what happened. Above it, the notice
+states the verdict the row now holds, composed from the row rather than from the
+URL, so a hand-written `?graded=` link cannot make the page claim one.
 
 ### Browsing this machine's sessions and replaying them
 
@@ -690,6 +760,11 @@ permission prompts bypassed, so they are guarded more strictly than the reports:
 - **No cross-site forms.** Every POST carries a token the server generated at
   startup and an `Origin`, when present, of the server itself. A page on another
   site cannot start a replay.
+- **The grade button is guarded the same way.** `POST /r/<id>/grade` writes to
+  the database and may spend an API call, so it checks the same three things —
+  Host, `Origin`, form token — even though the report pages themselves are still
+  read without any of them. Framing is refused on that route as well, because a
+  framed page is a button a stranger can put under the reader's cursor.
 - **There is no login.** Anything running as you on this machine that can open a
   socket can use the pages.
 
@@ -709,6 +784,7 @@ internal/attrib/   factor axes, sweep plans, paired comparison, the sign test
 internal/report/   the view model, the loader, the HTML renderer, the report registry
 internal/server/   the HTTP server: recorded reports, this machine's sessions, the replay form
 internal/replay/   replay presets and the job queue behind the replay button
+internal/regrade/  reaching a verdict again from what a finished cell recorded
 internal/machine/  the machine identity collect stamps and replays check
 internal/llm/      the minimal client used by llm_judge
 tests/             end-to-end tests driving the built binary
@@ -755,11 +831,14 @@ Stated here rather than discovered later:
   "restore the test files before grading, so an agent that edits the tests is
   scored on its actual work" — and it has no caller, no test and no dataset
   field.
-- **The report server is read-only and unauthenticated.** `aeval serve` rebuilds
-  recorded reports from the database and serves them; there is no login, no
-  write path and no per-user view. It binds to `127.0.0.1` by default and warns
-  when told to listen anywhere else, because anyone who can reach the port can
-  read every recorded report.
+- **The report server is unauthenticated, and now writable.** `aeval serve`
+  rebuilds recorded reports from the database and serves them, and its grade
+  button writes a verdict back to one cell. There is no login, no per-user view,
+  and no audit of who pressed it. The writes are bounded by what a finished cell
+  can be re-graded with — nothing re-runs the agent from a page. It binds to
+  `127.0.0.1` by default and warns when told to listen anywhere else, because
+  anyone who can reach the port can read every recorded report, and can now
+  change what one of them says.
 
 `docs/real-repo-eval.md` is the design for evaluating agents against a real
 repository rather than a three-file demo, and its §1 tables are kept current.

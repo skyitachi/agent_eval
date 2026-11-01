@@ -56,7 +56,7 @@ func sessionServerAt(t *testing.T, root string) (http.Handler, *store.Store) {
 	}
 	catalog := &session.Catalog{ClaudeRoot: root}
 	mgr, err := replay.NewManager(replay.Config{Store: st, Catalog: catalog, Presets: presets,
-		WorkRoot: t.TempDir(), Timeout: time.Minute})
+		WorkRoot: t.TempDir(), Timeout: time.Minute, Grader: "none"})
 	if err != nil {
 		t.Fatal(err)
 	}

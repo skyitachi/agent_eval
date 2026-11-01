@@ -268,15 +268,7 @@ func normalize(t *TaskSpec) {
 	if t.Limits == nil {
 		t.Limits = &Limits{}
 	}
-	for i := range t.Graders {
-		if t.Graders[i].Name == "" {
-			if len(t.Graders) == 1 {
-				t.Graders[i].Name = t.Graders[i].Type
-			} else {
-				t.Graders[i].Name = fmt.Sprintf("%s#%d", t.Graders[i].Type, i+1)
-			}
-		}
-	}
+	NameGraders(t.Graders)
 	sort.Strings(t.Tags)
 }
 

@@ -173,6 +173,25 @@ func (g GraderSpec) EffectiveWeight() float64 {
 // Float64 is a helper for building specs in Go with an explicit weight.
 func Float64(v float64) *float64 { return &v }
 
+// NameGraders fills in the label of every grader that has none.
+//
+// A single grader is named by its type; several are numbered by position, so
+// two llm_judge graders stay distinguishable in a report. It lives here rather
+// than in the loader because a re-grade builds its grader list at run time, and
+// two naming rules would label the same grader differently on the two paths.
+func NameGraders(specs []GraderSpec) {
+	for i := range specs {
+		if specs[i].Name != "" {
+			continue
+		}
+		if len(specs) == 1 {
+			specs[i].Name = specs[i].Type
+			continue
+		}
+		specs[i].Name = fmt.Sprintf("%s#%d", specs[i].Type, i+1)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------

@@ -801,3 +801,30 @@ func requirePytest(t *testing.T) string {
 		strings.Join(candidates, ", "), EnvPython)
 	return ""
 }
+
+// ---------------------------------------------------------------------------
+// Which graders a stored row can be graded with
+// ---------------------------------------------------------------------------
+
+// A re-grade has no workspace, so graders that execute inside one have to be
+// distinguishable from graders that read the recorded diff and answer. The
+// claim is checked against the registry rather than against a list at the call
+// site: a grader added later that shells out has to declare itself or it will
+// be run against nothing.
+func TestOnlyTheGradersThatExecuteNeedAWorkspace(t *testing.T) {
+	want := map[string]bool{
+		"pytest":      true,
+		"command":     true,
+		"patch":       false,
+		"exact_match": false,
+		"llm_judge":   false,
+	}
+	for typ, needs := range want {
+		if got := NeedsWorkspace(typ); got != needs {
+			t.Errorf("NeedsWorkspace(%q) = %v, want %v", typ, got, needs)
+		}
+	}
+	if NeedsWorkspace("not-a-grader") {
+		t.Error("an unregistered type reported a sandbox requirement; the caller reports that better")
+	}
+}

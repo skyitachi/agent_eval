@@ -90,6 +90,9 @@ func newManager(t *testing.T) (*Manager, *store.Store) {
 		Presets:  mockPresets(t),
 		WorkRoot: t.TempDir(),
 		Timeout:  time.Minute,
+		// No judge: these tests must stay offline. The default judge is
+		// covered by TestAWebReplayCollectedTasksCarryTheDefaultJudge.
+		Grader: "none",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -163,6 +166,70 @@ func TestAReplayRunsTheSessionAndRegistersItsReport(t *testing.T) {
 		if !strings.Contains(done.Log, want) {
 			t.Errorf("the log should say %q:\n%s", want, done.Log)
 		}
+	}
+}
+
+// A web replay must produce scorable tasks: the judge is the default, and it
+// must see the diff, not just the final "done".
+func TestAWebReplayCollectedTasksCarryTheDefaultJudge(t *testing.T) {
+	cat := &session.Catalog{ClaudeRoot: claudeRoot(t)}
+	entry, err := cat.Find(session.CatalogClaude, sessionID)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	sess, err := cat.Load(entry)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	items, _, err := collect(sess, DefaultGrader, "", DefaultGraderConfig())
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("collect produced no tasks")
+	}
+	for _, it := range items {
+		if len(it.Task.Graders) != 1 {
+			t.Fatalf("task %s carries %d graders, want the default judge", it.Task.ID, len(it.Task.Graders))
+		}
+		g := it.Task.Graders[0]
+		if g.Type != DefaultGrader {
+			t.Errorf("task %s grader = %q, want %q", it.Task.ID, g.Type, DefaultGrader)
+		}
+		if g.Config["input"] != "both" {
+			t.Errorf("task %s judge input = %v, want both (the diff is the work)", it.Task.ID, g.Config["input"])
+		}
+	}
+}
+
+// The default is what a person pressing replay on the page gets, so it is
+// pinned here rather than left implicit in an empty field.
+func TestTheManagerDefaultsToTheJudge(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m, err := NewManager(Config{Store: st, Catalog: &session.Catalog{}, WorkRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	if m.cfg.Grader != DefaultGrader {
+		t.Errorf("default grader = %q, want %q", m.cfg.Grader, DefaultGrader)
+	}
+	if m.cfg.GraderConfig["input"] != "both" {
+		t.Errorf("default judge input = %v, want both", m.cfg.GraderConfig["input"])
+	}
+
+	off, err := NewManager(Config{Store: st, Catalog: &session.Catalog{}, WorkRoot: t.TempDir(), Grader: "none"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(off.Close)
+	if off.cfg.Grader != "" || off.cfg.GraderConfig != nil {
+		t.Errorf(`Grader:"none" left %q/%v, want no grader`, off.cfg.Grader, off.cfg.GraderConfig)
 	}
 }
 
@@ -280,6 +347,7 @@ func TestCancellingARunningReplayStopsTheAgent(t *testing.T) {
 		Presets:  presets,
 		WorkRoot: t.TempDir(),
 		Timeout:  time.Minute,
+		Grader:   "none",
 	})
 	if err != nil {
 		t.Fatal(err)

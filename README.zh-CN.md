@@ -101,6 +101,7 @@ export ANTHROPIC_API_KEY=...
 | `aeval matrix`   | 对一条因子轴跑一次 sweep，或对已跑过的 sweep 做归因。         |
 | `aeval report`   | 把一次 run、一次对比、一次 sweep，或整个索引渲染成 HTML，并登记它渲染了什么。 |
 | `aeval serve`    | 把登记下来的报告跑成一个 HTTP 服务。                       |
+| `aeval grade`    | 用已记录的 cell 重判单个任务，不重跑 agent。               |
 | `aeval list`     | 列出已记录的 run，可按 sweep 或轴过滤。                 |
 | `aeval version`  | 打印构建、schema、payload 版本与已注册的 agent。        |
 
@@ -410,6 +411,35 @@ git -C <repo> clean -ffd
 会被记录下来、在报告里渲染成失败、并让退出码非零 —— 一个仓库停在错提交上的人，不该被一个 0 退出码  
 告知一切正常。
 
+## 单独重判一个任务
+
+verdict 不是总能在 agent 停下来那一刻拿到：采集来的会话只有 baseline、没有 ground truth；judge 可能缺凭据；
+rubric 可能写错了。重跑任务回答的是另一个问题 —— 另一次 attempt、另一份花费 —— 所以 `aeval grade` 用
+cell 里已经记下的东西，去判**实际做过的那份活**：
+
+```sh
+aeval grade --run 4d92d2be --task 3c11e6dc-p0 --grader llm_judge --db aeval.db
+```
+
+- 不给 `--grader` 时用它数据集里声明的评分器，这是可复现的选择。`--grader` 覆盖这一次的评分器，正好是采集来
+  的任务需要的 —— 它一个都没声明，报错会直说。
+- `--grader-config` 是该评分器的 JSON 配置，例如
+  `--grader-config '{"input":"both","rubric":"..."}'`。`--grader llm_judge` 不给配置时用网页 replay
+  挂的那套 rubric —— 从命令行得到的 verdict 和从网页得到的要能比，否则入口本身就成了变量。
+- `--dataset` 在原数据集被挪走时指向 manifest。
+- `--sample` 指定 `--samples k` 里第几遍（默认第一遍）；`--threshold` 覆盖 cell 上记录的阈值 ——
+  未判分的 cell 没有记录，这种情况按默认 1.0。
+
+写回的只有 verdict 那几列。tokens、耗时、花费描述的是一个已经退出的进程，重判把它们改掉，就等于给一个什么都没
+测到的 verdict 配了个数字。命令会把新 verdict 连同它替换掉的旧 verdict 一起打出来，并提示这次 run 登记过的页面
+已经和库里的内容不一致：`aeval report --run <id>` 会重新渲染并登记一份。
+
+有两件事它不做。它不启动 agent，所以判的就是当初记录下来的那份活。它也**拒绝**那些得不出结论的评分器，而不是
+硬写一个结论：`pytest` 与 `command` 要在 run 已经没有的工作区里执行，judge 缺凭据则会把一个没设的环境变量变成
+一个失败的任务。前者只能重跑，后者去设变量。
+
+同样的操作也是报告页上的一颗按钮 —— 见「在页面上给某个 cell 判分」。
+
 ## 报告
 
 `aeval report` 写出一份自包含的 `.html` —— CSS 与 JS 全部内联 —— 能从 `file://` 打开、  
@@ -475,8 +505,8 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 ```
 
 `GET /` 列出已登记的报告，`GET /r/<id>` 从数据库重建其中一份并渲染，`GET /r/<id>.json` 返回同一份  
-文档的 JSON。每个页面上都有一条横幅，说明「它刚刚重建出来的这份文档」与「当初登记的那份」是什么  
-关系：
+文档的 JSON，`POST /r/<id>/grade` 给它的某个 cell 重新得出一个结论（见下文）。每个页面上都有一条横幅，
+说明「它刚刚重建出来的这份文档」与「当初登记的那份」是什么关系：
 
 | 横幅写什么 | 什么时候 |
 | --- | --- |
@@ -491,6 +521,28 @@ aeval serve --db runs.db --addr 127.0.0.1:8080
 
 **只有 `aeval report` 与回放按钮登记。** `run` 与 `matrix` 顺手写出的那份报告是便利产物、不是登记 ——  
 那个视图没人要过，把它记进去只会让日志塞满从没被请求过的视图。
+
+### 在页面上给某个 cell 判分
+
+这些页面原来是只读的，而且这被当成一句承诺写着。这一条是**故意撤销**的。表里显示 `not graded` 的  
+cell 现在每一行都带一个 `grade` 按钮，`POST /r/<id>/grade` 用这一行**已经记下**的东西 —— diff、  
+回答、归一化后的轨迹 —— 重新得出一个结论，**不重跑 agent**。重跑判的是另一次尝试，而且要为它付钱。
+
+cell 的 **graders** 标签页里有一个下拉框选择判据：
+
+| 取值 | 用什么判 |
+| --- | --- |
+| `auto` | 数据集自己声明的那些评分器；它一个都没声明时用 judge |
+| `llm_judge` | judge，用网页回放默认挂的那套 rubric（`input: both`，判结果不判文风） |
+| `patch` | 只判改动的形状：确实改了，而且不是把仓库整体重写 |
+
+在**写任何东西之前**就会拒绝那些跑不了的：`pytest` 与 `command` 需要在工作区里执行，而已结束的 run  
+没有工作区；judge 没有凭证则会把 harness 的错误记成 agent 的失败。拒绝时会点名缺什么 —— 该设哪两个
+环境变量，或者哪些评分器是能离线跑的。
+
+没有变的是当初真正要紧的那部分：每次读取仍然是从行重建，所以被判过分的页面回来时会写着  
+`This page is not the recorded document.` —— 这正是发生的事。它上方那条提示写的是**行里现在**的结论，
+由行拼出来、而不是由 URL 拼出来，所以手写一个 `?graded=` 链接没法让页面声称一个它没有的结论。
 
 ### 浏览本机会话并回放
 
@@ -548,6 +600,9 @@ harness、`none` 一个 skill、CLI 默认模型。
   录的那一道。
 - **不接受跨站表单。** 每个 POST 都要带服务启动时生成的 token；带了 `Origin` 的必须是本服务。别的网站发  
   不起回放。
+- **判分按钮的防护是同一套。** `POST /r/<id>/grade` 会写数据库、还可能花掉一次 API 调用，所以它照样查  
+  那三样（Host、`Origin`、表单 token）—— 尽管报告页本身的读取仍然什么都不查。这条路由还拒绝被 iframe  
+  框住：被框住的页面就是陌生人能塞到读者光标底下的一颗按钮。
 - **没有登录。** 本机以你的身份运行、能开 socket 的任何东西都能用这些页面。
 
 ## 包结构
@@ -566,6 +621,7 @@ internal/attrib/   因子轴、sweep 计划、配对比较、符号检验
 internal/report/   视图模型、加载器、HTML 渲染器、报告登记表
 internal/server/   HTTP 服务：已登记报告、本机会话、回放表单
 internal/replay/   回放预设与回放按钮背后的任务队列
+internal/regrade/  用已完成 cell 记下的东西重新得出结论
 internal/machine/  collect 盖上、回放核对的机器标识
 internal/llm/      llm_judge 用的最小客户端
 tests/             驱动真实二进制的端到端测试
@@ -603,9 +659,11 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" go 
   于是 `resolve_rate` 无法被解释：分不清是任务难还是任务坏。
 - **`Baseline.RestorePaths` 写了但没人用。** 它正是「判分前把测试文件还原，让改了测试的  
   agent 按真实水平计分」那条语义的原语 —— 而它没有调用方、没有测试、数据集里也没有字段。
-- **报告服务只读、且无认证。** `aeval serve` 从数据库重建已登记的报告并把它提供出去；没有登录、  
-  没有写入路径、也没有按用户区分的视图。它默认绑 `127.0.0.1`，被要求监听别处时会打警告，  
-  因为凡是能连上那个端口的人，就能读到所有已登记的报告。
+- **报告服务无认证，而且现在可写。** `aeval serve` 从数据库重建已登记的报告并把它提供出去，页面上的  
+  判分按钮会把一个结论写回某个 cell。没有登录、没有按用户区分的视图，也不记录是谁按的。写入范围被  
+  「一个已结束的 cell 能怎么重判」限住 —— 页面上没有任何东西会重跑 agent。它默认绑 `127.0.0.1`，被要  
+  求监听别处时会打警告，因为凡是能连上那个端口的人，本来就能读到所有已登记的报告，现在还能改掉其中  
+  一份说的是什么。
 
 `docs/real-repo-eval.md` 是「在真实仓库而不是三文件 demo 上评测 agent」的设计，  
 它的 §1 表格保持与代码同步。`docs/design.md` 是本实现所回答的最初需求。
