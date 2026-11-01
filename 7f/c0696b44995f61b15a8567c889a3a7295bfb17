@@ -1,0 +1,33 @@
+internal/dataset/loader.go
+  s_13e3add1da2f22::t_9c13bdb712468f 271
+internal/dataset/spec.go
+  s_13e3add1da2f22::t_51b859fdfd5594 176-194
+internal/report/templates/page.html
+  s_aecb8c244b38b2::t_70760ea2d121e0 38-43,65-69
+internal/store/store.go
+  s_13e3add1da2f22::t_4403854c205caa 949-1010
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7fc0696b44995f61b15a8567c889a3a7295bfb17",
+  "prompts": {},
+  "sessions": {
+    "s_13e3add1da2f22": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a195bc-6b51-7684-8897-7c7315f5d142",
+        "model": "deepseek-flash"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    },
+    "s_aecb8c244b38b2": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "01a195d2-2d5d-7684-8897-7c75f6cd97b5",
+        "model": "deepseek-flash"
+      },
+      "human_author": "skyitachi <skbysp@gmail.com>"
+    }
+  }
+}
