@@ -51,6 +51,7 @@ import (
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/attrib"
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/grader"
 	"github.com/skyitachi/agenteval/internal/machine"
 	"github.com/skyitachi/agenteval/internal/regrade"
 	"github.com/skyitachi/agenteval/internal/replay"
@@ -575,6 +576,8 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		graderType = fs.String("grader", "", "attach a grader of this type; without one the task is measurable but not scorable")
 		graderName = fs.String("grader-name", "", "name for the attached grader")
 		graderCfg  = fs.String("grader-config", "", "inline JSON configuration for the grader")
+		graderFile = fs.String("grader-config-file", "",
+			"YAML file declaring the grader (type, name, config); the whole declaration, so it replaces the three flags above")
 
 		wsRepo   = fs.String("workspace-repo", "", "bind every task to this repository")
 		wsRef    = fs.String("ref", "", "commit or ref to check out")
@@ -638,6 +641,21 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// A file is the same three things at once, so combining it with any of them
+	// has no answer: whichever wins, the other flags read as if they applied.
+	gtype, gname := *graderType, *graderName
+	if *graderFile != "" {
+		if gtype != "" || gname != "" || graderConfig != nil {
+			return usageFail(stderr, "collect: --grader-config-file declares the type, the name and the config, "+
+				"so it cannot be combined with --grader, --grader-name or --grader-config")
+		}
+		spec, err := dataset.LoadGraderSpec(absFlagPath(*graderFile))
+		if err != nil {
+			return usageFail(stderr, "collect: %v", err)
+		}
+		gtype, gname, graderConfig = spec.Type, spec.Name, spec.Config
+	}
+
 	var (
 		sessions []*session.Session
 		names    []string
@@ -672,8 +690,8 @@ func cmdCollect(args []string, stdout, stderr io.Writer) int {
 
 	opts := session.Options{
 		Split:           splitMode,
-		Grader:          *graderType,
-		GraderName:      *graderName,
+		Grader:          gtype,
+		GraderName:      gname,
 		GraderConfig:    graderConfig,
 		WorkspaceRepo:   absFlagPath(*wsRepo),
 		WorkspaceRef:    *wsRef,
@@ -2096,6 +2114,88 @@ func safeName(id string) string {
 // serve
 // ---------------------------------------------------------------------------
 
+// serveJudge is the grader a server was told to attach, with the file it came
+// from.
+//
+// One value carries it to the two places that have to agree about it: the
+// replay manager that writes the grader onto collected tasks, and the line
+// printed at startup. If they could disagree, the banner would claim a judge
+// the replays do not use -- which is the state a reader would be in while
+// looking at a report page that refuses to grade.
+type serveJudge struct {
+	spec dataset.GraderSpec
+	path string
+}
+
+// replayConfig hands the declaration to a manager. An empty one leaves the
+// manager's own default -- the judge with the rubric a replay has always
+// attached -- because a server started without this flag has not been told
+// otherwise.
+//
+// A file replaces that declaration whole rather than merging into it: it has
+// the shape a dataset's grader[] entry has, and a partial-override reading
+// would be a second contract for the same document.
+func (j serveJudge) replayConfig(cfg replay.Config) replay.Config {
+	if j.spec.Type == "" {
+		return cfg
+	}
+	cfg.Grader, cfg.GraderName, cfg.GraderConfig = j.spec.Type, j.spec.Name, j.spec.Config
+	return cfg
+}
+
+// serverOptions hands the same declaration to the report server, which grades
+// stored cells with it. Nil when nothing was declared: the server's own default
+// is the built-in judge, which is what a server told nothing should use.
+//
+// Without this a served page and the replays it lists would grade with
+// different judges -- the replays with the one the flag named, the page with
+// api.anthropic.com -- and the page's answer would be "no credentials" on a
+// machine that has one, just not for that endpoint.
+func (j serveJudge) serverOptions() *dataset.GraderSpec {
+	if j.spec.Type == "" {
+		return nil
+	}
+	spec := j.spec
+	return &spec
+}
+
+// describe is the startup line, or "" when nothing was declared.
+func (j serveJudge) describe(replays bool) string {
+	if j.spec.Type == "" {
+		return ""
+	}
+	where := j.path
+	if j.spec.Name != "" {
+		where = j.spec.Name + " in " + where
+	}
+	use := "report pages grade with it"
+	if replays {
+		use = "replays attach it and report pages grade with it"
+	}
+	return fmt.Sprintf("judge     %s (%s): %s", j.spec.Type, where, use)
+}
+
+// credentialWarning is the startup line for a judge that cannot authenticate,
+// or "".
+//
+// It belongs in the banner because the alternative is finding out by pressing a
+// button: a report page refuses with a 409, and a replay silently collects
+// tasks that are measurable but not scorable. Both are the same missing
+// variable, stated once here where it can still be fixed by exporting it and
+// starting again.
+func (j serveJudge) credentialWarning() string {
+	if j.spec.Type == "" || replay.JudgeAvailable(j.spec.Config) {
+		return ""
+	}
+	name := j.spec.Name
+	if name == "" {
+		name = j.spec.Type
+	}
+	return fmt.Sprintf("warning   the judge %q has no credentials in this process: a grade from a report page "+
+		"will refuse, and replays will collect tasks that are measurable but not scorable. Set the variable the "+
+		"grader config names (api_key_env / auth_token_env) and start this server again", name)
+}
+
 // cmdServe serves the recorded reports over HTTP.
 //
 // It does not render anything to disk and it does not snapshot the database:
@@ -2108,16 +2208,19 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	var (
 		common commonFlags
-		addr   = fs.String("addr", "127.0.0.1:8080", "address to listen on")
+		addr   = fs.String("addr", "127.0.0.1:18080", "address to listen on")
 		limit  = fs.Int("limit", 200, "how many recorded reports the list shows")
 		title  = fs.String("title", "", "heading of the report list")
 
 		noSessions  = fs.Bool("no-sessions", false, "serve reports only: no session pages and no replay button (a report page can still be graded)")
 		presetsPath = fs.String("replay-config", "", "YAML file of the harnesses, skill sets and models a replay can pick")
-		claudeRoot  = fs.String("claude-root", "", "where Claude Code transcripts are read from (default ~/.claude/projects)")
-		cursorDB    = fs.String("cursor-db", "", "Cursor's state database (default: the platform's location)")
-		wbRoot      = fs.String("workbuddy-root", "", "WorkBuddy traces directory (default ~/.workbuddy/traces)")
-		replayRoot  = fs.String("replay-root", "", "where replays keep their datasets and workspaces (default: beside the database)")
+		graderFile  = fs.String("grader-config-file", "",
+			"YAML file declaring the grader this server grades with (type, name, config): replays attach it and "+
+				"report pages grade with it; without one the built-in judge is used")
+		claudeRoot = fs.String("claude-root", "", "where Claude Code transcripts are read from (default ~/.claude/projects)")
+		cursorDB   = fs.String("cursor-db", "", "Cursor's state database (default: the platform's location)")
+		wbRoot     = fs.String("workbuddy-root", "", "WorkBuddy traces directory (default ~/.workbuddy/traces)")
+		replayRoot = fs.String("replay-root", "", "where replays keep their datasets and workspaces (default: beside the database)")
 	)
 	addCommon(fs, &common)
 	if ok, code := parse(fs, args, stderr); !ok {
@@ -2128,7 +2231,20 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	if *noSessions && (*presetsPath != "" || *claudeRoot != "" || *cursorDB != "" || *wbRoot != "" || *replayRoot != "") {
 		return usageFail(stderr, "serve: --replay-config, --claude-root, --cursor-db and --replay-root "+
-			"only mean something with the session pages, which --no-sessions turns off")
+			"only mean something with the session pages, which --no-sessions turns off "+
+			"(--grader-config-file is not in that list: a report page grades with it too)")
+	}
+	// Read before listening, for the same reason the presets are: a file that
+	// does not parse has to fail where it is named, not on the report page of a
+	// replay that has already spent an agent run.
+	var judge serveJudge
+	if *graderFile != "" {
+		path := absFlagPath(*graderFile)
+		spec, err := dataset.LoadGraderSpec(path)
+		if err != nil {
+			return usageFail(stderr, "serve: %v", err)
+		}
+		judge = serveJudge{spec: spec, path: path}
 	}
 	if !*noSessions {
 		// Checked before listening: the session pages serve every transcript on
@@ -2148,6 +2264,20 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	defer st.Close()
 
+	// A grade request is a goroutine of the process that accepted it. A row
+	// still queued or running when this process starts belonged to one that is
+	// gone: the verdict was never written and never will be, so the row is
+	// closed as failed here rather than left saying "grading" forever -- the
+	// one reading that is certainly false.
+	//
+	// The count is printed with the rest of the banner rather than here, so the
+	// first line a script reads is still the address.
+	recovered, err := st.AbandonGradeJobs(context.Background(),
+		"the server that accepted this grade stopped before reaching a verdict")
+	if err != nil {
+		fmt.Fprintf(stderr, "aeval: serve: warning: %v\n", err)
+	}
+
 	// Listen before printing anything. The address that comes back is the one
 	// that is actually open, which is what makes `--addr 127.0.0.1:0` usable for
 	// taking a free port; and a port already in use has to fail before a line
@@ -2157,7 +2287,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		return fail(stderr, "serve: listen on %s: %v", *addr, err)
 	}
 
-	web := server.New(st, server.Options{Title: *title, Limit: *limit})
+	web := server.New(st, server.Options{Title: *title, Limit: *limit, Judge: judge.serverOptions()})
 	if !*noSessions {
 		presets := replay.DefaultPresets()
 		if *presetsPath != "" {
@@ -2176,10 +2306,10 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		if *wbRoot != "" {
 			catalog.WorkBuddyRoot = absFlagPath(*wbRoot)
 		}
-		mgr, err := replay.NewManager(replay.Config{
+		mgr, err := replay.NewManager(judge.replayConfig(replay.Config{
 			Store: st, Catalog: catalog, Presets: presets,
 			WorkRoot: absFlagPath(*replayRoot), ToolVersion: version,
-		})
+		}))
 		if err != nil {
 			ln.Close()
 			return fail(stderr, "serve: %v", err)
@@ -2209,6 +2339,12 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "serving   %s\n", listenURL(ln.Addr().String()))
 	fmt.Fprintf(stdout, "database  %s\n", st.Path())
+	if recovered > 0 {
+		// Said out loud because it is a request a reader made that will never
+		// finish: the page would otherwise simply stop saying "grading" with no
+		// explanation of what happened to it.
+		fmt.Fprintf(stdout, "recovered %d unfinished grade request(s) from a stopped server, closed as failed\n", recovered)
+	}
 	if !isLoopback(ln.Addr().String()) {
 		// Worth a line: the database holds every recorded transcript, diff and
 		// answer, so the difference between this and the default is the
@@ -2221,6 +2357,17 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	// The one thing here that writes, said out loud rather than discovered by
 	// pressing a button whose consequences were not stated.
 	fmt.Fprintln(stdout, "grading   a cell can be re-graded from its report page; that writes to this database")
+	// Said here rather than only in the file: the judge's endpoint and the
+	// name of its credential decide whether a grade can be reached at all, and
+	// "which judge was I actually running" is the question a 409 on the report
+	// page raises. It is printed with or without the session pages, because the
+	// grade button does not need them.
+	if line := judge.describe(!*noSessions); line != "" {
+		fmt.Fprintln(stdout, line)
+	}
+	if line := judge.credentialWarning(); line != "" {
+		fmt.Fprintln(stdout, line)
+	}
 	if !*noSessions {
 		fmt.Fprintf(stdout, "sessions  %ssessions   (replays launch agents on this machine; --no-sessions turns this off)\n",
 			listenURL(ln.Addr().String()))
@@ -2229,6 +2376,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 
 	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fail(stderr, "serve: %v", err)
+	}
+	// Grading runs in this process, so stopping means telling it to stop: a
+	// judge call in flight is abandoned and its row is left saying so, rather
+	// than the process waiting for a model that may take another minute.
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer closeCancel()
+	if err := web.Close(closeCtx); err != nil {
+		fmt.Fprintf(stderr, "aeval: serve: a grade in flight did not stop in time: %v\n", err)
 	}
 	fmt.Fprintln(stdout, "stopped")
 	// Stopping is how a server ends, not an interruption of work: the signal is
@@ -2240,7 +2395,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 // listenURL renders a bound address as something a person can paste.
 //
 // The wildcard forms become 127.0.0.1 because that is where a reader on this
-// machine reaches the same port, and printing "http://0.0.0.0:8080/" would be
+// machine reaches the same port, and printing "http://0.0.0.0:18080/" would be
 // technically what was bound and useless to click.
 func listenURL(addr string) string {
 	host, port, err := net.SplitHostPort(addr)
@@ -2372,7 +2527,8 @@ func cmdGrade(args []string, stdout, stderr io.Writer) int {
 		gtype  = fs.String("grader", "", "grade with this grader type instead of the ones the task declares")
 		gname  = fs.String("grader-name", "", "label for --grader in the report (default: its type)")
 		gconf  = fs.String("grader-config", "", "JSON config for --grader")
-		thresh = fs.Float64("threshold", 0, "score the task must reach to pass (default: the cutoff recorded on the cell, else 1.0)")
+		thresh = fs.Float64("threshold", 0, fmt.Sprintf(
+			"score the task must reach to pass (default: the cutoff recorded on the cell, else %v)", grader.Threshold))
 		asJSON = fs.Bool("json", false, "print the verdicts as JSON")
 	)
 	fs.Var(&tasks, "task", "task id to grade (repeatable)")
@@ -2421,14 +2577,40 @@ func cmdGrade(args []string, stdout, stderr io.Writer) int {
 	opts := regrade.Options{Dataset: absFlagPath(*dsPath), Graders: specs, Threshold: *thresh}
 	code := exitOK
 	var outcomes []*regrade.Outcome
+	// What each verdict cost, kept beside it so the printout can say so. The
+	// row is the record; this is only so the command does not make a reader
+	// open the database to find out what a judge call spent.
+	spend := map[*regrade.Outcome]*store.GradeJob{}
 	for _, id := range tasks {
-		o, err := regrade.One(ctx, st, *runID, id, *sample, opts)
+		// Resolved first: a request has to name the cell it is about, and -1
+		// means "whichever sample comes first", which is a number the row
+		// knows and the flag does not.
+		sampleIdx, err := regrade.Check(ctx, st, *runID, id, *sample, opts)
+		if err != nil {
+			fmt.Fprintf(stderr, "aeval: grade: %v\n", err)
+			code = exitError
+			continue
+		}
+		chosen := *gtype
+		if chosen == "" {
+			chosen = "auto"
+		}
+		job, err := regrade.Start(ctx, st, store.GradeRequest{
+			RunID: *runID, TaskID: id, Sample: sampleIdx, Grader: chosen,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "aeval: grade: %v\n", err)
+			code = exitError
+			continue
+		}
+		o, done, err := regrade.Run(ctx, st, job, opts)
 		if err != nil {
 			fmt.Fprintf(stderr, "aeval: grade: %v\n", err)
 			code = exitError
 			continue
 		}
 		outcomes = append(outcomes, o)
+		spend[o] = done
 	}
 
 	if *asJSON {
@@ -2447,6 +2629,10 @@ func cmdGrade(args []string, stdout, stderr io.Writer) int {
 			fmt.Fprintln(stdout)
 		}
 		printVerdict(stdout, o)
+		if j := spend[o]; j != nil && (j.InputTokens > 0 || j.OutputTokens > 0) {
+			fmt.Fprintf(stdout, "  judge  %s: %d in / %d out tokens in %.1fs\n",
+				j.Model, j.InputTokens, j.OutputTokens, float64(j.LatencyMs)/1000)
+		}
 	}
 	if len(outcomes) > 0 {
 		// The stored page was rendered from the row as it was. Its hash no

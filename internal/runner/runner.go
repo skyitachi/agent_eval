@@ -35,10 +35,13 @@ import (
 	"github.com/skyitachi/agenteval/internal/trace"
 )
 
-// DefaultThreshold is the composite score a task must reach to pass. One means
-// every weighted grader has to pass, which is the same reading as SWE-bench's
-// resolved rate.
-const DefaultThreshold = 1.0
+// DefaultThreshold is the composite score a task must reach to pass.
+//
+// 0.6 rather than 1.0: a rubric judge scores continuously and a mostly-correct
+// answer lands near 0.8, so a default of 1.0 turned "right, with one thing
+// missing" into a failure. A task that wants the exact line declares its own
+// threshold; see grader.Threshold for the full argument.
+const DefaultThreshold = 0.6
 
 // backendLocal is the only sandbox this build can select.
 //
@@ -1255,7 +1258,11 @@ func runCell(ctx context.Context, ds *dataset.Dataset, cfg Config, drive agent.R
 	}
 
 	if len(t.Graders) > 0 && att.Status != store.CellError {
-		grade, err := gradeTask(cellCtx, t, sb, baseline, attempt, cfg.Threshold)
+		// A task may carry the line it is measured against, and it wins over
+		// the run-wide one: a judge that scores continuously and a benchmark
+		// imported with its own cutoff disagree about what "passed" means, and
+		// the task is the only one of the two that knows which it is.
+		grade, err := gradeTask(cellCtx, t, sb, baseline, attempt, t.EffectiveThreshold(cfg.Threshold))
 		if err != nil {
 			att.Error = joinMsg(att.Error, "grade: "+err.Error())
 			if att.Status == store.CellOK {

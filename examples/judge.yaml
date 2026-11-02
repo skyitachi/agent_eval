@@ -1,0 +1,67 @@
+# The grader a replay attaches, in the shape a dataset's graders[] entry has.
+#
+#   aeval serve --grader-config-file examples/judge.yaml
+#   aeval collect --session <id> --out <dir> --grader-config-file examples/judge.yaml
+#
+# One declaration, two uses: `serve` attaches it to every task a replay
+# collects, `collect` writes it onto the tasks it emits. Either way it ends up
+# recorded inside the dataset, so the verdict on a report page is reproducible
+# on a machine whose shell has never heard of these variables -- and it can be
+# re-graded later without re-running the agent.
+#
+# The file replaces --grader / --grader-name / --grader-config whole; those
+# three flags cannot be combined with it.
+
+type: llm_judge
+
+# The name the verdict is reported under. Without one it is the type.
+name: judge
+
+config:
+  # What the judge reads: the final answer, the diff, or both. A collected
+  # task is usually a coding session bound to its repository, so the diff is
+  # where the work is and the answer is often just "done".
+  input: both
+
+  # Where to call. Any endpoint that speaks the Anthropic Messages protocol
+  # works; this one is DeepSeek's. Left out, the judge falls back to
+  # https://api.anthropic.com (or $ANTHROPIC_BASE_URL).
+  base_url: https://api.deepseek.com/anthropic
+
+  # The NAME of the variable holding the credential, never the credential.
+  # auth_token_env is sent as `Authorization: Bearer` (gateways); api_key_env
+  # is sent as `x-api-key` (native Anthropic keys). Naming it here is what
+  # makes a report page able to say "no credentials" instead of spending a
+  # call that fails.
+  auth_token_env: DEEPSEEK_API_KEY
+
+  # The model the judge asks for. Left out, it is $ANTHROPIC_MODEL, then
+  # claude-sonnet-4-5 -- which most gateways do not serve under that name.
+  # This endpoint serves deepseek-flash and deepseek-v4-pro; deepseek-chat
+  # still answers as an alias, but it is not the id its /models reports.
+  model: deepseek-flash
+
+  # The model reasons before it answers, and that reasoning is charged to the
+  # same output budget as the verdict -- measured on one 6 kB judge prompt, the
+  # thinking alone ranged from 6.5k to 25k characters. The default 2048 runs out
+  # mid-thought often enough to look like a flaky judge: the reply then carries
+  # a thinking block and no text, and the verdict is a zero with no JSON.
+  max_tokens: 16384
+
+  # The score at which this judge passes its own verdict; 0.67 when left out.
+  #
+  # The same number is written onto every task `collect` emits, as that task's
+  # `threshold`, so the grader's card in the report and the cell's verdict
+  # cannot disagree. It also wins over a run-wide --threshold, so a benchmark
+  # cannot be re-scored by a flag it never knew about.
+  threshold: 0.67
+
+  # What good looks like. The judge is asked for a JSON verdict against this.
+  rubric: |
+    The work is correct if it accomplishes what the task prompt asked for, the
+    change is coherent and complete, and it is not a no-op, an unrelated
+    rewrite, or a deletion of the tests. Judge the outcome, not the length or
+    style of the reply.
+
+# weight, required and timeout_s are refused here on purpose: they are task
+# decisions, and both commands that read this file would silently drop them.

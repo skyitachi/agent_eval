@@ -31,6 +31,37 @@ type LLMJudge struct{}
 
 func (j *LLMJudge) Type() string { return "llm_judge" }
 
+// RequiresModel marks the one dependency this grader has: without a credential
+// in the environment every call it makes fails, and a re-grade refuses it by
+// name rather than writing that failure over a row.
+func (j *LLMJudge) RequiresModel() bool { return true }
+
+// judgeThreshold is the cutoff the judge applies to its own score when its
+// config names none.
+//
+// It is a named constant because three things have to agree about it: the
+// verdict below, the number collect writes onto a task, and the number the
+// report explains. A second literal 0.67 drifting away from this one is exactly
+// how a page ends up saying "the grader passed it but the cell failed" for no
+// reason a reader can see.
+const judgeThreshold = 0.67
+
+// OwnThreshold reports the cutoff this judge applies to its own score, with the
+// default applied. See grader.SelfThresholded.
+func (j *LLMJudge) OwnThreshold(config map[string]any) float64 {
+	var cfg llmJudgeConfig
+	if err := DecodeConfig(dataset.GraderSpec{Type: j.Type(), Config: config}, &cfg); err != nil {
+		// A config this grader cannot decode is a broken dataset, and the run
+		// reports that by name. Answering with the default line here keeps the
+		// report from also failing to describe it.
+		return judgeThreshold
+	}
+	if cfg.Threshold > 0 {
+		return cfg.Threshold
+	}
+	return judgeThreshold
+}
+
 type llmJudgeConfig struct {
 	// Rubric is the natural-language description of what good looks like.
 	Rubric string `json:"rubric,omitempty"`
@@ -59,7 +90,10 @@ type llmJudgeConfig struct {
 
 	// Threshold is the score at which the grader passes. Default 0.67.
 	Threshold float64 `json:"threshold,omitempty"`
-	// MaxTokens bounds the judge's reply. Default 2048.
+	// MaxTokens bounds the judge's reply. Default 2048. A reasoning model
+	// spends part of this on thinking before it writes the verdict, and that
+	// thinking is charged to the same budget -- 2048 can be gone before the
+	// JSON starts, so a judge on such a model needs a few thousand more.
 	MaxTokens int `json:"max_tokens,omitempty"`
 	// Temperature defaults to 0 for the most repeatable verdicts available.
 	Temperature float64 `json:"temperature,omitempty"`
@@ -161,15 +195,34 @@ func (j *LLMJudge) Grade(ctx context.Context, gc *Context, spec dataset.GraderSp
 	})
 
 	start := time.Now()
+	budget := orDefaultInt(cfg.MaxTokens, 2048)
 	resp, err := client.Complete(ctx, llm.Request{
 		Model:       cfg.Model,
 		System:      judgeSystemPrompt,
 		Messages:    []llm.Message{{Role: "user", Content: prompt}},
-		MaxTokens:   orDefaultInt(cfg.MaxTokens, 2048),
+		MaxTokens:   budget,
 		Temperature: cfg.Temperature,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("llm_judge call: %w", err)
+	}
+
+	// A reasoning model writes its thinking into the same output budget as its
+	// answer, so a budget that looked generous for an answer alone can be gone
+	// before the first word of it. Reported as what it is: "no JSON object
+	// found; raw reply: " reads as a parsing problem and sends the reader to
+	// the wrong knob.
+	if strings.TrimSpace(resp.Text) == "" {
+		model := resp.Model
+		if model == "" {
+			model = cfg.Model
+		}
+		if resp.StopReason == "max_tokens" {
+			return nil, fmt.Errorf("llm_judge: %s spent all %d output tokens before writing an answer "+
+				"(it reasons first, and the reasoning is charged to the same budget); raise max_tokens",
+				model, budget)
+		}
+		return nil, fmt.Errorf("llm_judge: %s returned no text (stop_reason %q)", model, resp.StopReason)
 	}
 
 	verdict, err := parseVerdict(resp.Text)
@@ -180,7 +233,7 @@ func (j *LLMJudge) Grade(ctx context.Context, gc *Context, spec dataset.GraderSp
 
 	threshold := cfg.Threshold
 	if threshold <= 0 {
-		threshold = 0.67
+		threshold = judgeThreshold
 	}
 	score := 0.0
 	if verdict.Score != nil {
@@ -195,6 +248,11 @@ func (j *LLMJudge) Grade(ctx context.Context, gc *Context, spec dataset.GraderSp
 		passed = *verdict.Passed && score >= threshold*0.5
 	}
 
+	// Whether the model asserted a pass, separately from whether the score
+	// cleared the cutoff. The card follows the assertion when there is one --
+	// down to half the cutoff -- so a reader looking at "score 0.65, cutoff 0.67,
+	// pass" needs to be able to see that the verdict came from the model rather
+	// than from arithmetic that appears not to add up.
 	details := map[string]any{
 		"judge_model":      resp.Model,
 		"judge_base_url":   client.BaseURL(),
@@ -209,6 +267,9 @@ func (j *LLMJudge) Grade(ctx context.Context, gc *Context, spec dataset.GraderSp
 		},
 		"truncated":   len(subject) > limit,
 		"duration_ms": time.Since(start).Milliseconds(),
+	}
+	if verdict.Passed != nil {
+		details["model_passed"] = *verdict.Passed
 	}
 	if len(verdict.Criteria) > 0 {
 		criteria := make([]map[string]any, 0, len(verdict.Criteria))

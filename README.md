@@ -99,7 +99,7 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" \
 # Browsable index plus one page per run, all openable from file://
 ./bin/aeval report --index --out-dir reports/site
 
-# Or serve the reports the commands above recorded, at http://127.0.0.1:8080
+# Or serve the reports the commands above recorded, at http://127.0.0.1:18080
 ./bin/aeval serve
 ```
 
@@ -141,8 +141,19 @@ wrong, `130` interrupted.
 | **Baseline** | A recorded attempt a task is compared to, usually exported from a real session by `aeval collect`. |
 | **Run** | One invocation of `aeval run`, identified by a UUID, stored with its dataset hash. |
 
-A cell **passes** when its composite grader score reaches the threshold
-(`--threshold`, 1.0 by default, i.e. every weighted grader must pass).
+A cell **passes** when its composite grader score reaches the threshold:
+`--threshold` for the run, 0.6 by default, unless the task declares its own
+(`threshold: 0.85`) — a declared cutoff wins over the flag, because imported
+benchmarks and rubric judges bring their own line.
+
+0.6 rather than 1.0 is a deliberate choice about what a rubric judge means. It
+scores continuously and a correct-but-incomplete answer lands near 0.8, so an
+exact default reads "right, with one thing missing" as a failure and turns the
+resolve rate into a measure of the judge's generosity. A task that wants the
+exact line — a test suite where every test must pass — says `threshold: 1.0`.
+A cell can also fail while the judge's own card reads pass: the card compares
+the score to the cutoff in the judge's config (0.67 by default), and the report
+names both numbers rather than leaving one of them to be discovered.
 
 ## Dataset format
 
@@ -171,7 +182,7 @@ task:   id, version, category, difficulty, tags
 prompt: prompt | prompt_file, system_prompt
 init:   workspace: {type: empty|files|git, ...}
 output: type: patch|files|stdout|none, paths, ignore_paths, expect_answer
-score:  graders: [...], limits: {max_turns, timeout_s}
+score:  graders: [...], threshold, limits: {max_turns, timeout_s}
 base:   baseline: {file, notes}
 origin: session, prompt_index   # the recording a task came from, and which prompt
 meta:   metadata: {...}          # free-form provenance, never interpreted
@@ -193,6 +204,12 @@ see the section on it above.
 `graders[].weight` is a pointer, which is how `weight: 0` ("run it, do not score
 it") stays distinct from an unset weight (= 1). `required: true` fails the whole
 task regardless of the other graders.
+
+`threshold` is the composite score this task must reach; leaving it out means
+"whatever the run was told", which is `--threshold` or the 0.6 default. It wins
+over the flag. `collect --grader-config-file` writes the judge's own cutoff here,
+so the cell and the grader's card are held to the same line; a task graded by
+`pytest` or `patch` gets none, because those graders have no cutoff of their own.
 
 ### Manifest
 
@@ -308,6 +325,21 @@ time, turns, tool calls) and **no grader**: a transcript carries no ground truth
 so the task is measurable and unscorable. Grading it as a failure would invent a
 verdict; grading it as a pass would invent the opposite. Attach a grader
 explicitly with `--grader` if you have one.
+
+A judge needs more than a type to be scorable: the endpoint it calls, the model
+it asks for, and the *name* of the variable holding its credential. Those belong
+in a declaration file, in the shape a dataset's `graders[]` entry has:
+
+```sh
+aeval collect --session <id> --out <dir> --grader-config-file examples/judge.yaml
+```
+
+The declaration is written onto every task it emits, so the dataset records how
+to reach the judge and a report page can re-grade a cell without the shell that
+collected it ever existing again. `weight`, `required` and `timeout_s` are
+refused in that file: they are task-level decisions that both readers would
+drop, and a line that is accepted and then ignored reads as configured. `serve`
+takes the same file for the replays it collects.
 
 Every baseline also records the machine it was collected on (`machine`: a
 hashed platform identifier — `IOPlatformUUID` on macOS, `/etc/machine-id` on
@@ -526,7 +558,13 @@ aeval grade --run 4d92d2be --task 3c11e6dc-p0 --grader llm_judge --db aeval.db
 - `--dataset` points at the manifest when the original has moved.
 - `--sample` picks which pass of a `--samples k` task to grade (the first by
   default). `--threshold` overrides the cutoff recorded on the cell; an
-  ungraded cell records none, and grading follows the default 1.0 there.
+  ungraded cell records none, and grading follows the default 0.6 there.
+
+A re-grade keeps the cutoff recorded on the cell rather than applying today's
+default: the row is the record of what that verdict was measured against, and a
+verdict silently re-scored by a newer line would be a different measurement
+wearing the same timestamp. Re-grading a cell that passed under 1.0 therefore
+still fails at 0.80 — pass `--threshold 0.6` if that is the answer you want.
 
 Only the verdict columns are written. Tokens, duration and cost describe a
 process that has already exited, and a re-grade that rewrote them would put a
@@ -539,7 +577,8 @@ Two things it will not do. It does not start an agent, so the work is the work
 that was recorded. And it refuses a grader that cannot reach a verdict rather
 than writing one: `pytest` and `command` execute inside a workspace the run no
 longer has, and a judge with no credentials would turn a missing key into a
-failed task. Re-run the task for the first, and set the key for the second.
+failed task. Re-run the task for the first; for the second, set the key or pick a
+grader that calls nothing — the refusal names which ones.
 
 The same operation is a button on the report page that serves the run — see
 [Grading a cell from the page that serves it](#grading-a-cell-from-the-page-that-serves-it).
@@ -626,7 +665,7 @@ registrations can share while still being two events.
 `aeval serve` lists them and rebuilds each one on demand:
 
 ```sh
-aeval serve --db runs.db --addr 127.0.0.1:8080
+aeval serve --db runs.db --addr 127.0.0.1:18080
 ```
 
 `GET /` lists the recorded reports, `GET /r/<id>` rebuilds one from the database
@@ -666,14 +705,37 @@ The picker in the cell's **graders** tab chooses the criterion:
 | value | what it grades with |
 | --- | --- |
 | `auto` | the graders the dataset declares; the judge when it declares none |
-| `llm_judge` | the judge, with the rubric a web replay attaches (`input: both`, judge the outcome not the prose) |
-| `patch` | the shape of the change only: something changed, and it is not a repository-wide rewrite |
+| `llm_judge` | the judge — the one this server was started with (`--grader-config-file`), so its endpoint, model and credential variable are the declared ones; without a declaration, the rubric a web replay attaches (`input: both`, judge the outcome not the prose) |
+| `patch` | the shape of the change only: something changed, and it is not a repository-wide rewrite. It calls no model, so it needs no credential |
 
 Everything that cannot work on a finished row is refused before anything is
 written: `pytest` and `command` need a workspace the run no longer has, and a
 judge with no credentials would record a harness error as an agent failure. The
-refusal names what is missing — the two variables to set, or the graders that do
-run offline.
+refusal names what is missing — the variable to set, and the graders that call
+nothing and can run right now. A refusal that offers no alternative leaves the
+reader holding a button that cannot work.
+
+The grading itself is **asynchronous**. A press does three things — validate, record
+the request in `grade_jobs`, answer — and returns: 29 ms measured, against 13 to
+24 seconds for the judge call it starts. The work queues behind two workers in
+this process, so the page never has to look like a broken button:
+
+- the row's status becomes `grading…` at once, the banner says `Grading this
+  cell.`, and the page reloads itself every three seconds (the same mechanism the
+  session pages use to follow a replay) until the row holds a verdict;
+- a second press on the same cell does not buy a second judgement: a partial
+  unique index in the database makes sure of it, and the press is redirected to
+  the request that is already running;
+- when it finishes the banner gives the verdict and what reaching it cost: `It
+  cost 147 input and 2132 output tokens on deepseek-flash and took 13.5s.`
+
+Those numbers live in `grade_jobs`, one row per request, and deliberately **not**
+in the attempt's token columns: those are the agent's spend and the report's
+totals are read from them, so folding a judge's tokens in would distort the one
+number readers compare across runs. A failure lands there too — the page says
+`The grade did not finish.` with the reason, and the cell keeps the verdict it
+had. A row left `running` by a killed process is closed as failed the next time
+`aeval serve` starts, or the page would show "grading" forever.
 
 What did not change is the part that mattered: every read is still a rebuild
 from the rows, so a page that was graded comes back saying `This page is not the
@@ -749,6 +811,22 @@ id pattern and forwarded to `--model` as one quoted word. Without a presets file
 the page offers `clean-room` and `host` (Claude Code with this machine's own
 settings), the skill set `none`, and the CLI's default model.
 
+The judge a replay attaches is declared the same way, in the same file shape:
+
+```sh
+aeval serve --replay-config examples/replay-presets.yaml --grader-config-file examples/judge.yaml
+```
+
+That one declaration also decides which judge **the grade button on a report
+page** uses: the endpoint, the model and the credential variable all come from
+it. Without one the server grades with `llm_judge` and its built-in rubric,
+reading `ANTHROPIC_*` -- scorable on the machine that exported those, a refusal
+on any other. The startup banner names the file that was read, and it warns when
+this process has no credential for that judge, instead of leaving you to find
+out by pressing the button. The grader menu also offers `patch`, which reads the
+recorded diff and calls nothing: the way out when there is no key on this machine
+and a verdict is still wanted now.
+
 These pages read every transcript on this machine and launch an agent with
 permission prompts bypassed, so they are guarded more strictly than the reports:
 
@@ -779,12 +857,13 @@ internal/grader/   the five graders and the registry
 internal/trace/    Claude Code stream-json -> a normalized trajectory
 internal/session/  Claude Code transcript -> tasks with baselines
 internal/runner/   scheduling, timeouts, workspace lifecycle, recording
-internal/store/    the SQLite schema, runs and attempts
+internal/store/    the SQLite schema, runs and attempts, grade requests
 internal/attrib/   factor axes, sweep plans, paired comparison, the sign test
 internal/report/   the view model, the loader, the HTML renderer, the report registry
 internal/server/   the HTTP server: recorded reports, this machine's sessions, the replay form
 internal/replay/   replay presets and the job queue behind the replay button
-internal/regrade/  reaching a verdict again from what a finished cell recorded
+internal/regrade/  reaching a verdict again from what a finished cell recorded, and the
+                   requests that record what each attempt cost
 internal/machine/  the machine identity collect stamps and replays check
 internal/llm/      the minimal client used by llm_judge
 tests/             end-to-end tests driving the built binary

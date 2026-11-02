@@ -1043,6 +1043,169 @@ func TestCLICollectsASessionIntoAReplayableDataset(t *testing.T) {
 	}
 }
 
+// The default cutoff is 0.6, and a task may draw its own line.
+//
+// One dataset answers both questions, offline: four exact_match graders of which
+// three expect what the stand-in agent says and one does not, so the composite is
+// 0.75. That number sits below the exact default the tool used to apply (1.0) and
+// above the one it applies now, which is what makes each half of the assertion a
+// statement about the cutoff rather than about the answer.
+func TestCLIDefaultsToSixtyPercentAndLetsATaskOverrideIt(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+
+	dataset := func(name, extra string) string {
+		t.Helper()
+		dir := filepath.Join(work, "ds-"+name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := `name: cutoff-` + name + `
+tasks:
+  - id: answer
+    prompt: say done
+    workspace: {type: empty}
+    output: {type: stdout}
+` + extra + `    graders:
+      - {type: exact_match, config: {expected: done}}
+      - {type: exact_match, config: {expected: done}}
+      - {type: exact_match, config: {expected: done}}
+      - {type: exact_match, config: {expected: nope}}
+`
+		if err := os.WriteFile(filepath.Join(dir, "dataset.yaml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+
+	runNamed := func(name, ds string) payload {
+		t.Helper()
+		report := filepath.Join(work, name+".html")
+		r := runCLI(t, "run",
+			"--dataset", ds, "--bin", filepath.Join(agents, "one-turn.sh"),
+			"--model", "stand-in", "--name", name,
+			"--db", db, "--work-root", filepath.Join(work, "work-"+name),
+			"--report", report,
+		)
+		if r.exitCode != 0 {
+			t.Fatalf("run %s exited %d\nstdout:\n%s\nstderr:\n%s", name, r.exitCode, r.stdout, r.stderr)
+		}
+		return payloadFromHTML(t, report)
+	}
+
+	byDefault := runNamed("default-cutoff", dataset("default", ""))
+	if len(byDefault.Tasks) != 1 {
+		t.Fatalf("the fixture produced %d cells, want one", len(byDefault.Tasks))
+	}
+	cell := byDefault.Tasks[0]
+	if cell.Score != 0.75 {
+		t.Fatalf("score = %v, want the 0.75 three-of-four composite this test is about", cell.Score)
+	}
+	if !cell.Graded || cell.Threshold != 0.6 {
+		t.Errorf("graded %v at threshold %v, want it graded against the 0.6 default",
+			cell.Graded, cell.Threshold)
+	}
+	if !cell.Passed {
+		t.Error("0.75 was failed by a 0.6 threshold; the exact-score default is back")
+	}
+
+	// The task's own line wins, including over a run-wide flag: a benchmark that
+	// imported its cutoff would otherwise be silently re-scored by --threshold.
+	declared := runNamed("task-cutoff", dataset("declared", "    threshold: 1.0\n"))
+	strict := declared.Tasks[0]
+	if strict.Threshold != 1.0 {
+		t.Errorf("threshold = %v, want the task's declared 1.0", strict.Threshold)
+	}
+	if strict.Passed {
+		t.Error("a score of 0.75 passed a task whose own threshold is 1.0")
+	}
+}
+
+// A judge declared in a file has to arrive inside the dataset, otherwise the
+// file is decoration: the reason to write the declaration down is that the
+// endpoint and the *name* of the credential travel with the tasks instead of
+// living in whichever shell started the command.
+func TestCLICollectWritesTheDeclaredJudgeIntoTheDataset(t *testing.T) {
+	work := t.TempDir()
+	out := filepath.Join(work, "collected")
+	session := filepath.Join(repoRoot, "tests", "testdata", "session", "basic.jsonl")
+	declaration := filepath.Join(work, "judge.yaml")
+	if err := os.WriteFile(declaration, []byte(`type: llm_judge
+name: judge
+config:
+  input: both
+  base_url: https://api.deepseek.com/anthropic
+  auth_token_env: DEEPSEEK_API_KEY
+  model: deepseek-chat
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := runCLI(t, "collect", "--session", session, "--out", out, "--grader-config-file", declaration)
+	if r.exitCode != 0 {
+		t.Fatalf("collect exited %d\nstdout:\n%s\nstderr:\n%s", r.exitCode, r.stdout, r.stderr)
+	}
+
+	rawTasks, err := os.ReadFile(filepath.Join(out, "tasks.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var collected struct {
+		Threshold float64 `json:"threshold"`
+		Graders   []struct {
+			Type   string         `json:"type"`
+			Name   string         `json:"name"`
+			Config map[string]any `json:"config"`
+		} `json:"graders"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(rawTasks))), &collected); err != nil {
+		t.Fatalf("the collected task does not decode: %v\n%s", err, rawTasks)
+	}
+	if len(collected.Graders) != 1 {
+		t.Fatalf("task carries %d graders, want the declared judge: %+v", len(collected.Graders), collected.Graders)
+	}
+	g := collected.Graders[0]
+	if g.Type != "llm_judge" || g.Name != "judge" {
+		t.Errorf("grader = %q/%q, want llm_judge/judge", g.Type, g.Name)
+	}
+	// The four keys that decide whether the judge can call anything at all.
+	for k, want := range map[string]any{
+		"base_url":       "https://api.deepseek.com/anthropic",
+		"auth_token_env": "DEEPSEEK_API_KEY",
+		"model":          "deepseek-chat",
+		"input":          "both",
+	} {
+		if got := g.Config[k]; got != want {
+			t.Errorf("grader config[%s] = %v, want %v", k, got, want)
+		}
+	}
+	// The judge's own cutoff travels with the task. Without it the cell would be
+	// graded against the run's default while the judge's card reads a verdict
+	// from a different number, which is the pair of answers this field exists to
+	// make one.
+	if collected.Threshold != 0.67 {
+		t.Errorf("task threshold = %v, want the judge's 0.67 written onto the task", collected.Threshold)
+	}
+
+	// And what it wrote is an ordinary dataset: a declaration only `collect`
+	// could read would make the tasks unloadable the moment it exited.
+	if v := runCLI(t, "validate", "--dataset", out); v.exitCode != 0 {
+		t.Fatalf("the collected dataset does not validate (%d):\n%s\n%s", v.exitCode, v.stdout, v.stderr)
+	}
+
+	// The file declares the type, the name and the config, so naming any of
+	// them beside it has no answer -- whichever won, the other would read as
+	// if it had applied.
+	conflict := runCLI(t, "collect", "--session", session, "--out", filepath.Join(work, "other"),
+		"--grader-config-file", declaration, "--grader", "patch")
+	if conflict.exitCode == 0 {
+		t.Fatal("accepted a file and the flag it replaces at the same time")
+	}
+	if !strings.Contains(conflict.stderr, "--grader-config-file") {
+		t.Errorf("the refusal should name the flag that swallowed the others, got:\n%s", conflict.stderr)
+	}
+}
+
 // TestCLIRefusesToReplayOnAnotherMachine moves a collected dataset to "another
 // machine" by rewriting the identity its baseline carries, which is the only
 // part of a move the harness can observe.
@@ -3070,6 +3233,55 @@ func TestCLIServesTheReportsItRecorded(t *testing.T) {
 	}
 }
 
+// A grade request is a goroutine of the process that accepted it, so a row left
+// queued or running belongs to a process that is gone and can never finish. A
+// page reading that row would say "grading" forever, which is the one thing
+// certainly untrue. Starting the server has to close it.
+//
+// The state is written straight into the file because nothing in the API can
+// produce it: a killed process leaves it, and a test cannot kill one halfway
+// through a grade deterministically.
+func TestCLIServeClosesGradesLeftRunningByAStoppedProcess(t *testing.T) {
+	work := t.TempDir()
+	db := filepath.Join(work, "runs.db")
+	runOneAnswer(t, work, db, "stale")
+
+	conn, err := sql.Open("sqlite", db)
+	if err != nil {
+		t.Fatalf("open %s: %v", db, err)
+	}
+	_, err = conn.Exec(`INSERT INTO grade_jobs
+		(id, report_id, run_id, task_id, sample_index, grader, status, created_at)
+		VALUES ('deadbeefdeadbeef', 'rep', 'run', 'task', 0, 'auto', 'running', '2026-01-01T00:00:00Z')`)
+	if err != nil {
+		t.Fatalf("write a running request: %v", err)
+	}
+	_ = conn.Close()
+
+	base, stop := startServer(t, db)
+	defer stop()
+	if base == "" {
+		t.Fatal("the server did not start")
+	}
+
+	var status, reason string
+	conn, err = sql.Open("sqlite", db)
+	if err != nil {
+		t.Fatalf("reopen %s: %v", db, err)
+	}
+	defer conn.Close()
+	if err := conn.QueryRow(
+		`SELECT status, error FROM grade_jobs WHERE id='deadbeefdeadbeef'`).Scan(&status, &reason); err != nil {
+		t.Fatalf("read the row back: %v", err)
+	}
+	if status != "failed" {
+		t.Errorf("the abandoned request is %q after a restart, want failed", status)
+	}
+	if !strings.Contains(reason, "stopped before reaching a verdict") {
+		t.Errorf("the recorded reason is %q; it should say the server that accepted it stopped", reason)
+	}
+}
+
 // countReports is how many rows the registry holds, read as a client of the
 // file rather than through the code under test.
 func countReports(t *testing.T, db string) int {
@@ -3351,6 +3563,19 @@ func TestCLIServesSessionsOnLoopbackOnly(t *testing.T) {
 	r = runCLI(t, "serve", "--db", db, "--no-sessions", "--replay-config", "x.yaml")
 	if r.exitCode != 2 {
 		t.Errorf("--replay-config with --no-sessions exited %d, want 2", r.exitCode)
+	}
+
+	// A grader declaration is not in that list: a report page grades with it,
+	// and grading never needed the session pages. The file below does not
+	// exist, so the run still fails -- but on reading it, not on a rule that
+	// says the flag is meaningless here.
+	r = runCLI(t, "serve", "--db", db, "--no-sessions", "--grader-config-file", "x.yaml")
+	if strings.Contains(r.stderr, "only mean something with the session pages") {
+		t.Errorf("--grader-config-file was refused as a session-page flag, but reports grade with it too:\n%s",
+			r.stderr)
+	}
+	if r.exitCode != 2 || !strings.Contains(r.stderr, "x.yaml") {
+		t.Errorf("a missing grader file exited %d without naming it: %s", r.exitCode, r.stderr)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/grader"
 	"github.com/skyitachi/agenteval/internal/machine"
 )
 
@@ -340,11 +341,20 @@ func buildItem(s *Session, promptIndex int, opts Options, used map[string]bool) 
 		if name == "" {
 			name = opts.Grader
 		}
-		task.Graders = []dataset.GraderSpec{{
+		spec := dataset.GraderSpec{
 			Type:   opts.Grader,
 			Name:   name,
 			Config: opts.GraderConfig,
-		}}
+		}
+		task.Graders = []dataset.GraderSpec{spec}
+		// A grader that draws its own line declares it, and the task carries
+		// it: otherwise the judge's card reads "pass" at 0.67 while the cell --
+		// graded against the run's default -- calls the same score a failure.
+		// Written here rather than at run time so the number travels with the
+		// dataset, which is the artifact someone else reruns.
+		if cutoff, ok := grader.DeclaredThreshold(spec); ok {
+			task.Threshold = cutoff
+		}
 	}
 
 	return Item{

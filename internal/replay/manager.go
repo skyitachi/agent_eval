@@ -481,7 +481,7 @@ func (m *Manager) execute(ctx context.Context, j *job) error {
 	j.mu.Unlock()
 
 	grader, graderName, graderCfg := m.cfg.Grader, m.cfg.GraderName, m.cfg.GraderConfig
-	if grader == DefaultGrader && !judgeAvailable(graderCfg) {
+	if grader == DefaultGrader && !JudgeAvailable(graderCfg) {
 		// Collecting without a grader leaves the old measurable-but-unscorable
 		// behaviour, which is honest; attaching a judge that cannot authenticate
 		// would mark every task failed and look like the agent's fault.
@@ -701,11 +701,16 @@ func collect(sess *session.Session, grader, graderName string, graderCfg map[str
 	return items, []string{note}, nil
 }
 
-// judgeAvailable reports whether the judge has credentials to call a model.
+// JudgeAvailable reports whether the judge has credentials to call a model.
 //
 // It reads the same environment the grader will, including a per-run override
 // of the variable names, so "attached" and "can authenticate" cannot disagree.
-func judgeAvailable(cfg map[string]any) bool {
+//
+// Exported because the two places that have to agree are in different
+// packages: a replay deciding whether to attach a judge at all, and a server
+// that grades a stored cell and would otherwise discover the same fact by
+// refusing a button press.
+func JudgeAvailable(cfg map[string]any) bool {
 	c := llm.Config{}
 	if v, ok := cfg["api_key_env"].(string); ok {
 		c.APIKeyEnv = v

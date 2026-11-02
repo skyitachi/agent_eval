@@ -233,6 +233,63 @@ func TestTheManagerDefaultsToTheJudge(t *testing.T) {
 	}
 }
 
+// A judge declaration is only worth writing down if the endpoint and the name
+// of its credential reach the tasks a replay collects. The built-in rubric must
+// not win over the one that was supplied, and the declared name is what the
+// report shows -- otherwise a replay is scorable in principle and unreadable in
+// practice.
+func TestAManagerKeepsTheJudgeItWasGivenAndPutsItOnTheTasks(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "runs.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	declared := map[string]any{
+		"input":          "both",
+		"base_url":       "https://api.deepseek.com/anthropic",
+		"auth_token_env": "DEEPSEEK_API_KEY",
+		"model":          "deepseek-chat",
+	}
+	m, err := NewManager(Config{
+		Store: st, Catalog: &session.Catalog{}, WorkRoot: t.TempDir(),
+		Grader: DefaultGrader, GraderName: "judge", GraderConfig: declared,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(m.Close)
+	if got := m.cfg.GraderConfig["base_url"]; got != declared["base_url"] {
+		t.Errorf("manager endpoint = %v, want the declared %v", got, declared["base_url"])
+	}
+
+	cat := &session.Catalog{ClaudeRoot: claudeRoot(t)}
+	entry, err := cat.Find(session.CatalogClaude, sessionID)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	sess, err := cat.Load(entry)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	items, _, err := collect(sess, m.cfg.Grader, m.cfg.GraderName, m.cfg.GraderConfig)
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	if len(items) == 0 {
+		t.Fatal("collect produced no tasks")
+	}
+	g := items[0].Task.Graders[0]
+	if g.Name != "judge" {
+		t.Errorf("task grader name = %q, want the declared judge", g.Name)
+	}
+	for k, want := range declared {
+		if got := g.Config[k]; got != want {
+			t.Errorf("task grader config[%s] = %v, want %v; the dataset has to record how to reach the judge",
+				k, got, want)
+		}
+	}
+}
+
 func TestSubmitRefusesWhatIsNotOnOffer(t *testing.T) {
 	m, st := newManager(t)
 	ctx := context.Background()

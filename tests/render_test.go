@@ -614,17 +614,50 @@ tasks:
 }
 
 // gradeProbe reads the one control on the page that writes: whether the client
-// offered it, and whether the picker behind it lists what the server accepts.
+// offered it, whether the picker behind it lists what the server accepts, and
+// -- the part that used to be missing -- what pressing it actually did.
+//
+// Pressing is observed rather than performed. HTMLFormElement.submit is
+// replaced with a recorder, so the probe can read the form the client built
+// (its action, its fields, and whether it was in the document at the moment)
+// without the page navigating away to a server that a file:// page cannot
+// reach. The recorder is the whole point of this probe: the button was drawn,
+// wired and clickable for a release while pressing it did nothing at all,
+// because the client submitted a form it had built and never attached --
+// Blink cancels that with "Form submission canceled because the form is not
+// connected", which is a console warning no reader opens. Nothing in the
+// artifact, the payload or the exit code could have shown it; only a press
+// could, and this probe is the press.
 const gradeProbe = `<script>
 setTimeout(function () {
-  var out = { rows: 0, buttons: 0, action: false, picker: false, graders: [], notice: '', banner: '' };
+  var out = { rows: 0, buttons: 0, action: false, picker: false, graders: [], notice: '', banner: '',
+              presses: 0, press: null, pickerPress: null, pickerChoice: '' };
+  var presses = [];
+  var proto = window.HTMLFormElement.prototype;
+  proto.submit = function () {
+    var fields = {};
+    Array.prototype.forEach.call(this.elements, function (i) { fields[i.name] = i.value; });
+    presses.push({
+      connected: this.isConnected,
+      action: this.getAttribute('action') || '',
+      method: (this.getAttribute('method') || '').toLowerCase(),
+      fields: fields
+    });
+  };
   out.action = !!document.body.getAttribute('data-grade-url');
   out.rows = document.querySelectorAll('#main tbody tr').length;
   /* Only the table's own buttons count: a control anywhere else on the page
    * would be a second place to press, and this asserts there is one. */
   out.buttons = document.querySelectorAll('#main tbody .btn.grade').length;
+  /* The status the client drew for each row. A grade in flight is the one state
+   * the payload cannot carry -- the row it describes is about to change -- so
+   * the client paints it from the shell, and this is how that is checked. */
+  out.pills = Array.prototype.map.call(document.querySelectorAll('#main tbody .pill'),
+    function (p) { return p.textContent; });
   var heads = document.querySelectorAll('#main thead th');
   out.columns = heads.length;
+  var rowBtn = document.querySelector('#main tbody .btn.grade');
+  if (rowBtn) rowBtn.click();
   var first = document.querySelector('#main tbody tr');
   if (first) first.click();
   var tab = document.querySelector('.drawer-body [data-tab="graders"]');
@@ -634,7 +667,15 @@ setTimeout(function () {
   var sel = document.querySelector('#grader-choice');
   if (sel) {
     out.graders = Array.prototype.map.call(sel.options, function (o) { return o.value; });
+    /* The picker is asked for something other than the default, so the press
+     * below proves the choice travels rather than that a default does. */
+    sel.value = sel.options.length ? sel.options[sel.options.length - 1].value : '';
+    out.pickerChoice = sel.value;
+    run.click();
   }
+  out.presses = presses.length;
+  out.press = presses.length ? presses[0] : null;
+  out.pickerPress = presses.length > 1 ? presses[presses.length - 1] : null;
   var notice = document.querySelector('.recordbar .notice');
   out.notice = notice ? notice.textContent : '';
   var pre = document.createElement('pre');
@@ -644,14 +685,27 @@ setTimeout(function () {
 </script>
 </body>`
 
+// formPress is one intercepted submission.
+type formPress struct {
+	Connected bool              `json:"connected"`
+	Action    string            `json:"action"`
+	Method    string            `json:"method"`
+	Fields    map[string]string `json:"fields"`
+}
+
 type gradeView struct {
-	Rows    int      `json:"rows"`
-	Buttons int      `json:"buttons"`
-	Action  bool     `json:"action"`
-	Picker  bool     `json:"picker"`
-	Graders []string `json:"graders"`
-	Columns int      `json:"columns"`
-	Notice  string   `json:"notice"`
+	Rows         int        `json:"rows"`
+	Buttons      int        `json:"buttons"`
+	Action       bool       `json:"action"`
+	Picker       bool       `json:"picker"`
+	Graders      []string   `json:"graders"`
+	Columns      int        `json:"columns"`
+	Pills        []string   `json:"pills"`
+	Notice       string     `json:"notice"`
+	Presses      int        `json:"presses"`
+	Press        *formPress `json:"press"`
+	PickerPress  *formPress `json:"pickerPress"`
+	PickerChoice string     `json:"pickerChoice"`
 }
 
 // TestReportGradeControlOnlyExistsOnAServedPage is the client half of the
@@ -741,6 +795,100 @@ func TestReportGradeControlOnlyExistsOnAServedPage(t *testing.T) {
 	}
 	if strings.Join(live.Graders, ",") != "auto,llm_judge,patch" {
 		t.Errorf("the picker offers %v, want the values the server accepts", live.Graders)
+	}
+	// The press. A control that is drawn, wired and clickable while pressing it
+	// writes nothing is the failure this block exists for, and it was the shape
+	// of a real bug: the client built the form and submitted it without ever
+	// attaching it, so the browser cancelled the submission and the page did
+	// nothing at all. The two conditions below are the ones a browser checks.
+	if live.Press == nil {
+		t.Fatal("pressing the row's grade button built no form, so the button does not write")
+	}
+	if !live.Press.Connected {
+		t.Error("the form was submitted while it was not in the document; a browser cancels that with a console warning and nothing else")
+	}
+	if live.Press.Method != "post" || live.Press.Action != "/r/abc123/grade" {
+		t.Errorf("the form posts %s %q, want post /r/abc123/grade", live.Press.Method, live.Press.Action)
+	}
+	// The identity of the cell travels with the press; a form that reaches the
+	// right URL carrying no task grades nothing and is refused as such.
+	wantFields := map[string]string{"csrf": "0123456789abcdef", "task": "answer", "sample": "0", "grader": "auto"}
+	for name, want := range wantFields {
+		if got := live.Press.Fields[name]; got != want {
+			t.Errorf("the row's form sends %s=%q, want %q", name, got, want)
+		}
+	}
+
+	// A grade in flight is a fourth status, and it has to be drawn from the
+	// shell rather than from the payload: the payload is the bytes the
+	// registered hash covers, and a row that said "not graded" while a verdict
+	// was on its way would be asserting something that is about to be false.
+	// The page is rendered without the meta refresh it would be served with.
+	// The refresh is what keeps the reader's copy current, and it is exactly
+	// what makes the page unreadable to this probe: the browser reloads every
+	// three seconds, and --dump-dom waits for a load that never settles, so the
+	// probe is killed at the two-minute mark with no payload. The refresh is
+	// checked as markup in the report package instead
+	// (TestAPageCanAskTheBrowserToComeBack); everything else here — the pill,
+	// the banner — is what a served page draws.
+	inFlight := filepath.Join(work, "inflight.html")
+	buf.Reset()
+	err = report.RenderRun(&buf, data, report.RenderOptions{
+		Standalone: true,
+		Grade: &report.GradeAction{
+			URL:     "/r/abc123/grade",
+			Token:   "0123456789abcdef",
+			Graders: []string{"auto", "llm_judge", "patch"},
+			Grading: &report.Grading{TaskID: "answer", Sample: 0},
+		},
+		Notice: &report.Notice{
+			Severity: "info",
+			Head:     "Grading this cell.",
+			Note:     "Task answer is being graded by the graders the dataset declares (running).",
+		},
+	})
+	if err != nil {
+		t.Fatalf("render in-flight page: %v", err)
+	}
+	if err := os.WriteFile(inFlight, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write in-flight page: %v", err)
+	}
+	running := probeGrades(t, inFlight)
+	if len(running.Pills) == 0 {
+		t.Fatal("the in-flight page drew no status pill, so the row's state cannot be read")
+	}
+	if running.Pills[0] != "grading…" {
+		t.Errorf("the row being graded reads %q, want grading…: the reader would take the old verdict for the current one",
+			running.Pills[0])
+	}
+	if !strings.Contains(running.Notice, "Grading this cell.") {
+		t.Errorf("the in-flight banner is %q", running.Notice)
+	}
+	// And the state does not leak: a page with no request in flight draws no
+	// such pill, so the word only ever describes something that is happening.
+	for _, p := range live.Pills {
+		if p == "grading…" {
+			t.Error("the settled page marks a row as grading")
+		}
+	}
+	// And the picker is a second way to press, with its own code path: what the
+	// reader chose has to be what is sent, not the default it started on.
+	if live.PickerPress == nil || live.PickerChoice == "" {
+		t.Fatal("the graders tab's button built no form, so choosing a grader there does nothing")
+	}
+	if !live.PickerPress.Connected {
+		t.Error("the picker's form was submitted while it was not in the document; a browser cancels that silently")
+	}
+	if got := live.PickerPress.Fields["grader"]; got != live.PickerChoice {
+		t.Errorf("the picker sent grader=%q, want the chosen %q", got, live.PickerChoice)
+	}
+	if got := live.PickerPress.Fields["task"]; got != "answer" {
+		t.Errorf("the picker's form sends task=%q, want the cell it was opened on", got)
+	}
+	// The saved page has no control and therefore no press: the recorder must
+	// stay silent, or the guard above would pass on a page that offers nothing.
+	if plain.Presses != 0 {
+		t.Errorf("a saved report built %d form(s); it has no server to post to", plain.Presses)
 	}
 	// The banner is outside the payload, so the client must not have painted
 	// over it: a page that just changed its mind about a cell has to say so.

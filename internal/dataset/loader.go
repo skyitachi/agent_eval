@@ -341,6 +341,7 @@ func (d *Dataset) computeHash() (string, error) {
 		Output     *Output        `json:"output,omitempty"`
 		Graders    []GraderSpec   `json:"graders,omitempty"`
 		Limits     *Limits        `json:"limits,omitempty"`
+		Threshold  float64        `json:"threshold,omitempty"`
 		Baseline   *Baseline      `json:"baseline,omitempty"`
 		Metadata   map[string]any `json:"metadata,omitempty"`
 	}
@@ -356,7 +357,10 @@ func (d *Dataset) computeHash() (string, error) {
 			Tags: t.Tags, Prompt: t.ResolvedPrompt, System: t.SystemPrompt,
 			Workspace: t.Workspace, Output: t.Output, Graders: t.Graders,
 			Limits: t.Limits, Baseline: t.ResolvedBaseline,
-			Metadata: t.Metadata,
+			// The cutoff decides which verdicts a run reaches, so two datasets
+			// that differ only in it are not the same dataset.
+			Threshold: t.Threshold,
+			Metadata:  t.Metadata,
 		}
 		wrapped.Tasks = append(wrapped.Tasks, h)
 	}
@@ -483,6 +487,13 @@ func (d *Dataset) Validate() error {
 		}
 		if t.Limits.TimeoutS < 0 {
 			add(id, "limits.timeout_s", "must be >= 0")
+		}
+		// A threshold above 1 can never be reached by a score in [0,1], and a
+		// negative one would pass everything -- both are typos rather than
+		// policies, and both would read later as "the agent failed" or "the
+		// agent passed" rather than as a broken task.
+		if t.Threshold < 0 || t.Threshold > 1 {
+			add(id, "threshold", "must be in [0,1], got %v (omit it for the run's default)", t.Threshold)
 		}
 		if t.Baseline != nil && strings.TrimSpace(t.Baseline.File) == "" {
 			// A baseline block that points at nothing is worse than none: the

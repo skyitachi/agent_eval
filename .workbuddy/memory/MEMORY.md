@@ -1,177 +1,126 @@
 # agenteval — 项目长期记忆
 
-Go 的 agent 评测框架。`/Users/skyitachi/lab/agent_eval`，module `github.com/skyitachi/agenteval`，Go 1.25.1。
-链路：数据集 → 可插拔 grader → SQLite → 自包含 HTML 报告。只有 Claude Code 一种 agent（`mock` 是测试替身）
-，model 自由指定（透传 CLI）。**八条子命令**（`cmd/aeval/main.go`）：`collect`/`validate`/`run`/`matrix`/
-`report`/`serve`/`list`/`version`。回答「做得怎么样 / 差异归因给谁 / 真实会话花了多少」，**拒绝**回答
-「这个 agent 好不好」。
+Go 的 agent 评测框架。module `github.com/skyitachi/agenteval`，Go 1.25.1。
+链路：数据集 → 可插拔 grader → SQLite → 自包含 HTML 报告。只有 Claude Code 一种 agent（`mock` 是测试
+替身），model 透传 CLI。八条子命令：`collect`/`validate`/`run`/`matrix`/`report`/`serve`/`list`/`version`。
+回答「做得怎么样 / 差异归因给谁 / 真实会话花了多少」，**拒绝**回答「这个 agent 好不好」。
 
-## 会话来源（collect 识别的 session）
+**本文件只留「不带着上下文就会踩坑」的规则，全部解释性细节在 `notes/`：**
+`collect.md`（来源/挑选/切片/chain/workspace-cwd）· `reporting.md`（chip、app.js 客户端、Chrome 护栏）·
+`testing.md`（套件、pytest 解释器、变异验证方法论）· `trace-and-schema.md`（token 记账、schema 版本表、
+数据集格式）· `environment-freezing.md`（真实仓库评测，未落码）· `memory-archive-2026-11-02.md`
+（本文件 2026-11-02 之前的完整长文，被压缩前原样存档，找不到细节先翻它）。
 
-- **三条来源**：Claude Code（`~/.claude/projects` JSONL，源码 `claude.go`）、Cursor（`cursor.db`
-  SQLite，`cursor.go`）、**WorkBuddy**（`~/.workbuddy/traces/<pid>/trace_*.jsonl` 的 OTel JSONL，
-  `workbuddy.go`）。Catalog 常量 `CatalogClaude`/`CatalogCursor`/`CatalogWorkBuddy`；CLI `--source`
-  取值 `claude`/`cursor`/`workbuddy`（互斥，与 `--root`/`--cursor-db`/`--workbuddy-root` 各自冲突）。
-- **WorkBuddy trace 是遥测、非权威记录**，解析时已知三处损失，已写进 `Session.BaselineNotes`：① 无工作目录
-  （`Cwd` 空，traces 不记录 cwd）；② payload 可能截断（`toolInput`/`toolOutput` 带
-  `tracePayloadTruncated` 标记）；③ token 只给会话总量（`trace_end.modelInfo.totalTokens`），无逐调用数。
-  对话内容在 span 里：`generation` span 的 `toolOutput` = `[{chat.completion: choices[0].message.content}]`
-  （assistant 轮），`function` span 的 `toolName`/`toolInput`/`toolOutput` = 工具调用（挂到上一个
-  assistant 轮）。`span_end` 才带完整 payload，`span_start` 的为空。
-- `agentName()`/`sourceLabel()`/`server sourceLabel` 三处都加了 `"workbuddy"` 分支（返回
-  `"workbuddy"` / `"WorkBuddy"`）。`--source` 校验报错文案含 workbuddy，e2e 与 `cmd/aeval` 测试已同步。
-- 真实目录 `aeval collect --source workbuddy --list` 实测列出 **68 条** trace（含仍在跑、无 modelInfo 的，
-  显示 `model=-`、`title=<id>`，属预期）。
-- **重放：没有 `aeval replay` 子命令**。重放只经 `aeval serve` 网页按钮（`replay.Manager.Submit` →
-  `execute`：collect→run→report）。引擎本身**来源无关**（`Catalog.Find`/`Catalog.Load`），所以 WorkBuddy
-  会话也能重放。**命令行等价做法是两步**：`collect --source workbuddy --session <id> --split turn --out DIR`
-  再 `run --dataset DIR`。三条 WorkBuddy 重放限制：① **很多 trace 没有开头 prompt**（`env.Prompt` 空且
-  generation 的 toolInput 里没可用 user 消息）→ collect 直接 `skipped ... with no human prompt`，无法重放
-  （实测 72 条里 `13feb0c1`/`140dea50` 被跳、`5965283c` 可出 1 个任务）；② **无 cwd** → 重放在空 workspace
-  里跑，要文件得用 `--workspace-repo`/`--assets`；③ **解析只取开头一条 prompt** → 即便 `--split turn` 也只
-  产 1 个任务（不是整段多轮）。
+## 会话来源 / 归因（结论级）
 
-**细节在 `notes/`，本文件只留「不带着上下文就会踩坑」的规则。**
-`collect.md`（来源/挑选/切片/`--chain-sessions`/`--workspace-cwd`）·
-`reporting.md`（模型与 skills 两种 chip、app.js 客户端、Chrome 渲染护栏）·
-`testing.md`（套件、pytest 解释器、沙箱与变异验证方法论、gitignore）·
-`trace-and-schema.md`（token 记账、schema 版本表、数据集格式、patch 从磁盘反算）·
-`environment-freezing.md`（真实仓库评测设计，未落码）。
-
-## 三轴归因（OFAT）
-
-- harness = 实现+配置；`model` 一轴；`skill` 一轴。一次 sweep 只动一条轴，**加载期强制**：level 改了本轴
-  不拥有的键 → 拒绝（不是警告）。轴的所有权靠**反射读 `agent.Spec` 的 yaml tag** 推导
-  （`internal/attrib/plan.go` 的 `specKeys`/`Axis.Owned()`）——写死会漏字段，用 `yaml.Marshal(零值)` 会因
-  `omitempty` 退化成空集（踩过）。
-- 每条 level 必须记录**改了哪些键**（`attrib.Meta.Changed` → run 的 `config_json`）：缺了它，读者分不清
-  「这个 level 没改东西」和「差异没被记录」。
-- 分离度用**精确符号检验**（log 空间求和，`0.5^n` 在 n=1074 处下溢）；**非平局配对 < 6 对时无论多偏都到
-  不了 p<0.05**（写进每份报告的 caveat）。方向由 **win/loss 分裂**定，不由均值。
+- 三条来源：Claude Code（`~/.claude/projects` JSONL）、Cursor（`cursor.db`）、WorkBuddy
+  （`~/.workbuddy/traces/*/trace_*.jsonl` OTel）。WorkBuddy trace 是**遥测非权威记录**：无 cwd、payload 可能
+  截断、token 只有会话总量 —— 三处损失写进 `Session.BaselineNotes`；很多 trace 无开头 prompt 会直接被
+  collect 跳过；解析只取开头一条 prompt，`--split turn` 也只产 1 个任务。
+- **没有 `aeval replay` 子命令**。重放只经 `serve` 网页按钮，或两步 CLI：`collect --session ... --out DIR`
+  再 `run --dataset DIR`。
+- 三轴归因 OFAT：轴所有权靠**反射读 `agent.Spec` 的 yaml tag** 推导（写死会漏、`omitempty` 会退化成空集）；
+  每条 level 必须记录 `attrib.Meta.Changed`；分离度用精确符号检验（log 空间），非平局配对 < 6 对到不了
+  p<0.05；方向看 win/loss 分裂不看均值。
 
 ## 设计约定（改代码前先读）
 
-1. **报告是「数据库的函数」**：渲染层只读持久化状态（`report/model.go`+`load.go` 把行投影成视图模型，
-   **借用** `runner.Summary`/`attrib.Attribution` 而不镜像）。e2e 断言运行期报告与从 db 重生**逐字节相
-   同**（比对时省掉 `generated`）。
-2. **XSS 靠编码器不变量**：`render.go` 的 `neutralize()` 把 payload 的 `<` `>` `&` 重写成 `\u003c`/
-   `\u003e`/`\u0026`（JSON 字符串外不含这三个字符，重写不改结构），一次封死三种逃逸。客户端默认
-   `esc()`，只有 `raw()` 例外。
-3. `html/template` 上下文敏感：注入 `<style>` 用 `template.CSS`、`<script>` 用 `template.JS`；用
-   `template.HTML` 会被当文本**重新转义**（踩过）。
-4. **`hidden` 必须由样式表显式兑现**：UA 的 `display:none` 被任何作者 `display` 覆盖
-   （`.drawer{display:flex}` 直接作废它），空抽屉不报错、只是**不透明盖住右边 1000px**，看起来像「布局
-   坏了」。加 hidden 元素必须同步加 `.cls[hidden]{display:none}`；`TestHiddenElementsCanActuallyBeHidden`
+1. **报告是数据库的函数**：渲染层只读持久化状态；e2e 断言运行期报告与从 db 重生逐字节相同（省 `generated`）。
+2. **XSS 靠编码器不变量**：`render.go` 的 `neutralize()` 把 `<` `>` `&` 重写成 `\u003c` 等，一次封死三种
+   逃逸；客户端默认 `esc()`，只有 `raw()` 例外。
+3. `html/template` 上下文敏感：`<style>` 用 `template.CSS`、`<script>` 用 `template.JS`；`template.HTML`
+   会被重新转义。
+4. **`hidden` 必须由样式表显式兑现**：任何作者 `display` 都会作废 UA 的 `display:none`（`.drawer{display:flex}`
+   就盖住了右边 1000px）。加 hidden 元素必须同步 `.cls[hidden]{display:none}`，`TestHiddenElementsCanActuallyBeHidden`
    守它。
-5. `MaxInlineBytes`（默认 8 MiB）超了按优先级丢 detail（失败/出错留最久，skip 最先丢），降级记入
-   `Warnings`。轨迹截断留**头尾 + gap marker**。
-6. 退出码 `0/1/2/130`；**有任务失败 ≠ 命令失败**（否则 CI 没法用）。
-7. 数据集/matrix 文档**就地解码**，未知键是**错误**（拼错的 `plugin_dirs` 会产出「skill 没用」的 sweep）。
-   时长必须带单位。
-8. 路径相对**声明它的文档所在目录**解析；经 CLI 传的（`--bin`/`--work-root`/`--session`/`--file`）相对
-   **调用者 cwd**。
-9. 「裸命令名 vs 路径」：值里没有 `/` → 当 PATH 上的命令原样保留，否则绝对化。唯一实现在
-   `agent.ResolvePath`。
-10. **测量值不重试**：timeout/非零退出/error result 都是**数据**。`retries` 只管进程起不来，默认 0。
-11. agent 默认 **clean room**（无 user hooks / auto-memory / 任务外 MCP / CLAUDE.md）。**这是两条 flag 的
-    默认值**：`--bare` 与 `--disable-slash-commands` **都默认 true**。把它们改成 false 会同时打破
-    `TestCLIReadsTheSkillFlags` 与 `TestASlashCommandPromptThatCannotResolveIsNotScoredAsARun`（后者靠
-    「skills 没加载」才会打出那个 slash-command 警告）——**本轮踩过，是无关的顺手改动**。
-12. **位置参数可写在 flag 之后**：Go 的 `flag` 遇第一个非 flag 就停，`report --compare a b -o x` 会把
-    `-o x` 当位置参数并报「got 4」；`positionals()` 从那个词起重新解析。**但重新解析必须在 `openStore`
-    之前做**：曾经 `cmdReport` 先 `openStore(&common)`、到 `--compare` 分支里才 `positionals()`，于是
-    `report --compare a b --db X` 的 `--db X` **来得太晚** —— store 已经开在默认路径上，两个 run 都被报成
-    「not found in **aeval.db**」（错误信息点名的文件正是线索）。`--db` 写在 `--compare` 前面的形状一直是好
-    的，而**本文件里所有既有 e2e 都是那个形状**，所以没人发现。现在 `trailing, code := positionals(fs,
-    stderr)` 在 `openStore` 之前调一次，分支复用结果。护栏
+5. `MaxInlineBytes`（默认 8 MiB）超了按优先级丢 detail，记入 `Warnings`；轨迹截断留头尾 + gap marker。
+6. 退出码 `0/1/2/130`；**有任务失败 ≠ 命令失败**。
+7. 数据集/matrix 文档就地解码，**未知键是错误**（拼错的 `plugin_dirs` 会产出「skill 没用」的 sweep）；时长
+   必须带单位。
+8. 路径相对**声明它的文档所在目录**；CLI 传的相对调用者 cwd。裸命令名 vs 路径见 `agent.ResolvePath`。
+9. **测量值不重试**：timeout/非零/error 都是数据，`retries` 只管进程起不来。
+10. agent 默认 clean room：**`--bare` 与 `--disable-slash-commands` 都默认 true**。改成 false 会同时打破
+    `TestCLIReadsTheSkillFlags` 与 `TestASlashCommandPromptThatCannotResolveIsNotScoredAsARun`。
+11. **位置参数可写在 flag 之后**，但 `positionals()` 必须在 `openStore` **之前**调一次（否则
+    `report --compare a b --db X` 的 `--db` 来得太晚，store 开在默认路径）。护栏
     `TestCLIComparesTwoRunsHoweverTheFlagsAreOrdered`。
-13. **工具打印的命令必须能跑**：`Next:` 提示漏 `--db` 就会给出必然失败的命令；`printSummary` 只在 `--db`
-    非默认时补它、**按用户输入原样回显**，`hintArg` 给带空格的值加引号。**找不到记录必须点名文件**：
-    `store.NotFoundError{Kind,ID,Path}` 保持 `errors.Is(err, ErrNotFound)` 同时打印 `store: run X not
-    found in aeval.db`（「not found」像工具坏了，「not found in aeval.db」才指向 `--db` 给错）。
-14. **schema 版本：往后拒绝、往前升级**。更高 = 拒绝（列含义不明）；更低 = **就地升级**（另一条路是扔掉付
-    过钱的 run），发生在**任何一次 open**（含 `report`/`serve`）。`migrations[i]` = v(i+1)→v(i+2)，只追加；
-    每步**必须能重跑**（`ADD COLUMN` 不幂等，在 DDL 与版本号之间被杀掉会报 "duplicate column name"）。
-    **v6 只加表**：`reports` 由 `schema.sql` 的 `CREATE TABLE IF NOT EXISTS` 建立，`upgradeV5ToV6` **故意
-    为空**（在此重复 DDL 就会成为第二份定义并漂移），但仍必须存在，否则 upgrade 链会报 "no path from
-    it"。版本→列的速查表见 `notes/trace-and-schema.md`；**低版本夹具要把所有更高版本加的列一起删**，只删
-    一列得到的是「再降一版」而不是那个版本。
+12. **工具打印的命令必须能跑**：`Next:` 提示漏 `--db` 就是必然失败的命令；找不到记录必须点名文件
+    （`store.NotFoundError`，`«not found in aeval.db»` 才指向 `--db` 给错）。
+13. **schema：往后拒绝、往前升级**。升级发生在任何一次 open（含 `report`/`serve`）；`migrations[i]` 只追加、
+    每步必须能重跑；`upgradeV5ToV6` **故意为空**（DDL 只在 `schema.sql`），但仍必须存在否则链断。低版本夹具
+    要把所有更高版本加的列一起删。
+14. **verdict 可能事后才可达 → `aeval grade`（`internal/regrade`）**：只写 verdict 列（tokens/耗时是已退出
+    进程的测量值，改它就是造假）。`grader.Sandboxed{RequiresSandbox()}` 让「要活工作区」由 grader 自己声明，
+    离线重判**按名字拒绝**；新增这类 grader 必须实现它。重判成功要摘掉 runner 留下的 `; grade: ...` 段。
+15. **阈值三层：默认 0.6 → task 声明 → `--threshold`（task 压过命令行；CLI 的 `--threshold` 压过默认）**。
+    `grader.Threshold` 与 `runner.DefaultThreshold` 必须同时改（前者是重判无记录时的兜底，后者是 run 的默认）。
+    task 级 `threshold` 进 `hashTask`（不同线 = 不同数据集），越界（<0 或 >1）是校验错误，0 = 未声明。
+    重判**沿用行上记录的阈值**而不是今天的默认：行是「这份 verdict 按什么线量的」的记录，`--threshold` 才改线。
+16. **一个 cell 两个阈值**：judge 卡片比的是它自己 config 的 cutoff（`judgeThreshold`=0.67），cell 比的是 run/task
+    的线，两者可以同时一 green 一 red。`grader.SelfThresholded{OwnThreshold(config)}` + `DeclaredThreshold(spec)`
+    是唯一来源：`collect` 把它写进 task.threshold，`verdictNotice` 用行里 `details.threshold` 把两个数字一起说出来
+    （**只陈述 cutoff 与 verdict，不写「score≥cutoff 所以 pass」**——模型断言 `passed` 时会越过自己的算术，下限是
+    cutoff 的一半；`details.model_passed` 记录那次断言）。
 
-15. **`tests/render_test.go` 用 Chrome `--dump-dom` 验报告渲染**：启动 Chrome 必须带 `--no-sandbox`
-    `--disable-dev-shm-usage`（外加既有的 `--headless --disable-gpu`），否则在本机沙箱里 Chrome 自带的
-    sandbox 起不来会 `trace/BPT trap` 崩（`Failed to initialize sandbox` / `GPU process isn't usable`）。
-    找不到浏览器时这些测试**跳过**而非失败（`findBrowser` 返回 ""），`AGENTEVAL_CHROME` 可覆盖路径。
+## 报告登记 + HTTP 服务
 
-16. **verdict 可能事后才可达 → `aeval grade`（`internal/regrade`）**：用 row 里已存的 diff/answer/
-    trace 重跑 grader，**只写 verdict 那几列**（`store.UpdateGrade`；tokens/耗时/花费是已退出进程的测量
-    值，重判改它就是造假）。`grader.Sandboxed{RequiresSandbox()}` 让「需要活工作区」这件事由 grader 自己
-    声明（pytest/command），离线重判**按名字拒绝**而不是对着 nil sandbox 跑出被读成 agent 失败的
-    verdict；新增这类 grader 必须实现它。`grader.Context.DiffOverride` 就是为这条路准备的（2016 行注释里
-    早写着，之前一直无调用方）。重判成功后要摘掉 runner 留下的 `; grade: ...` 段，否则一行同时写着
-    passed 和 grade 报错。
+- 登记行**只存无法重新推导的东西**：`kind`/`title`/`subject`/`params_json`/`options_json`/`created_at` +
+  `payload_hash`（= `sha256(DataJSON(payload))`）/`payload_bytes`/`data_version`。不存渲染好的 HTML，访问时
+  按需重渲染并比对哈希 → 横幅声明。**哈希覆盖的字节 == `/r/{id}.json` 返回的字节**（`X-Aeval-Hash*`）。
+- **append-only（log 而非 state）**：同一视图渲染两次写两行；id = 8 字节随机 hex（不是序号、不是内容寻址）。
+  **只有 `report` 命令登记**，`run`/`matrix` 顺手写的报告不登记。
+- `options` 存**已 resolve** 的值（`Options.Resolve()`，`GeneratedAt` 是文档的一部分）；`ParseOptions` 对坏
+  JSON 或零 `GeneratedAt` 一律拒绝。
+- 横幅在 shell 里、**不在 payload 里**（client 每次 render 清空重绘 `<main>`）。失败页是页面而非纯状态码，
+  `error.html` **不带 app.js**；两个 view 都嵌 `Head shellHead`。
+- `recordFor` 分支顺序 **Match 优先**：Match → info；否则 DataVersion 不同 → warn 旧格式；否则 warn
+  "not the recorded document"（**不选因**）。
+- `serve`：先 `net.Listen` 再打印；非 loopback 打警告；SIGINT 优雅停机返 0；登记失败 = `fail`。
+- **静态资源 `Cache-Control: no-cache`（不是 max-age）**：页面是 `no-store`，资源若能免问缓存就会让「新页面
+  + 旧客户端」共存 —— 修好的 grade 按钮因此看起来没生效 5 分钟。ETag 仍在，重验只是 304。守它的是
+  `TestTheAssetsAreServedOnceAndRevalidated`。
+- **一个写路径 `POST /r/{id}/grade`**（撤销只读承诺）：从该行已存 diff/answer 重判一个 cell。无认证/无登录；
+  写路由三条守卫（Host 可答 / Origin 是本服务 / per-process form token），读路由不设防。
+- **判分是异步的：判定留在 attempt，请求落 `grade_jobs`**。`Check`（= `planFor`）同步拒判，`Start` 落请求，
+  worker（2 个）跑，303 立刻返回（23.8 s → 29 ms）。「一个 cell 只一个活请求」靠部分唯一索引
+  `WHERE status IN ('queued','running')` 兜住，应用层检查只是礼貌的一半。进程死掉的 running 行由下次
+  `serve` 启动 `AbandonGradeJobs` 收成 failed（停机写库要 `context.WithoutCancel`）。进行中页面靠
+  **`<meta http-equiv="refresh" content="3">`**（无脚本、无状态）+ 行上 `grading…` pill（由 `data-grade-task`
+  壳层属性喂给 app.js，**不进 payload**：payload 是被哈希覆盖的字节）。
 
-## 报告登记 + HTTP 服务（`report` 写、`serve` 读）
+## 客户端（`internal/report/assets/app.js`）—— 交互 bug 的教训
 
-`report` 每次渲染都往 `reports` 表写一行。前提仍是约定 1：报告是 db 的函数，所以登记行**只存无法重新推
-导的东西**，不存第二份答案。
-
-- **存「视图描述 + 载荷哈希」，不存渲染好的 HTML**（用户拍板）：`kind`/`title`/`subject`/`params_json`/
-  `options_json`/`created_at` + `payload_hash`（= `sha256(DataJSON(payload))`）/`payload_bytes`/
-  `data_version`。访问 `/r/{id}` 时**按需重渲染**，重算哈希与登记值比 → 横幅声明。
-- **哈希覆盖的字节 == `/r/{id}.json` 返回的字节**（关键不变量）：`X-Aeval-Hash` / `X-Aeval-Hash-Matches`
-  让脚本不经解析页面就能核对这个主张。改渲染就不能偷偷改哈希的输入。
-- **append-only（log 而非 state）**：同一视图渲染两次写两行、两个哈希并列才是漂移的证据。id = 8 字节随机
-  hex（16 字符）——不用序号（会被读成版本号），不用内容寻址（内容恰恰是两次登记会共享的东西）。
-- **`options` 必须存「已 resolve」的值**：`Options.Resolve()`（原 `withDefaults`）导出，因为 `GeneratedAt`
-  是文档的一部分（重放要用录制时刻而非当前时刻）。`ParseOptions` 对坏 JSON 或零 `GeneratedAt` **一律拒
-  绝**，不猜。
-- **只有 `report` 命令登记**（用户拍板）：`run`/`matrix` 顺手写出的报告不登记。
-- **横幅在 shell 里、不在 payload 里**：`Record` 放 `RenderOptions`/`pageView`，渲染在 `<main>` **之外**
-  （client 每次 render 会清空并重绘 `<main>`）。
-- **失败页是页面而非纯状态码**：`RenderError` + `error.html`，**不带 app.js**（否则 client 会把「还没记录
-  任何报告」画在失败原因之上）。共享 `shell-head` 模板靠 `shellHead` 结构承接，两个 view 都嵌
-  `Head shellHead`。
-- 路由（`net/http` 方法限定 + `r.PathValue`）：`GET /{$}`、`GET /r/{id}`、`GET /static/app.css`、
-  `GET /static/app.js`、`GET /` 兜底。`.json` 后缀**就地剥离**（mux 只匹配整段）；`Derive` 失败区分
-  `ErrNotFound` → `gone` 页（标题 **"The subject of this report is gone."**，含 subject 与登记时间）。
-- `recordFor` 的**分支顺序是 Match 优先**：Match → info；否则 `DataVersion` 不同 → warn "Recorded in an
-  older payload format."；否则 warn "This page is not the recorded document."（且**不选因**——行动了和投影
-  代码变了服务端分不出）。
-- `serve`：`--addr`（默认 `127.0.0.1:8080`）/`--limit`（默认 200）/`--title`/`--db`。**先 `net.Listen` 再打
-  印**（绑不上就 exit 1 且不打印 "serving"）；非 loopback 打警告；SIGINT → `srv.Shutdown` 优雅停机后返回
-  0。登记失败 = `fail`（记账失败就是失败，不像渲染那样可以降级）。
-- **变异验证 9/9 确认变红**：`Fingerprint` 换输入；`store.SaveReport` 被跳过（`TestARegistrationRebuildsTo
-  ItsOwnHash` + CLI e2e 两条各自抓到）；`recordFor` 把 Match 条件加上 `DataVersion` 相等（顺序变异）；
-  横幅挪成 `Record: nil`；`SaveReport` 不再要求 kind；`ListReports` 改 `ASC`；`upgradeV5ToV6` 从 migrations
-  摘掉；`.json` 后缀不剥离。
-  **两条方法论坑（本轮都踩了）**：① 我第一版「跳过 SaveReport」的变异写成
-  `if err := st.SaveReport(...); err != nil && false` —— **init 语句照样执行**，是语义 no-op，两次
-  MISSED 全是变异写错、不是测试弱；② 变异脚本必须区分 **CAUGHT / MISSED / BROKEN(编译不过) / NOCHANGE
-  (perl 没匹配上) / NOTRUN(测试名不存在)**，只看退出码会把编译错算成抓到。
+- **`form.submit()` 要求表单在文档里**：分离的表单被 Blink 取消，只留一条 console warning
+  （`Form submission canceled because the form is not connected`），页面毫无反应 —— 看起来就像按钮坏了。
+  `submitGrade()` 因此先 `appendChild` 再提交。**这是 2026-11-02 修的真实 bug**。
+- 渲染类 bug 在 artifact 里看不见（文件、payload、退出码全对）：`tests/render_test.go` 用 Chrome
+  `--dump-dom` + 注入探针，**探针必须真的「按下去」**（拦截 `HTMLFormElement.prototype.submit` 记录
+  `isConnected`/action/字段），只断言「按钮画出来了」就会漏掉这类。Chrome 启动必须带 `--no-sandbox
+  --disable-dev-shm-usage`，找不到浏览器跳过不失败（`AGENTEVAL_CHROME` 可覆盖）。
+- **`--dump-dom` 只能读会 settle 的页面**：探针页若带 `MetaRefresh`（如 grade 进行中页面），Chrome 每 3 秒
+  重载、加载永不完成，2 分钟 context 到点直接 SIGKILL（报 `signal: killed`，极像 OOM，**别误判**）。
+  自我刷新页在浏览器测试里只能「不测」或「测 markup」（`TestAPageCanAskTheBrowserToComeBack`）。
 
 ## 已知缺口（勿当已完成）
 
-- **容器后端整体不可达**：`internal/sandbox/docker.go` **无调用方、无测试**；runner 里 `Backend` 写死
-  local，CLI/数据集都无字段。保留是刻意的，注释已指向二选一：接上并补 e2e，或删掉。
-  `DockerConfig.Network` **没有默认值** → 空值 = 不传 = docker 默认（联网）。
-- **`sandbox.Baseline.RestorePaths` 写了但没人用**：正是「判分前还原测试文件」的原语，**比「没有」更危
-  险**（看起来做完了）。要完成是接线，不是重新实现。
-- `llm_judge` 不在 e2e 覆盖内（e2e 必须离线）。
-- **报告服务**：~~只读~~ → 现在有**一个**写路径 `POST /r/{id}/grade`（用户拍板撤销只读承诺）：从这一行
-  已存的 diff/answer 重判一个 cell。仍然**无认证、无登录、无按用户视图**；写路由沿用 session 页那三条
-  守卫（Host 可答 / Origin 是本服务 / 启动时生成的 form token），读路由不设防。默认绑 loopback，被要求
-  监听别处只打警告 —— 能连上端口就能读到所有登记报告，**并且能给任何 run 报告的 cell 重判**（要花钱）。
-- **cursor 把「文件引用块」塞进 user bubble 的正文**：`--split turn` 于是把机器注入的上下文当成「prompt」
-  的一部分。**已报给用户、未修**——修法是识别并剥离注入块，但规则写错会删掉真人写的内容，不该顺手做。
-- **链式只覆盖 `run`，`matrix` 还没有这条路**：sweep 出来的每个 level 仍按普通方式规划。要做的话是接线同
-  一套 `plan`。
-- `Attempt.CommandLine` **仍无消费方**（未变）。~~`Baseline.Notes`（v3）~~ 与 ~~`agent_spec_json`（v4）~~
-  两条盲区**已关**。
+- **容器后端整体不可达**：`internal/sandbox/docker.go` 无调用方无测试；runner 里 `Backend` 写死 local。
+  `DockerConfig.Network` 无默认值（空 = 联网）。
+- **`sandbox.Baseline.RestorePaths` 写了没人用**：正是「判分前还原测试文件」的原语，**比没有更危险**。要接线。
+- `llm_judge` 不在 e2e 覆盖内（e2e 必须离线）。**grade 与 replay 的 judge 声明必须是同一个**：
+  `serve --grader-config-file` 现在同时决定页面 grade 用哪个 judge（`server.Options.Judge`）；以前只有
+  replay 拿到它，页面永远打 api.anthropic.com → 无 `ANTHROPIC_*` 就 409。无凭证的拒绝文案会点名
+  **不调模型的替代**（`grader.Modelled` / `NeedsModel` / `freeGraders`），serve 启动横幅也会先警告。
+  **reasoning 模型的思考与回答共用 `max_tokens`**：默认 2048
+  在 `deepseek-flash` 上会得到「只有 thinking、无 text」的空回复（实测 thinking 6.5k–25k 字符随机），
+  `examples/judge.yaml` 因此用 `max_tokens: 16384`；空文本 + `stop_reason=max_tokens` 现在有一句点明预算的报错。
+  该端点的模型只有 `deepseek-flash` / `deepseek-v4-pro`（`deepseek-chat` 是别名，`/models` 不列）。
+- 报告服务：能连上端口就能读所有登记报告并给任何 run 报告的 cell 重判（要花钱）。
+- cursor 把「文件引用块」塞进 user bubble 正文，`--split turn` 会把它当 prompt（**已报用户、未修**）。
+- 链式只覆盖 `run`，`matrix` 还没有这条路。`Attempt.CommandLine` 仍无消费方。
 
 ## 真实仓库评测
 
-设计文档 `docs/real-repo-eval.md`（**细节以它为准**）+ `notes/environment-freezing.md`。结论：链路通了，
-判分语义浅。P0：① pytest 无用例级期望（缺 FAIL_TO_PASS/PASS_TO_PASS 清单 + JUnit XML 逐用例解析）；
-② `restore_paths` 只做了一半；③ 无 `oracle` 字段/任务自检 → `resolve_rate` 不可解释。已做对：
-`workspace.git` 默认**剥离上游 `.git` 再重建 baseline**。最大风险不是跑不起来，而是**答案泄漏**（prompt 带
-issue/PR 号）、**作弊空间**（改测试/conftest）、**flaky 测试被当成 agent 失败**。
+设计以 `docs/real-repo-eval.md` 为准。链路通了，判分语义浅。P0：pytest 无用例级期望（缺
+FAIL_TO_PASS/PASS_TO_PASS + JUnit 逐用例解析）、`restore_paths` 只做一半、无 `oracle` 字段 → `resolve_rate`
+不可解释。已做对：`workspace.git` 默认剥离上游 `.git` 再重建 baseline。最大风险是**答案泄漏**（prompt 带
+issue/PR 号）、**作弊空间**（改测试/conftest）、**flaky 测试当成 agent 失败**。

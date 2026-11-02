@@ -93,49 +93,49 @@ type WorkBuddyTrace struct {
 
 // wbModelInfo is the model summary a trace carries on its envelope.
 type wbModelInfo struct {
-	Models           []string `json:"models"`
-	TotalInputTokens int      `json:"totalInputTokens"`
-	TotalOutputTokens int     `json:"totalOutputTokens"`
+	Models            []string `json:"models"`
+	TotalInputTokens  int      `json:"totalInputTokens"`
+	TotalOutputTokens int      `json:"totalOutputTokens"`
 	TotalCachedTokens int      `json:"totalCachedTokens"`
-	CallCount        int      `json:"callCount"`
+	CallCount         int      `json:"callCount"`
 }
 
 // wbTrace is the envelope shared by trace_start / trace_update / trace_end.
 type wbTrace struct {
-	TraceID    string         `json:"traceId"`
-	Name       string         `json:"name"`
-	SessionID  string         `json:"sessionId"`
-	AgentName  string         `json:"agentName"`
-	Prompt     string         `json:"prompt"`
-	StartedAt  string         `json:"startedAt"`
-	EndedAt    string         `json:"endedAt"`
-	DurationMs int64          `json:"duration"`
-	Status     string         `json:"status"`
-	SpanCount  int            `json:"spanCount"`
-	TotalTokens int64         `json:"totalTokens"`
-	ModelInfo  *wbModelInfo   `json:"modelInfo"`
-	Metadata   map[string]any `json:"metadata"`
+	TraceID     string         `json:"traceId"`
+	Name        string         `json:"name"`
+	SessionID   string         `json:"sessionId"`
+	AgentName   string         `json:"agentName"`
+	Prompt      string         `json:"prompt"`
+	StartedAt   string         `json:"startedAt"`
+	EndedAt     string         `json:"endedAt"`
+	DurationMs  int64          `json:"duration"`
+	Status      string         `json:"status"`
+	SpanCount   int            `json:"spanCount"`
+	TotalTokens int64          `json:"totalTokens"`
+	ModelInfo   *wbModelInfo   `json:"modelInfo"`
+	Metadata    map[string]any `json:"metadata"`
 }
 
 // wbSpan is one completed span. The parse reads `span_end` only: it carries the
 // full span, including the `toolInput` / `toolOutput` the matching `span_start`
 // left empty.
 type wbSpan struct {
-	TraceID   string         `json:"traceId"`
-	SpanID    string         `json:"spanId"`
-	ParentID  string         `json:"parentId"`
-	Name      string         `json:"name"`
-	Type      string         `json:"type"`
-	StartedAt string         `json:"startedAt"`
-	EndedAt   string         `json:"endedAt"`
-	DurationMs int64         `json:"duration"`
-	Status    string         `json:"status"`
-	Error     any            `json:"error"`
-	AgentName string         `json:"agentName"`
-	ToolName  string         `json:"toolName"`
-	ToolInput json.RawMessage `json:"toolInput"`
+	TraceID    string          `json:"traceId"`
+	SpanID     string          `json:"spanId"`
+	ParentID   string          `json:"parentId"`
+	Name       string          `json:"name"`
+	Type       string          `json:"type"`
+	StartedAt  string          `json:"startedAt"`
+	EndedAt    string          `json:"endedAt"`
+	DurationMs int64           `json:"duration"`
+	Status     string          `json:"status"`
+	Error      any             `json:"error"`
+	AgentName  string          `json:"agentName"`
+	ToolName   string          `json:"toolName"`
+	ToolInput  json.RawMessage `json:"toolInput"`
 	ToolOutput json.RawMessage `json:"toolOutput"`
-	Attributes map[string]any `json:"attributes"`
+	Attributes map[string]any  `json:"attributes"`
 }
 
 // wbRecord is the envelope every line shares.
@@ -352,10 +352,10 @@ func ParseWorkBuddy(path string) (*Session, error) {
 
 func parseWorkBuddyReader(r io.Reader, path string) (*Session, error) {
 	var (
-		env        *wbTrace
-		spans      []wbSpan
-		parseErrs  []string
-		truncated  bool
+		env       *wbTrace
+		spans     []wbSpan
+		parseErrs []string
+		truncated bool
 	)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 1<<20), maxLine)
@@ -509,9 +509,9 @@ func parseWorkBuddyReader(r io.Reader, path string) (*Session, error) {
 	sort.Strings(s.Models)
 	if env.ModelInfo != nil {
 		s.Usage = Usage{
-			InputTokens:       env.ModelInfo.TotalInputTokens,
-			OutputTokens:      env.ModelInfo.TotalOutputTokens,
-			CacheReadTokens:   env.ModelInfo.TotalCachedTokens,
+			InputTokens:     env.ModelInfo.TotalInputTokens,
+			OutputTokens:    env.ModelInfo.TotalOutputTokens,
+			CacheReadTokens: env.ModelInfo.TotalCachedTokens,
 		}
 	}
 	if env.DurationMs > 0 {

@@ -68,6 +68,51 @@ func TestGraderIsAttachedOnlyWhenAsked(t *testing.T) {
 	}
 }
 
+// A judge that scores continuously carries a cutoff of its own, and the task
+// carries it too. Otherwise a collected task is graded against whatever the run
+// was told while its judge's card reports a different verdict for the same
+// score -- two numbers about one cell, and nothing on the page reconciling them.
+func TestACollectedTaskInheritsTheCutoffOfTheGraderAttached(t *testing.T) {
+	s := parseFixture(t)
+
+	judged, err := Collect([]*Session{s}, Options{
+		Grader:       "llm_judge",
+		GraderConfig: map[string]any{"input": "both", "model": "deepseek-flash"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No cutoff in the config: the judge's documented default travels with the
+	// task, so the dataset says what the verdict was measured against.
+	if got := judged[0].Task.Threshold; got != 0.67 {
+		t.Errorf("threshold = %v, want the judge's own 0.67", got)
+	}
+
+	declared, err := Collect([]*Session{s}, Options{
+		Grader:       "llm_judge",
+		GraderConfig: map[string]any{"threshold": 0.9},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := declared[0].Task.Threshold; got != 0.9 {
+		t.Errorf("threshold = %v, want the declared 0.9", got)
+	}
+
+	// A grader that compares against ground truth has no band of its own, so
+	// the task says nothing and the run's default applies.
+	exact, err := Collect([]*Session{s}, Options{
+		Grader:       "exact_match",
+		GraderConfig: map[string]any{"expect": "x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := exact[0].Task.Threshold; got != 0 {
+		t.Errorf("threshold = %v on an exact_match task, want it left to the run", got)
+	}
+}
+
 func TestWorkspaceBindingChangesTheOutputContract(t *testing.T) {
 	s := parseFixture(t)
 

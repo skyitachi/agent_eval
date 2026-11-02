@@ -406,6 +406,13 @@ func TestTheDatasetsOwnGradersOutrankTheFallback(t *testing.T) {
 // A judge with no key fails every call, and a grader error is recorded as a
 // failed task. That would write a statement about the harness over a row that
 // may have been passing -- so the refusal has to come before the write.
+//
+// The message is part of the behaviour: a refusal that only says "no
+// credentials" leaves the reader with a button that cannot work and no
+// alternative, when this tool ships another grader that answers the same
+// question without calling anyone. Naming patch as the way out is what makes
+// the 409 actionable -- and naming llm_judge as one would not be, since that is
+// the grader that just failed to authenticate.
 func TestOneRefusesAJudgeWithNoCredentialsAndLeavesTheRowAlone(t *testing.T) {
 	dsDir := newDataset(t, taskLine("answer", `,"graders":[{"type":"exact_match",`+
 		`"config":{"expected":"done"}}]`))
@@ -419,8 +426,15 @@ func TestOneRefusesAJudgeWithNoCredentialsAndLeavesTheRowAlone(t *testing.T) {
 	if err == nil {
 		t.Fatal("graded with a judge that has no credentials")
 	}
-	if !strings.Contains(err.Error(), "ANTHROPIC_API_KEY") {
-		t.Errorf("error %q should name the variable to set", err)
+	msg := err.Error()
+	if !strings.Contains(msg, "ANTHROPIC_API_KEY") {
+		t.Errorf("error %q should name the variable to set", msg)
+	}
+	if !strings.Contains(msg, "patch") {
+		t.Errorf("error %q should name a grader that reaches a verdict without a model", msg)
+	}
+	if offline := strings.Join(freeGraders(), ", "); strings.Contains(offline, "llm_judge") {
+		t.Errorf("the alternatives offered (%s) include the judge that cannot authenticate", offline)
 	}
 	if got := cell(t, st, "answer", 0); got.Graded || len(got.Grades) != 0 {
 		t.Errorf("row = graded %v grades %+v, want it untouched", got.Graded, got.Grades)

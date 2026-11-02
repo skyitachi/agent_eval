@@ -108,6 +108,68 @@ tasks:
 	}
 }
 
+// A task may carry the line it is graded against, and the hash has to cover it:
+// two datasets that differ only in a cutoff reach different verdicts, so they
+// are not the same dataset.
+func TestATaskCanDeclareTheLineItIsGradedAgainst(t *testing.T) {
+	dir := t.TempDir()
+	write := func(threshold string) *Dataset {
+		t.Helper()
+		writeManifest(t, dir, `
+name: t
+version: 1.0.0
+tasks:
+  - id: a
+    prompt: hello
+    workspace: {type: empty}
+    output: {type: patch}
+    graders: [{type: llm_judge}]
+`+threshold)
+		d, err := Load(dir)
+		if err != nil {
+			t.Fatalf("load with %q: %v", threshold, err)
+		}
+		return d
+	}
+
+	unset := write("")
+	if got := unset.Tasks[0].Threshold; got != 0 {
+		t.Errorf("threshold = %v on a task that declared none", got)
+	}
+	// Zero is "the run decides", so the fallback has to survive untouched.
+	if got := unset.Tasks[0].EffectiveThreshold(0.6); got != 0.6 {
+		t.Errorf("EffectiveThreshold(0.6) = %v for a task that declared none", got)
+	}
+
+	declared := write("    threshold: 0.85\n")
+	if got := declared.Tasks[0].Threshold; got != 0.85 {
+		t.Errorf("threshold = %v, want 0.85", got)
+	}
+	if got := declared.Tasks[0].EffectiveThreshold(0.6); got != 0.85 {
+		t.Errorf("EffectiveThreshold(0.6) = %v, want the declared 0.85", got)
+	}
+	if declared.Hash == unset.Hash {
+		t.Error("the hash ignores the threshold, so two differently graded datasets look identical")
+	}
+
+	for _, bad := range []string{"1.5", "-0.2"} {
+		writeManifest(t, dir, `
+name: t
+version: 1.0.0
+tasks:
+  - id: a
+    prompt: hello
+    workspace: {type: empty}
+    output: {type: patch}
+    graders: [{type: patch}]
+    threshold: `+bad+"\n")
+		_, err := Load(dir)
+		if err == nil || !strings.Contains(err.Error(), "threshold") {
+			t.Errorf("threshold %s was accepted or reported without naming the field: %v", bad, err)
+		}
+	}
+}
+
 func TestDefaultsAreInheritedWhenTaskIsSilent(t *testing.T) {
 	dir := t.TempDir()
 	writeManifest(t, dir, `

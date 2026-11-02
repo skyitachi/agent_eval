@@ -369,6 +369,19 @@ type TaskSpec struct {
 	Graders   []GraderSpec `json:"graders,omitempty" yaml:"graders,omitempty"`
 	Limits    *Limits      `json:"limits,omitempty" yaml:"limits,omitempty"`
 
+	// Threshold is the composite score this task must reach to pass. Zero means
+	// "whatever the run was told", which is the CLI's --threshold or the
+	// engine's default, so omitting it is not the same as declaring 0.6.
+	//
+	// It is a field rather than a property of the run because the line belongs
+	// to the task: a benchmark imported from a paper carries the cutoff the
+	// paper used, and a judge that scores continuously has a band in which
+	// "mostly right" is the intended answer. A run-wide number can only be one
+	// of those. `aeval collect --grader-config-file` writes the judge's own
+	// cutoff here, so the cell and the grader's card agree instead of the page
+	// having to explain two numbers.
+	Threshold float64 `json:"threshold,omitempty" yaml:"threshold,omitempty"`
+
 	// Baseline is the recorded reference attempt this task is compared against,
 	// usually one exported from a real session by `aeval collect`. Optional: a
 	// task without one is still graded, it just has nothing to be measured
@@ -402,6 +415,20 @@ type TaskSpec struct {
 	ResolvedPrompt string `json:"-" yaml:"-"`
 	// ResolvedBaseline is the loaded baseline document (set by loader).
 	ResolvedBaseline *Baseline `json:"-" yaml:"-"`
+}
+
+// EffectiveThreshold is the cutoff this task is graded against, given the one
+// its run would otherwise apply.
+//
+// A declared threshold wins; zero means the task declared none. The engine has
+// this same "zero means fall back" spelling in three other places (--threshold,
+// Options.Threshold, Limits.TimeoutS), and the alternative -- a task able to say
+// "everything passes" -- is what a run-wide --threshold 0 is for.
+func (t TaskSpec) EffectiveThreshold(fallback float64) float64 {
+	if t.Threshold > 0 {
+		return t.Threshold
+	}
+	return fallback
 }
 
 // ---------------------------------------------------------------------------

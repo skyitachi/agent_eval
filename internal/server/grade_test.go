@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,9 +12,11 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/skyitachi/agenteval/internal/dataset"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/store"
 )
@@ -93,6 +96,20 @@ func registerCompare(t *testing.T, st *store.Store, left, right string) store.Re
 }
 
 var csrfPattern = regexp.MustCompile(`data-grade-csrf="([0-9a-f]+)"`)
+
+// waitForGrades blocks until the server has finished what it accepted.
+//
+// Grading is off the request now, so a test that reads the row the moment the
+// POST returns would be asserting on a job that has not run yet. A browser has
+// the same gap and the page closes it by refreshing; a test closes it here.
+func waitForGrades(t *testing.T, s *Server) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := s.WaitGrades(ctx); err != nil {
+		t.Fatalf("grading did not finish: %v", err)
+	}
+}
 
 // tokenOf reads the form token out of the page, which is how a browser gets it:
 // the test has no other channel, in the same way an attacker on another origin
@@ -188,7 +205,8 @@ func TestGradingACellFromItsPageWritesTheVerdict(t *testing.T) {
 	ds := gradableDataset(t, `[{"type":"exact_match","config":{"expected":"done","normalize":["trim"]}}]`)
 	addGradableRun(t, st, "r1", ds)
 	reg := register(t, st, "r1")
-	h := New(st, Options{}).Handler()
+	srv := New(st, Options{})
+	h := srv.Handler()
 
 	page := get(t, h, "/r/"+reg.ID, nil).Body.String()
 	token := tokenOf(t, page)
@@ -207,6 +225,13 @@ func TestGradingACellFromItsPageWritesTheVerdict(t *testing.T) {
 	if want := "/r/" + reg.ID + "?graded=t1&sample=0#tasks"; rec.Header().Get("Location") != want {
 		t.Errorf("Location = %q, want %q", rec.Header().Get("Location"), want)
 	}
+
+	// The request is answered before the verdict exists: that is the point of
+	// the change. The page the reader lands on says so.
+	if graded := attempt(t, st, "r1", "t1"); graded.Graded {
+		t.Error("the POST waited for the verdict; grading is supposed to be off the request")
+	}
+	waitForGrades(t, srv)
 
 	after := attempt(t, st, "r1", "t1")
 	if !after.Graded || !after.Passed || after.Score != 1 {
@@ -418,6 +443,100 @@ func TestGradingACollectedTaskFallsBackToTheJudge(t *testing.T) {
 	}
 }
 
+// A server started with a judge declaration grades with that declaration.
+//
+// The declaration is more than a type name: the endpoint, the model and the
+// name of the credential variable are what make a call possible at all. Grading
+// with the built-in defaults while the replays use the declared judge is the
+// state this test exists to prevent -- the page would send a key for one
+// gateway to api.anthropic.com and report the result as "no credentials", which
+// is the least useful description of a problem that has already been solved in
+// the shell that started the server.
+func TestTheJudgeAServerWasStartedWithIsTheJudgeItGradesWith(t *testing.T) {
+	st := newStore(t)
+	// A collected task: no graders, so the fallback is what grades it.
+	dir := t.TempDir()
+	writeFixture(t, filepath.Join(dir, "dataset.yaml"),
+		"name: collected\nversion: 1.0.0\ntasks_file: tasks.jsonl\n")
+	writeFixture(t, filepath.Join(dir, "tasks.jsonl"),
+		`{"id":"t1","prompt":"answer the question",`+
+			`"workspace":{"type":"files","files":{"a.txt":"x"}},`+
+			`"output":{"type":"stdout"},"baseline":{"file":"baseline.json"}}`+"\n")
+	writeFixture(t, filepath.Join(dir, "baseline.json"), `{}`)
+	addGradableRun(t, st, "r1", dir)
+	reg := register(t, st, "r1")
+
+	// A stub that speaks the Messages protocol, so the test observes which
+	// endpoint was called rather than trusting a config value.
+	var (
+		mu     sync.Mutex
+		auth   string
+		model  string
+		called string
+	)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		auth, model, called = r.Header.Get("Authorization"), body.Model, r.URL.Path
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"model":"stub-judge","content":[{"type":"text",`+
+			`"text":"{\"score\":1,\"passed\":true,\"reason\":\"the stub judged it\"}"}],`+
+			`"stop_reason":"end_turn","usage":{"input_tokens":11,"output_tokens":7}}`)
+	}))
+	defer stub.Close()
+
+	declared := dataset.GraderSpec{
+		Type: "llm_judge",
+		Name: "judge",
+		Config: map[string]any{
+			"base_url":       stub.URL,
+			"auth_token_env": "AEVAL_JUDGE_TOKEN",
+			"model":          "stub-judge",
+			"input":          "both",
+			"rubric":         "correct if it does what the prompt asked",
+		},
+	}
+	srv := New(st, Options{Judge: &declared})
+	// The built-in judge's variable is empty on purpose: if the server graded
+	// with it, the request would be refused instead of reaching the stub.
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("AEVAL_JUDGE_TOKEN", "token-from-the-declaration")
+	h := srv.Handler()
+	token := tokenOf(t, get(t, h, "/r/"+reg.ID, nil).Body.String())
+
+	rec := post(h, "/r/"+reg.ID+"/grade",
+		url.Values{"csrf": {token}, "task": {"t1"}, "grader": {"auto"}}, nil)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303: the declared judge cannot authenticate\n%s", rec.Code, rec.Body.String())
+	}
+	waitForGrades(t, srv)
+
+	after := attempt(t, st, "r1", "t1")
+	if !after.Graded || !after.Passed {
+		t.Fatalf("cell = graded %v passed %v, want the stub's verdict", after.Graded, after.Passed)
+	}
+	if len(after.Grades) != 1 || after.Grades[0].Type != "llm_judge" {
+		t.Errorf("graders = %+v, want the declared llm_judge", after.Grades)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if called != "/v1/messages" {
+		t.Errorf("the judge called %q, want the declared endpoint's /v1/messages", called)
+	}
+	if auth != "Bearer token-from-the-declaration" {
+		t.Errorf("Authorization = %q, want the token the declaration names", auth)
+	}
+	if model != "stub-judge" {
+		t.Errorf("model = %q, want the one the declaration names", model)
+	}
+}
+
 // The JSON endpoint is the document the hash covers. Grading changes the row,
 // so the endpoint must report the drift rather than hide it -- that is the
 // claim that survived the withdrawal of read-only.
@@ -426,7 +545,8 @@ func TestGradingMakesTheJSONEndpointSayTheHashMoved(t *testing.T) {
 	ds := gradableDataset(t, `[{"type":"exact_match","config":{"expected":"done"}}]`)
 	addGradableRun(t, st, "r1", ds)
 	reg := register(t, st, "r1")
-	h := New(st, Options{}).Handler()
+	srv := New(st, Options{})
+	h := srv.Handler()
 	token := tokenOf(t, get(t, h, "/r/"+reg.ID, nil).Body.String())
 
 	if matches := get(t, h, "/r/"+reg.ID+".json", nil).Header().Get("X-Aeval-Hash-Matches"); matches != "true" {
@@ -436,6 +556,7 @@ func TestGradingMakesTheJSONEndpointSayTheHashMoved(t *testing.T) {
 		url.Values{"csrf": {token}, "task": {"t1"}}, nil); rec.Code != http.StatusSeeOther {
 		t.Fatalf("grade: status %d\n%s", rec.Code, rec.Body.String())
 	}
+	waitForGrades(t, srv)
 	rec := get(t, h, "/r/"+reg.ID+".json", nil)
 	if rec.Header().Get("X-Aeval-Hash-Matches") != "false" {
 		t.Error("the JSON endpoint claims the graded document is the recorded one")

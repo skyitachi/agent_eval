@@ -17,8 +17,8 @@ import (
 // identify a capture format ("cursor-composer"), these identify where on this
 // machine a session was found.
 const (
-	CatalogClaude   = "claude"
-	CatalogCursor   = "cursor"
+	CatalogClaude    = "claude"
+	CatalogCursor    = "cursor"
 	CatalogWorkBuddy = "workbuddy"
 )
 

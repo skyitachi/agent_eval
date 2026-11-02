@@ -504,7 +504,7 @@ func TestAPostIsNotAccepted(t *testing.T) {
 // Assets
 // ---------------------------------------------------------------------------
 
-func TestTheAssetsAreServedOnceAndCached(t *testing.T) {
+func TestTheAssetsAreServedOnceAndRevalidated(t *testing.T) {
 	st := newStore(t)
 	h := New(st, Options{}).Handler()
 
@@ -516,6 +516,14 @@ func TestTheAssetsAreServedOnceAndCached(t *testing.T) {
 		tag := rec.Header().Get("ETag")
 		if tag == "" {
 			t.Fatalf("%s carries no ETag, so every visit refetches it", path)
+		}
+		// The client has to ask again every time. The page that loads it is
+		// no-store, so an asset the browser may keep for a while can be last
+		// build's client running against this build's page -- which is exactly
+		// how a fixed "grade" button went on doing nothing for five minutes
+		// after the fix was built.
+		if cc := rec.Header().Get("Cache-Control"); strings.Contains(cc, "max-age") {
+			t.Errorf("%s may be kept without asking (%q): a rebuilt binary's page would run the previous client", path, cc)
 		}
 		again := get(t, h, path, map[string]string{"If-None-Match": tag})
 		if again.Code != http.StatusNotModified {

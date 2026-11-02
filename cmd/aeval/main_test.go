@@ -10,6 +10,7 @@ import (
 
 	"github.com/skyitachi/agenteval/internal/agent"
 	"github.com/skyitachi/agenteval/internal/dataset"
+	"github.com/skyitachi/agenteval/internal/replay"
 	"github.com/skyitachi/agenteval/internal/session"
 )
 
@@ -203,5 +204,112 @@ func TestCollectLeavesOutTranscriptsAReplayWrote(t *testing.T) {
 	}
 	if !strings.Contains(list.String(), recordingID) {
 		t.Errorf("--list dropped the recording too:\n%s", list.String())
+	}
+}
+
+// The startup line, the manager's configuration and the server's grading
+// declaration are three views of one decision, so all of them are read off the
+// same value here. A banner claiming a judge the replays do not attach is worse
+// than no banner: it is what a reader would be looking at while a report page
+// refuses to grade.
+//
+// The third view is the one that was missing. A server started with
+// --grader-config-file told the replays which endpoint and which credential
+// variable to use and left the grade button on api.anthropic.com, so the page
+// answered "no credentials" on a machine that had one.
+func TestTheServeJudgeReachesTheManagerTheServerAndTheBanner(t *testing.T) {
+	empty := serveJudge{}
+	for _, replays := range []bool{true, false} {
+		if got := empty.describe(replays); got != "" {
+			t.Errorf("a server with no judge file announces %q", got)
+		}
+	}
+	if got := empty.serverOptions(); got != nil {
+		t.Errorf("a server with no judge file grades with %+v, want the built-in default", got)
+	}
+	if got := empty.credentialWarning(); got != "" {
+		t.Errorf("a server with no judge file warns %q", got)
+	}
+	untouched := replay.Config{Grader: "kept", GraderName: "kept", GraderConfig: map[string]any{"input": "diff"}}
+	if got := empty.replayConfig(untouched); got.Grader != "kept" || got.GraderConfig["input"] != "diff" {
+		t.Errorf("no declaration overwrote the manager's default: %+v", got)
+	}
+
+	declared := map[string]any{
+		"input":          "both",
+		"base_url":       "https://api.deepseek.com/anthropic",
+		"auth_token_env": "DEEPSEEK_API_KEY",
+		"model":          "deepseek-chat",
+	}
+	j := serveJudge{
+		spec: dataset.GraderSpec{Type: "llm_judge", Name: "judge", Config: declared},
+		path: "/tmp/judge.yaml",
+	}
+	cfg := j.replayConfig(replay.Config{})
+	if cfg.Grader != "llm_judge" || cfg.GraderName != "judge" {
+		t.Errorf("manager got %q/%q, want the declared llm_judge/judge", cfg.Grader, cfg.GraderName)
+	}
+	for k, want := range declared {
+		if got := cfg.GraderConfig[k]; got != want {
+			t.Errorf("manager config[%s] = %v, want %v; the endpoint has to reach the tasks", k, got, want)
+		}
+	}
+
+	served := j.serverOptions()
+	if served == nil || served.Type != "llm_judge" {
+		t.Fatalf("the report server got %+v, want the declared judge", served)
+	}
+	for k, want := range declared {
+		if got := served.Config[k]; got != want {
+			t.Errorf("server config[%s] = %v, want %v; a page that grades with the built-in judge "+
+				"calls an endpoint nobody configured", k, got, want)
+		}
+	}
+
+	for _, replays := range []bool{true, false} {
+		line := j.describe(replays)
+		for _, want := range []string{"llm_judge", "judge", "/tmp/judge.yaml"} {
+			if !strings.Contains(line, want) {
+				t.Errorf("banner %q should name %q", line, want)
+			}
+		}
+	}
+
+	// The credential is read from the environment this process will grade in,
+	// so a server that cannot authenticate says so before the first press.
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	if got := j.credentialWarning(); !strings.Contains(got, "no credentials") || !strings.Contains(got, "judge") {
+		t.Errorf("a judge with no credential warns %q, want a line naming the judge and the problem", got)
+	}
+	t.Setenv("DEEPSEEK_API_KEY", "present")
+	if got := j.credentialWarning(); got != "" {
+		t.Errorf("a judge with a credential warns %q", got)
+	}
+}
+
+// A file declares the type, the name and the config at once, so passing it
+// beside the flags it replaces has no answer: whichever won, the others would
+// read as if they had applied.
+func TestCollectRefusesAJudgeFileBesideTheFlagsItReplaces(t *testing.T) {
+	work := t.TempDir()
+	declaration := filepath.Join(work, "judge.yaml")
+	if err := os.WriteFile(declaration, []byte("type: llm_judge\nconfig:\n  input: both\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cmdCollect([]string{
+		"--session", filepath.Join("..", "..", "tests", "testdata", "session", "basic.jsonl"),
+		"--out", filepath.Join(work, "out"),
+		"--grader-config-file", declaration,
+		"--grader", "patch",
+	}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("accepted a file and a flag it replaces:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--grader-config-file") {
+		t.Errorf("the refusal should name the flag, got: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(work, "out")); err == nil {
+		t.Error("a refused collect still wrote a dataset")
 	}
 }

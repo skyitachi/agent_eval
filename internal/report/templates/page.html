@@ -40,7 +40,7 @@
      control at all when they are not. The token is in the shell rather than in
      the payload because it changes every time the server starts, and the
      payload is the bytes the recorded hash covers. */}}
-<body data-mode="{{.Mode}}"{{if .Grade}} data-grade-url="{{.Grade.URL}}" data-grade-csrf="{{.Grade.Token}}" data-grade-graders="{{csv .Grade.Graders ","}}"{{end}}>
+<body data-mode="{{.Mode}}"{{if .Grade}} data-grade-url="{{.Grade.URL}}" data-grade-csrf="{{.Grade.Token}}" data-grade-graders="{{csv .Grade.Graders ","}}"{{if .Grade.Grading}} data-grade-task="{{.Grade.Grading.TaskID}}" data-grade-sample="{{.Grade.Grading.Sample}}"{{end}}{{end}}>
 <header class="topbar">
   <div class="topbar-inner">
     <a class="brand" id="brand" href="{{.Home}}"></a>

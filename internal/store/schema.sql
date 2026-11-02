@@ -282,3 +282,74 @@ CREATE TABLE IF NOT EXISTS replays (
 
 CREATE INDEX IF NOT EXISTS idx_replays_session ON replays(source, session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_replays_created ON replays(created_at DESC);
+
+-- Re-grades asked for from a report page: one row per request.
+--
+-- The verdict itself lives on the attempt, because that is what every report is
+-- rendered from and a verdict held anywhere else would disagree with the page.
+-- What is *not* on the attempt is the cost of reaching it: a judge call spends
+-- tokens, takes seconds, and can fail before it writes anything. Those are
+-- facts about a request, not about the cell -- a cell can be graded ten times
+-- and the row has to keep saying one thing -- so they are recorded here, one
+-- row per press, and the attempt is left alone.
+--
+-- Nothing goes on the attempts row's token columns either. Those are the
+-- agent's spend and the report totals are read from them: adding a judge's
+-- tokens there would inflate what the agent cost, which is the one number a
+-- reader is comparing across runs.
+--
+-- status: queued | running | done | failed. A row found as queued or running
+-- when a process opens the database belonged to a process that is gone -- the
+-- verdict it was reaching was never written -- and is closed as failed rather
+-- than left looking as though it is still going.
+CREATE TABLE IF NOT EXISTS grade_jobs (
+    id            TEXT PRIMARY KEY,
+    -- The page the press came from, and the cell it was about. report_id is
+    -- kept because the same cell can be reached from a report that is later
+    -- re-registered; the job belongs to the press, not to the current link.
+    report_id     TEXT NOT NULL DEFAULT '',
+    run_id        TEXT NOT NULL,
+    task_id       TEXT NOT NULL,
+    sample_index  INTEGER NOT NULL DEFAULT 0,
+    -- The picker's value: auto | llm_judge | patch. What was asked for, which
+    -- is not the same as what ran (auto resolves to the dataset's graders).
+    grader        TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'queued',
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
+    ended_at      TEXT,
+
+    -- What reaching the verdict cost. Zero when no model was called.
+    model         TEXT NOT NULL DEFAULT '',
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    latency_ms    INTEGER NOT NULL DEFAULT 0,
+
+    -- The verdict a finished job produced, repeated so a reader can see what a
+    -- job did without joining the attempt -- and so a job whose cell was graded
+    -- again afterwards still says what it itself reached.
+    score         REAL NOT NULL DEFAULT 0,
+    passed        INTEGER NOT NULL DEFAULT 0,
+    -- The per-grader results, the same shape the attempt's grades column holds.
+    details_json  TEXT NOT NULL DEFAULT '',
+
+    -- Why it failed, in the words of whatever failed. A failed job writes
+    -- nothing: the attempt keeps the verdict it had.
+    error         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_grade_jobs_cell ON grade_jobs(run_id, task_id, sample_index, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_grade_jobs_status ON grade_jobs(status, created_at);
+
+-- One live request per cell, enforced by the database rather than by a check
+-- and an insert.
+--
+-- Two presses in the same second -- a double click, two tabs on the same report
+-- -- would otherwise both read "nothing is running" and both start a paid call.
+-- A partial index makes the second insert fail, and the caller turns that
+-- failure into "the request you already made is the one being worked on".
+CREATE UNIQUE INDEX IF NOT EXISTS idx_grade_jobs_one_active
+    ON grade_jobs(run_id, task_id, sample_index)
+    WHERE status IN ('queued', 'running');
+
+

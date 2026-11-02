@@ -53,6 +53,27 @@ func gradeChoices() []string {
 	return []string{"auto", replay.DefaultGrader, "patch"}
 }
 
+// judgeGrader is the grader this server reaches verdicts with when the task
+// declares none.
+//
+// A grader declaration is more than a type name: the endpoint, the model and
+// the name of the credential variable are what make a call possible at all, and
+// a server started with --grader-config-file was told all three. Grading with
+// the built-in defaults instead would send the request to api.anthropic.com
+// with a key that belongs to someone else's gateway -- which arrives at the page
+// as "no credentials", the least helpful description of a solved problem.
+func (s *Server) judgeGrader() dataset.GraderSpec {
+	if s.opts.Judge != nil && strings.TrimSpace(s.opts.Judge.Type) != "" {
+		return *s.opts.Judge
+	}
+	return builtinJudge()
+}
+
+// builtinJudge is what every server can grade with, told nothing.
+func builtinJudge() dataset.GraderSpec {
+	return dataset.GraderSpec{Type: replay.DefaultGrader, Config: replay.DefaultGraderConfig()}
+}
+
 // gradeAction is what the page needs to offer the control, or nil when the page
 // cannot be graded.
 //
@@ -88,19 +109,36 @@ func runOf(reg store.Report) (string, error) {
 	return id, nil
 }
 
-// gradeNotice is the banner a page shows after a verdict was reached.
+// gradeRefresh is how often a page with grading in flight reloads itself.
 //
-// It is composed from the row, never from the URL. A link can carry
-// ?graded=<id>; it cannot make a row say something the row does not hold, so a
-// crafted link produces either nothing or the truth.
-func (s *Server) gradeNotice(r *http.Request, reg store.Report) *report.Notice {
+// Three seconds is the interval the session pages already use for a replay. The
+// mechanism is the same on purpose: a reader who has watched one "still
+// happening" page in this tool should not have to learn a second one, and a
+// meta refresh needs no script, no endpoint and no state of its own.
+const gradeRefresh = "3"
+
+// gradeStatus is what the page says about the cell named in the URL.
+//
+// It has three states and they are not the same sentence: still working, failed
+// without writing anything, or done with a verdict to report. It is read from
+// the rows -- the job and the cell -- never from the query string, so a crafted
+// link produces either nothing or the truth.
+type gradeStatus struct {
+	Notice  *report.Notice
+	Refresh string
+	// Job is the request the notice is about, so the page can mark the row it
+	// is working on rather than only saying so in a banner.
+	Job *store.GradeJob
+}
+
+func (s *Server) gradeStatus(r *http.Request, reg store.Report) gradeStatus {
 	task := strings.TrimSpace(r.URL.Query().Get("graded"))
 	if task == "" {
-		return nil
+		return gradeStatus{}
 	}
 	runID, err := runOf(reg)
 	if err != nil {
-		return nil
+		return gradeStatus{}
 	}
 	sample := -1
 	if raw := strings.TrimSpace(r.URL.Query().Get("sample")); raw != "" {
@@ -110,7 +148,7 @@ func (s *Server) gradeNotice(r *http.Request, reg store.Report) *report.Notice {
 	}
 	rows, err := s.st.ListAttempts(r.Context(), runID)
 	if err != nil {
-		return nil
+		return gradeStatus{}
 	}
 	var row *store.Attempt
 	for i := range rows {
@@ -123,17 +161,70 @@ func (s *Server) gradeNotice(r *http.Request, reg store.Report) *report.Notice {
 		}
 	}
 	if row == nil {
-		return nil
+		return gradeStatus{}
 	}
-	return verdictNotice(*row)
+
+	job, err := s.st.LatestGradeJob(r.Context(), runID, row.TaskID, row.Sample)
+	if err != nil {
+		job = nil
+	}
+	switch {
+	case job != nil && job.Active():
+		return gradeStatus{
+			Notice:  runningNotice(*row, *job),
+			Refresh: gradeRefresh,
+			Job:     job,
+		}
+	case job != nil && job.Status == store.GradeFailed:
+		return gradeStatus{Notice: failedNotice(*row, *job), Job: job}
+	default:
+		return gradeStatus{Notice: verdictNotice(*row, job), Job: job}
+	}
+}
+
+// runningNotice is what a page says while the work is in flight.
+//
+// It names the cell and says the page is following it, because "grading" with
+// no end in sight is indistinguishable from a page that forgot.
+func runningNotice(a store.Attempt, job store.GradeJob) *report.Notice {
+	where := cellName(a)
+	state := "queued"
+	if job.Status == store.GradeRunning {
+		state = "running"
+	}
+	by := job.Grader
+	if by == "" || by == "auto" {
+		by = "the graders the dataset declares"
+	} else {
+		by = "the " + by + " grader"
+	}
+	note := fmt.Sprintf("%s is being graded by %s (%s). This page reloads every %s seconds and will show "+
+		"the verdict when the row has one; nothing else on the page changes in the meantime.",
+		where, by, state, gradeRefresh)
+	return &report.Notice{Severity: "info", Head: "Grading this cell.", Note: note}
+}
+
+// failedNotice reports a request that reached no verdict.
+//
+// The important half is that the cell is unchanged: a reader who pressed the
+// button has to be able to tell "the grade disagreed with me" from "the grade
+// never happened", and the row still says what it said before.
+func failedNotice(a store.Attempt, job store.GradeJob) *report.Notice {
+	reason := strings.TrimSpace(job.Error)
+	if reason == "" {
+		reason = "no reason was recorded"
+	}
+	return &report.Notice{
+		Severity: "warn",
+		Head:     "The grade did not finish.",
+		Note: fmt.Sprintf("%s was not re-graded: %s. The row below is unchanged -- it still holds the verdict "+
+			"it had before this request.", cellName(a), reason),
+	}
 }
 
 // verdictNotice phrases one row's verdict for the banner.
-func verdictNotice(a store.Attempt) *report.Notice {
-	where := fmt.Sprintf("Task %s", a.TaskID)
-	if a.Sample > 0 {
-		where = fmt.Sprintf("Task %s, sample %d", a.TaskID, a.Sample)
-	}
+func verdictNotice(a store.Attempt, job *store.GradeJob) *report.Notice {
+	where := cellName(a)
 	switch {
 	case a.Status == store.CellError:
 		return &report.Notice{
@@ -157,15 +248,122 @@ func verdictNotice(a store.Attempt) *report.Notice {
 		sev, head = "info", "The verdict on record is PASS."
 	}
 	parts := []string{fmt.Sprintf("%s scores %.2f against a threshold of %.2f.", where, a.Score, a.Threshold)}
+	// Before the graders, not after: a reader looking at a green card over a
+	// red row needs the two numbers explained next to each other, and "Reached
+	// by llm_judge" is not an explanation.
+	if cut := graderCutoffs(a); cut != "" {
+		parts = append(parts, cut)
+	}
 	if by := gradedBy(a); by != "" {
 		parts = append(parts, "Reached by "+by+".")
 	}
 	if failed := failedGraders(a); failed != "" {
 		parts = append(parts, "Could not run: "+failed+".")
 	}
+	if spend := spendNote(job); spend != "" {
+		parts = append(parts, spend)
+	}
 	parts = append(parts, "The table below is rendered from that row; the banner beside it says whether this "+
 		"page still matches the registration.")
 	return &report.Notice{Severity: sev, Head: head, Note: strings.Join(parts, " ")}
+}
+
+// graderCutoffs states the cutoffs the graders applied to their own scores.
+//
+// A cell and its judge can disagree without either being wrong. The judge
+// compares its score to the cutoff in its own config; the cell compares the same
+// score to the line the run was given. The page used to show only the cell's
+// number while the drawer showed the judge's green tick, so a reader saw two
+// verdicts about one row and nothing saying they answer different questions.
+//
+// This is that statement, and it is written from the recorded results rather
+// than recomputed: the cutoff to explain is the one that produced the verdict on
+// this row, not whatever today's default would give.
+func graderCutoffs(a store.Attempt) string {
+	var parts []string
+	for _, g := range a.Grades {
+		if g.Error != "" {
+			continue
+		}
+		cut, ok := detailNumber(g.Details["threshold"])
+		if !ok || cut <= 0 {
+			continue
+		}
+		verdict := "fail"
+		if g.Passed {
+			verdict = "pass"
+		}
+		// The card's verdict is not always score >= cutoff: a judge that
+		// asserts "passed" overrides its own arithmetic down to half the cutoff.
+		// So the sentence names the cutoff and the verdict separately rather
+		// than inviting a reader to check a sum that was never the rule.
+		parts = append(parts, fmt.Sprintf("%s's own cutoff is %.2f and it reads %s on this work",
+			g.Grader, cut, verdict))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "; ") + " -- that cutoff is the grader's own standard, the threshold above " +
+		"is the line this cell was run against, and the verdict comes from that one."
+}
+
+// detailNumber reads a number out of a grader's recorded details.
+//
+// It is written against the shapes a JSON round trip can produce -- the row is
+// decoded from the database, not held in memory -- and refuses everything else
+// rather than printing a guess.
+func detailNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	}
+	return 0, false
+}
+
+// spendNote says what the judgement itself cost, when it cost anything.
+//
+// It is the number that was missing: a page could say which grader reached a
+// verdict and nothing about what reaching it spent, so a reader comparing a
+// cheap grader with an expensive one had to go to the database. Zero tokens
+// means no model was called -- patch and exact_match spend nothing -- and that
+// is worth stating rather than hiding, because it is the difference between a
+// free verdict and a paid one.
+func spendNote(job *store.GradeJob) string {
+	if job == nil || job.Status != store.GradeDone {
+		return ""
+	}
+	if job.InputTokens == 0 && job.OutputTokens == 0 {
+		return fmt.Sprintf("It cost no model tokens and took %s.", durationText(job.LatencyMs))
+	}
+	model := job.Model
+	if model == "" {
+		model = "the judge's model"
+	}
+	return fmt.Sprintf("It cost %d input and %d output tokens on %s and took %s.",
+		job.InputTokens, job.OutputTokens, model, durationText(job.LatencyMs))
+}
+
+// durationText renders a duration the way a reader of one grade wants it: a
+// fast grader in milliseconds rather than "0.0s", a slow one in seconds.
+func durationText(ms int64) string {
+	if ms < 1000 {
+		return fmt.Sprintf("%dms", ms)
+	}
+	return fmt.Sprintf("%.1fs", float64(ms)/1000)
+}
+
+// cellName is how the page refers to one cell.
+func cellName(a store.Attempt) string {
+	if a.Sample > 0 {
+		return fmt.Sprintf("Task %s, sample %d", a.TaskID, a.Sample)
+	}
+	return fmt.Sprintf("Task %s", a.TaskID)
 }
 
 // gradedBy names the graders that produced the verdict on a row, in the order
@@ -266,32 +464,72 @@ func (s *Server) handleGrade(w http.ResponseWriter, r *http.Request) {
 		}
 		sample = n
 	}
-	specs, err := gradeSelection(r.PostForm.Get("grader"))
+	specs, err := gradeSelection(r.PostForm.Get("grader"), s.judgeGrader())
 	if err != nil {
 		s.refuseGrade(w, http.StatusBadRequest, reg, "That grader is not one this page offers.", err.Error())
 		return
 	}
-
-	outcome, err := regrade.One(r.Context(), s.st, runID, task, sample, regrade.Options{
+	opts := regrade.Options{
 		Graders: specs,
 		// A collected task declares no graders of its own, and "grade this"
 		// from a page means "reach a verdict", not "tell me the dataset has
 		// none". The judge is the criterion that needs no ground truth, which
-		// is why the replay button attaches it too.
-		Fallback: []dataset.GraderSpec{{
-			Type:   replay.DefaultGrader,
-			Config: replay.DefaultGraderConfig(),
-		}},
-	})
+		// is why the replay button attaches it too -- and it is the judge this
+		// server was started with, not a default that ignores the endpoint it
+		// was configured to call.
+		Fallback: []dataset.GraderSpec{s.judgeGrader()},
+	}
+
+	// Everything that can be refused is refused here, while the reader is
+	// still on the page that would have to explain it: a judge with no
+	// credentials, a cell that never ran, a dataset that moved. Accepting those
+	// as a request would answer "303" and then fail a minute later on a page
+	// the reader has left.
+	//
+	// What is left to fail later is the grading itself -- a model that answers
+	// nothing, a call that times out -- and that is a fact about this request,
+	// which is what the job row is for.
+	resolved, err := regrade.Check(r.Context(), s.st, runID, task, sample, opts)
 	if err != nil {
-		// Nothing was written when this returns an error, so the page can say
-		// why in the same breath as "the row is unchanged".
 		s.refuseGrade(w, http.StatusConflict, reg, "This cell cannot be graded.", err.Error())
 		return
 	}
-	// Post/redirect/get, because a verdict may have cost an API call: a reload
-	// of the resulting page must not grade a second time.
-	http.Redirect(w, r, gradedURL(reg.ID, outcome.TaskID, outcome.Sample), http.StatusSeeOther)
+	sample = resolved
+
+	// One live request per cell: a second press is answered with the request
+	// that is already running rather than with a second paid comparison of the
+	// same work. The check here is the polite half; the partial index on
+	// grade_jobs is the half that holds under two simultaneous presses.
+	if running, err := s.st.ActiveGradeJob(r.Context(), runID, task, sample); err == nil && running != nil {
+		http.Redirect(w, r, gradedURL(reg.ID, running.TaskID, running.Sample), http.StatusSeeOther)
+		return
+	}
+
+	job, err := regrade.Start(r.Context(), s.st, store.GradeRequest{
+		ReportID: reg.ID,
+		RunID:    runID,
+		TaskID:   task,
+		Sample:   sample,
+		Grader:   strings.TrimSpace(r.PostForm.Get("grader")),
+	})
+	if err != nil {
+		// Lost a race with another press for the same cell. That is not a
+		// failure the reader can act on: the work they asked for is happening.
+		if running, aerr := s.st.ActiveGradeJob(r.Context(), runID, task, sample); aerr == nil && running != nil {
+			http.Redirect(w, r, gradedURL(reg.ID, running.TaskID, running.Sample), http.StatusSeeOther)
+			return
+		}
+		s.failure(w, http.StatusInternalServerError, "The grade could not be recorded.",
+			fmt.Sprintf("Writing the request to %s failed: %v", s.st.Path(), err))
+		return
+	}
+
+	// Post/redirect/get, for the same reason as before: a verdict may cost an
+	// API call, and a reload of the page it lands on must not pay for another.
+	// The work is not done when this returns -- the page says "grading" and
+	// follows the row until it is.
+	s.grades.submit(job, opts)
+	http.Redirect(w, r, gradedURL(reg.ID, job.TaskID, job.Sample), http.StatusSeeOther)
 }
 
 // gradeSelection turns the picker's value into grader specs.
@@ -299,13 +537,20 @@ func (s *Server) handleGrade(w http.ResponseWriter, r *http.Request) {
 // An empty value means the same as "auto" -- a form that lost the field, or a
 // page rendered by an older build, falls back to the documented policy rather
 // than to an error nobody can act on.
-func gradeSelection(choice string) ([]dataset.GraderSpec, error) {
+//
+// judge is the grader the server was started with; the picker's llm_judge entry
+// means that one when it is a judge at all, because the declaration is what
+// carries the endpoint and credential its calls need.
+func gradeSelection(choice string, judge dataset.GraderSpec) ([]dataset.GraderSpec, error) {
 	switch v := strings.TrimSpace(choice); v {
 	case "", "auto":
 		// Nil: the dataset's own graders, which is the reproducible choice.
 		return nil, nil
 	case replay.DefaultGrader:
-		return []dataset.GraderSpec{{Type: replay.DefaultGrader, Config: replay.DefaultGraderConfig()}}, nil
+		if judge.Type != replay.DefaultGrader {
+			judge = builtinJudge()
+		}
+		return []dataset.GraderSpec{judge}, nil
 	case "patch":
 		// No config: the defaults ask only that something changed and that it
 		// is not a repository-wide rewrite, which is the question this grader

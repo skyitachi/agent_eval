@@ -9,10 +9,17 @@
 //	score = Σ(weight_i × score_i) / Σ(weight_i)
 //
 // A task passes when every grader marked `required` passed AND the score reaches
-// the task threshold (default 1.0). Requiring a full score by default matches how
-// benchmarks such as SWE-bench define "resolved" -- all target tests must pass --
-// while the weighted score still exposes partial progress for analysis. Lower the
-// threshold to accept partial credit as a pass.
+// the task threshold (default 0.6).
+//
+// The default used to be 1.0, which is how benchmarks such as SWE-bench define
+// "resolved": all target tests pass, no partial credit. That is the right line
+// for a binary suite and the wrong one for a rubric judge, which essentially
+// never returns a perfect score -- a 0.8 verdict on correct, slightly
+// incomplete work read as a failure, and a run's resolve rate was then a
+// measurement of the judge's generosity rather than of the agent. 0.6 keeps the
+// "cleared the bar" reading while letting a mostly-correct attempt pass; a task
+// that wants the exact line declares `threshold: 1.0`, and `--threshold`
+// overrides it for a whole run.
 //
 // # Extending
 //
@@ -346,6 +353,70 @@ func NeedsWorkspace(typ string) bool {
 	return ok && s.RequiresSandbox()
 }
 
+// Modelled is implemented by graders that call a language model.
+//
+// It exists for the same reason as Sandboxed, one dependency later. A re-grade
+// refuses a grader it cannot actually run, and one of those refusals is "there
+// is no credential here" -- which is only visible if the grader says it needs
+// one. The other half is what the refusal offers instead: a list of graders
+// that call nothing is not an answer if it includes the judge that just failed
+// to authenticate.
+//
+// Declaring the dependency rather than matching on the type name keeps a second
+// model-backed grader from being silently left out of both halves.
+type Modelled interface {
+	// RequiresModel reports whether this grader calls a language model.
+	RequiresModel() bool
+}
+
+// NeedsModel reports whether a registered grader type calls a language model.
+// Unknown types report false; the caller resolves those first and gets a
+// better error there.
+func NeedsModel(typ string) bool {
+	g, err := Get(typ)
+	if err != nil {
+		return false
+	}
+	m, ok := g.(Modelled)
+	return ok && m.RequiresModel()
+}
+
+// SelfThresholded is implemented by graders that compare their own score to a
+// cutoff of their own rather than to the task's.
+//
+// The judge is the case that matters. Its config carries a threshold, so a card
+// in the report can read "pass" for the same score the cell calls a failure --
+// two numbers answering two questions, and a reader who sees only one of them
+// reads the page as broken. Declaring the cutoff here is what lets the rest of
+// the tool reconcile them instead of hard-coding 0.67 in three places: collect
+// writes it onto the task, and the report names both numbers side by side.
+type SelfThresholded interface {
+	// OwnThreshold reports the cutoff this grader applies to its own score,
+	// given its config block and with its defaults already applied.
+	OwnThreshold(config map[string]any) float64
+}
+
+// DeclaredThreshold reports the cutoff a grader applies to its own score, and
+// whether it has one at all.
+//
+// Unknown types and graders with no cutoff of their own report false: an
+// unreadable declaration is not a reason to invent a line for it.
+func DeclaredThreshold(spec dataset.GraderSpec) (float64, bool) {
+	g, err := Get(spec.Type)
+	if err != nil {
+		return 0, false
+	}
+	s, ok := g.(SelfThresholded)
+	if !ok {
+		return 0, false
+	}
+	t := s.OwnThreshold(spec.Config)
+	if t <= 0 {
+		return 0, false
+	}
+	return t, true
+}
+
 var (
 	regMu    sync.RWMutex
 	registry = map[string]Grader{}
@@ -419,7 +490,7 @@ func DecodeConfig(spec dataset.GraderSpec, out any) error {
 // ---------------------------------------------------------------------------
 
 // Threshold is the default score required for a task to count as passed.
-const Threshold = 1.0
+const Threshold = 0.6
 
 // Grade is the aggregated verdict for one task attempt.
 type Grade struct {

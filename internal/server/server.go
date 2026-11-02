@@ -51,6 +51,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/skyitachi/agenteval/internal/dataset"
 	"github.com/skyitachi/agenteval/internal/report"
 	"github.com/skyitachi/agenteval/internal/store"
 )
@@ -63,6 +64,16 @@ type Options struct {
 	// default, which is deliberately not "everything": the registry is
 	// append-only, so a listing of everything grows without bound.
 	Limit int
+	// Judge is the grader this server was told to reach verdicts with, when it
+	// was told. Nil keeps the built-in one: llm_judge with the default rubric
+	// and a credential from the ANTHROPIC_* variables.
+	//
+	// It is the same declaration a replay attaches, and it has to be, because
+	// a page can grade a cell: a judge naming a gateway, a model and its own
+	// credential variable is the difference between a button that reaches a
+	// verdict and one that answers "no credentials" on a machine whose shell
+	// has never heard of ANTHROPIC_API_KEY.
+	Judge *dataset.GraderSpec
 }
 
 const defaultLimit = 200
@@ -82,6 +93,10 @@ type Server struct {
 	// csrf is the token every POST must carry. It is per process, so a form
 	// rendered by an earlier server is refused rather than honoured.
 	csrf string
+
+	// grades runs the re-grades this server accepted. It is not per request
+	// because the work outlives the request that asked for it.
+	grades *gradeRunner
 }
 
 // New builds a server over a store. The store is not copied: every request
@@ -96,6 +111,7 @@ func New(st *store.Store, opts Options) *Server {
 		opts:    opts,
 		cssETag: etag(report.CSS()),
 		jsETag:  etag(report.JS()),
+		grades:  newGradeRunner(st),
 	}
 	// The form token is generated even when the session pages are off, because
 	// re-grading a report is a write too. It is per process: a form rendered by
@@ -221,6 +237,11 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		s.writePayload(w, payload, reg, current)
 		return
 	}
+	status := s.gradeStatus(r, reg)
+	grade := s.gradeAction(reg, mode)
+	if grade != nil && status.Job != nil && status.Job.Active() {
+		grade.Grading = &report.Grading{TaskID: status.Job.TaskID, Sample: status.Job.Sample}
+	}
 	writeHTML(w, http.StatusOK, func(out io.Writer) error {
 		return report.RenderPayload(out, mode, payload, report.RenderOptions{
 			Home: "/",
@@ -230,9 +251,12 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 			Record: recordFor(reg, current),
 			// The notice is what the page's own last action produced. It comes
 			// first because it is the most recent fact on the page, and it is
-			// read back from the row rather than taken from the URL.
-			Notice: s.gradeNotice(r, reg),
-			Grade:  s.gradeAction(reg, mode),
+			// read back from the rows rather than taken from the URL.
+			Notice: status.Notice,
+			// A page with grading in flight follows it by reloading, which is
+			// how the session pages already follow a replay.
+			MetaRefresh: status.Refresh,
+			Grade:       grade,
 		})
 	})
 }
@@ -303,11 +327,20 @@ func (s *Server) handleJS(w http.ResponseWriter, r *http.Request) {
 // The body is a constant of this build, so a conditional request is answered
 // without hashing anything again: the ETag was computed once, and if it still
 // matches, the client's copy is this build's copy.
+//
+// Which is why the asset is marked no-cache rather than given a lifetime. The
+// page that loads it is no-store, so a client that may keep the script for five
+// minutes can end up running last build's client against this build's page --
+// and the reader's report is the place that shows it. That is not a theory: a
+// rebuilt binary served a client whose "grade" button submitted a detached form
+// and did nothing, and the fix looked like it had not taken effect until the
+// browser's five minutes were up. Revalidating costs one conditional request on
+// loopback and answers 304.
 func serveAsset(w http.ResponseWriter, r *http.Request, contentType, body, tag string) {
 	h := w.Header()
 	h.Set("Content-Type", contentType)
 	h.Set("ETag", tag)
-	h.Set("Cache-Control", "public, max-age=300")
+	h.Set("Cache-Control", "no-cache")
 	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, tag) {
 		w.WriteHeader(http.StatusNotModified)
 		return

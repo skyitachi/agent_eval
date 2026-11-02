@@ -2000,6 +2000,54 @@ func TestTheRecordBannerIsOutsideThePayload(t *testing.T) {
 	}
 }
 
+// TestAPageCanAskTheBrowserToComeBack covers the meta refresh.
+//
+// It is how a page that is still working tells the reader's browser to look
+// again: the server answers a grade request immediately and the verdict lands
+// seconds later, so the page that says "grading" has to refresh itself rather
+// than pretend the answer is already on record. The tag belongs in the shell,
+// next to the banner and for the same reason: the payload is the bytes the
+// registered hash covers, and a document that reloaded differently depending on
+// when it was read would not be one document.
+func TestAPageCanAskTheBrowserToComeBack(t *testing.T) {
+	st := newStore(t)
+	sampleRunCell(t, st)
+	data := mustLoad(t, st, "r1", Options{})
+	before, err := DataJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var settled bytes.Buffer
+	if err := RenderRun(&settled, data, RenderOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(settled.String(), "http-equiv") {
+		t.Error("a page with nothing in flight asks the browser to reload anyway")
+	}
+
+	var live bytes.Buffer
+	if err := RenderRun(&live, data, RenderOptions{MetaRefresh: "3"}); err != nil {
+		t.Fatal(err)
+	}
+	doc := live.String()
+	if !strings.Contains(doc, `<meta http-equiv="refresh" content="3">`) {
+		t.Fatalf("the page does not ask the browser to come back:\n%s", doc)
+	}
+	// The interval is an option, not a constant: a caller that says six seconds
+	// has to get six seconds, or the page reloads on a schedule nobody chose.
+	var slow bytes.Buffer
+	if err := RenderRun(&slow, data, RenderOptions{MetaRefresh: "6"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(slow.String(), `content="6"`) {
+		t.Error("the refresh interval was not the one asked for")
+	}
+	if after := extractPayload(t, doc); after != string(before) {
+		t.Error("the refresh changed the embedded payload")
+	}
+}
+
 // TestTheFailurePageCarriesNoClientScript covers the error shell.
 //
 // app.js renders "nothing has been recorded yet" when it finds no listing, so

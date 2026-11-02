@@ -99,13 +99,23 @@ func (o *Outcome) Changed() bool {
 	return b.Passed != o.Grade.Passed || b.Score != o.Grade.Score
 }
 
-// One re-grades a single cell of a run.
+// plan is a cell's grading inputs, resolved and validated.
 //
-// sample selects which pass of the task to grade; a negative value means "the
-// first sample recorded". The verdict is written back to the row, because the
-// row is what every report is rendered from -- a verdict held only in memory
-// would disagree with the page the reader is looking at.
-func One(ctx context.Context, st *store.Store, runID, taskID string, sample int, o Options) (*Outcome, error) {
+// Everything that can be refused is decided here, before a grader runs: a cell
+// that never ran, a dataset that moved, a task that was renamed, a grader that
+// needs a workspace a finished run no longer has. Splitting this from the work
+// itself is what lets a request be refused synchronously -- on a page that can
+// still say why -- while the judgement itself is queued.
+type plan struct {
+	row       *store.Attempt
+	task      dataset.TaskSpec
+	specs     []dataset.GraderSpec
+	threshold float64
+	dsPath    string
+}
+
+// planFor resolves and validates everything a re-grade needs.
+func planFor(ctx context.Context, st *store.Store, runID, taskID string, sample int, o Options) (*plan, error) {
 	run, err := st.GetRun(ctx, runID)
 	if err != nil {
 		return nil, err
@@ -173,6 +183,40 @@ func One(ctx context.Context, st *store.Store, runID, taskID string, sample int,
 	if threshold <= 0 {
 		threshold = grader.Threshold
 	}
+	return &plan{row: row, task: task, specs: specs, threshold: threshold, dsPath: dsPath}, nil
+}
+
+// Check runs every refusal a re-grade can reach, without grading anything.
+//
+// It exists for callers that answer a request in two steps: refuse now, do the
+// work later. Without it a button press that cannot possibly work -- a judge
+// with no credentials, a cell that never ran -- would be accepted, queued, and
+// reported as a failure a minute later, on a page the reader has left.
+//
+// The sample it returns is the one that will be graded. A caller that was asked
+// for "whichever sample comes first" (-1) needs the resolved number before it
+// records a request: the request has to name the cell it is about, or a page
+// cannot say which row is being worked on.
+func Check(ctx context.Context, st *store.Store, runID, taskID string, sample int, o Options) (int, error) {
+	p, err := planFor(ctx, st, runID, taskID, sample, o)
+	if err != nil {
+		return sample, err
+	}
+	return p.row.Sample, nil
+}
+
+// One re-grades a single cell of a run.
+//
+// sample selects which pass of the task to grade; a negative value means "the
+// first sample recorded". The verdict is written back to the row, because the
+// row is what every report is rendered from -- a verdict held only in memory
+// would disagree with the page the reader is looking at.
+func One(ctx context.Context, st *store.Store, runID, taskID string, sample int, o Options) (*Outcome, error) {
+	p, err := planFor(ctx, st, runID, taskID, sample, o)
+	if err != nil {
+		return nil, err
+	}
+	row, task, threshold := p.row, p.task, p.threshold
 
 	diff := row.Diff
 	gc := &grader.Context{
@@ -210,7 +254,7 @@ func One(ctx context.Context, st *store.Store, runID, taskID string, sample int,
 		Sample:  row.Sample,
 		Before:  *row,
 		Grade:   grade,
-		Dataset: dsPath,
+		Dataset: p.dsPath,
 	}, nil
 }
 
@@ -306,7 +350,7 @@ func checkUsable(spec dataset.GraderSpec) error {
 			"grade with one that reads the recorded diff and answer (%s), or re-run the task",
 			name, spec.Type, strings.Join(offlineGraders(), ", "))
 	}
-	if spec.Type == "llm_judge" {
+	if grader.NeedsModel(spec.Type) {
 		c := llm.Config{}
 		if v, ok := spec.Config["api_key_env"].(string); ok {
 			c.APIKeyEnv = v
@@ -316,11 +360,31 @@ func checkUsable(spec dataset.GraderSpec) error {
 		}
 		client := llm.New(c)
 		if !client.Available() {
-			return fmt.Errorf("grader %q calls a language model and has no credentials: %w",
-				name, client.MissingCredentialsError())
+			return fmt.Errorf("grader %q calls a language model and has no credentials: %w\n"+
+				"set that variable in the shell that started this command, or score the cell with a grader "+
+				"that calls nothing (%s); a judge pointed at a gateway needs base_url, model and the name of "+
+				"its own variable in the grader config, not just a key in the environment",
+				name, client.MissingCredentialsError(), strings.Join(freeGraders(), ", "))
 		}
 	}
 	return nil
+}
+
+// freeGraders lists the graders that reach a verdict without a model call.
+//
+// This is what a refusal can offer instead, so it must not include the ones
+// that were just refused: a judge listed as the alternative to a judge with no
+// credentials is the same 409 a second time. Both halves come from the
+// registry, so a grader added later joins or leaves this list by declaring
+// what it needs.
+func freeGraders() []string {
+	var out []string
+	for _, typ := range offlineGraders() {
+		if !grader.NeedsModel(typ) {
+			out = append(out, typ)
+		}
+	}
+	return out
 }
 
 // offlineGraders lists the registered graders that can run from a stored row.

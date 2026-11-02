@@ -26,7 +26,7 @@ import (
 // from serving that on a port, and both work against a server bound to
 // loopback, because the attacker's code runs in the user's own browser:
 //
-//   - A page on any site can POST a form to http://127.0.0.1:8080. It cannot
+//   - A page on any site can POST a form to http://127.0.0.1:18080. It cannot
 //     read the answer, but it does not need to: the POST starts the replay.
 //     Every POST therefore carries a token only a page this server rendered
 //     knows, and an Origin header, when present, must be this server.

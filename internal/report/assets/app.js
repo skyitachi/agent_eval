@@ -160,10 +160,15 @@
     var url = body.getAttribute('data-grade-url');
     if (!url) return null;
     var list = body.getAttribute('data-grade-graders') || '';
+    var task = body.getAttribute('data-grade-task');
     return {
       url: url,
       csrf: body.getAttribute('data-grade-csrf') || '',
-      graders: list ? list.split(',') : []
+      graders: list ? list.split(',') : [],
+      /* The cell a request is working on right now, when the server says so.
+       * Its status is the one thing the row is not about to keep saying, so it
+       * is painted as "grading" rather than left as "not graded". */
+      job: task ? { task: task, sample: parseInt(body.getAttribute('data-grade-sample'), 10) || 0 } : null
     };
   })();
 
@@ -216,10 +221,16 @@
 
   /* A cell's status is about the harness; passed is about the agent. They are
    * separate because "ran out of its budget" and "did the wrong thing" are
-   * different findings, and "there was nothing to score it against" is a third. */
+   * different findings, and "there was nothing to score it against" is a third.
+   * A grade in flight is a fourth, and it comes first: whatever the row says
+   * now is about to be replaced, so saying it at all would be a claim the page
+   * cannot keep for more than twenty seconds. */
   function statusPill(t) {
     var cls, text;
-    if (t.status === 'error') { cls = 'fail'; text = 'harness error'; }
+    if (GRADE && GRADE.job && GRADE.job.task === t.id && GRADE.job.sample === t.sample_index) {
+      cls = 'info'; text = 'grading…';
+    }
+    else if (t.status === 'error') { cls = 'fail'; text = 'harness error'; }
     else if (t.status === 'timeout') { cls = 'warn'; text = 'timed out'; }
     else if (!t.graded) { cls = 'warn'; text = 'not graded'; }
     else if (t.passed) { cls = 'pass'; text = 'passed'; }
@@ -517,6 +528,23 @@
     return f;
   }
 
+  /* A form has to be *in the document* to be submitted.
+   *
+   * HTMLFormElement.submit() on a form that was built but never attached is
+   * cancelled by Blink with "Form submission canceled because the form is not
+   * connected" -- a console warning nobody opens, no request, no navigation.
+   * That is exactly what a dead button looks like: the click fires, the handler
+   * runs, and the page does nothing. The form is therefore attached (invisible:
+   * it holds only hidden inputs) before submitting, and swept up afterwards for
+   * the case where the submission did not navigate -- a refusal page does
+   * navigate, so the usual path leaves nothing behind. */
+  function submitGrade(t, grader) {
+    var f = gradeForm(t, grader);
+    document.body.appendChild(f);
+    f.submit();
+    setTimeout(function () { if (f.parentNode) f.parentNode.removeChild(f); }, 1000);
+  }
+
   function field(form, name, value) {
     var i = document.createElement('input');
     i.type = 'hidden';
@@ -539,7 +567,7 @@
         e.stopPropagation();
         var key = b.getAttribute('data-grade');
         var t = (P.tasks || []).filter(function (x) { return x.key === key; })[0];
-        if (t) gradeForm(t).submit();
+        if (t) submitGrade(t);
       });
     });
   }
@@ -1087,7 +1115,7 @@
     if (picker) {
       box.appendChild(picker);
       picker.querySelector('#grader-run').addEventListener('click', function () {
-        gradeForm(t, picker.querySelector('#grader-choice').value).submit();
+        submitGrade(t, picker.querySelector('#grader-choice').value);
       });
     }
 
@@ -1107,6 +1135,9 @@
             <span class="muted small mono-sm">${g.type}</span>
             <span class="chip">score <b>${num(g.score, 3)}</b></span>
             <span class="chip">weight <b>${num(g.weight, 2)}</b></span>
+            ${g.details && typeof g.details.threshold === 'number'
+              ? raw(tpl`<span class="chip">own cutoff <b>${num(g.details.threshold, 2)}</b></span>`)
+              : ''}
             ${g.required ? raw('<span class="chip tag">required</span>') : ''}
           </div>
           ${g.reason ? raw(tpl`<div class="mt small">${g.reason}</div>`) : ''}

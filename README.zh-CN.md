@@ -80,7 +80,7 @@ AGENTEVAL_PYTHON="$(python3 -c 'import pytest, sys; print(sys.executable)')" \
 # 可浏览的索引，加每次 run 一页，全部能从 file:// 打开
 ./bin/aeval report --index --out-dir reports/site
 
-# 或者把上面这些命令登记下来的报告跑成一个服务：http://127.0.0.1:8080
+# 或者把上面这些命令登记下来的报告跑成一个服务：http://127.0.0.1:18080
 ./bin/aeval serve
 ```
 
@@ -121,8 +121,15 @@ export ANTHROPIC_API_KEY=...
 | **baseline**    | 一个任务用来对照的录制尝试，通常由 `aeval collect` 从真实会话导出。                |
 | **Run（运行）**     | 一次 `aeval run` 调用，由 UUID 标识，连同数据集哈希一起存储。                  |
 
-当一个格子的评分器加权分达到阈值（`--threshold`，默认 1.0，即每个加权评分器都必须通过）时，  
-它**通过**。
+当一个格子的评分器加权分达到阈值时它**通过**：阈值来自 run 的 `--threshold`（默认 0.6），  
+或任务自己声明的 `threshold`（任务声明优先于命令行 —— 从外部导入的 benchmark 与 rubric judge  
+都自带及格线）。
+
+默认取 0.6 而不是 1.0，是对"rubric judge 意味着什么"的判断。judge 打的是连续分，一个正确但不完整的  
+回答通常落在 0.8：用 1.0 当默认，等于把"对，但少做了一件事"判成失败，最后量到的是 judge 的宽容度  
+而不是 agent 的水平。要精确及格线的任务 —— 比如每个测试都得过的套件 —— 自己写 `threshold: 1.0`。  
+另外，judge 卡片显示 pass、格子却 failed 是可能的：卡片比的是 judge 自己 config 里的 cutoff（默认  
+0.67），而报告会把**两个数字一起写出来**，不靠读者自己去抽屉里翻。
 
 ## 数据集格式
 
@@ -150,7 +157,7 @@ task:   id, version, category, difficulty, tags
 prompt: prompt | prompt_file, system_prompt
 init:   workspace: {type: empty|files|git, ...}
 output: type: patch|files|stdout|none, paths, ignore_paths, expect_answer
-score:  graders: [...], limits: {max_turns, timeout_s}
+score:  graders: [...], threshold, limits: {max_turns, timeout_s}
 base:   baseline: {file, notes}
 origin: session, prompt_index   # 任务出自哪份录制，以及它是其中的第几条 prompt
 meta:   metadata: {...}          # 自由来源信息，引擎从不解释
@@ -168,6 +175,11 @@ meta:   metadata: {...}          # 自由来源信息，引擎从不解释
 
 `graders[].weight` 是个指针，这样 `weight: 0`（「跑它，但不计分」）与「未设置」（= 1）  
 能区分开。`required: true` 会让整个任务直接判负，与其它评分器无关。
+
+`threshold` 是这个任务的复合分及格线；不写就是「随 run 的 `--threshold`」，也就是 0.6 的默认值。  
+任务里写了就**压过命令行**。`collect --grader-config-file` 会把 judge 自己的 cutoff 写到这里，  
+于是格子和 judge 卡片被同一条线衡量；`pytest` / `patch` 这类本身没有 cutoff 的评分器不写，  
+留给 run 的默认值。
 
 ### manifest
 
@@ -270,6 +282,18 @@ aeval collect --cwd ~/code/proj --out datasets/mine
 它产出的任务带一段 prompt、一个工作目录、一个 baseline（tokens、忙碌时间、轮次、工具调用），  
 以及**没有评分器**：转录里没有标准答案，所以这个任务是可测量但不可评分的。把它判成失败是  
 造一个判决，判成通过是造另一个。若你确实有评分依据，用 `--grader` 显式挂上去。
+
+一个 judge 光有类型不够判分：它调哪个端点、要哪个模型、凭据在**哪个变量名**里，三件事都得有。  
+这些写在一份声明文件里，形状和数据集里的 `graders[]` 条目一致：
+
+```sh
+aeval collect --session <id> --out <dir> --grader-config-file examples/judge.yaml
+```
+
+声明会写进它产出的每个任务，于是数据集自己记住了怎么调到 judge —— 报告页重判一个 cell 时，不再  
+依赖当初采集它的那个 shell。`weight`、`required`、`timeout_s` 写进这个文件会直接报错：那是任务级  
+的决定，两个读取方都会把它们丢掉，而「写进去了却不生效」读起来像是已经配好了。`serve` 采集回放  
+时用的是同一份文件。
 
 每个 baseline 还记录采集它的机器（`machine`：平台机器标识的哈希 —— macOS 取 `IOPlatformUUID`、  
 Linux 取 `/etc/machine-id`、Windows 取 `MachineGuid` —— 外加给人看的主机名、OS、架构）。  
@@ -428,7 +452,11 @@ aeval grade --run 4d92d2be --task 3c11e6dc-p0 --grader llm_judge --db aeval.db
   挂的那套 rubric —— 从命令行得到的 verdict 和从网页得到的要能比，否则入口本身就成了变量。
 - `--dataset` 在原数据集被挪走时指向 manifest。
 - `--sample` 指定 `--samples k` 里第几遍（默认第一遍）；`--threshold` 覆盖 cell 上记录的阈值 ——
-  未判分的 cell 没有记录，这种情况按默认 1.0。
+  未判分的 cell 没有记录，这种情况按默认 0.6。
+
+重判**沿用 cell 上记录的阈值**，不会套用今天的默认值：那一行是"这份 verdict 当初按什么线量的"的记录，
+被新默认悄悄重算，等于给同一个时间戳换了一份测量。所以一个在 1.0 下判过的格子，重判后 0.80 仍然 FAIL ——
+如果你要的是新线，就显式给 `--threshold 0.6`。
 
 写回的只有 verdict 那几列。tokens、耗时、花费描述的是一个已经退出的进程，重判把它们改掉，就等于给一个什么都没
 测到的 verdict 配了个数字。命令会把新 verdict 连同它替换掉的旧 verdict 一起打出来，并提示这次 run 登记过的页面
@@ -436,7 +464,7 @@ aeval grade --run 4d92d2be --task 3c11e6dc-p0 --grader llm_judge --db aeval.db
 
 有两件事它不做。它不启动 agent，所以判的就是当初记录下来的那份活。它也**拒绝**那些得不出结论的评分器，而不是
 硬写一个结论：`pytest` 与 `command` 要在 run 已经没有的工作区里执行，judge 缺凭据则会把一个没设的环境变量变成
-一个失败的任务。前者只能重跑，后者去设变量。
+一个失败的任务。前者只能重跑；后者要么去设变量，要么换一个不调模型的评分器 —— 拒绝信息会点名哪些能跑。
 
 同样的操作也是报告页上的一颗按钮 —— 见「在页面上给某个 cell 判分」。
 
@@ -501,7 +529,7 @@ id 用随机值而非序号（带编号的日志会被读成版本号），也�
 `aeval serve` 把它们列出来，并按需重建：
 
 ```sh
-aeval serve --db runs.db --addr 127.0.0.1:8080
+aeval serve --db runs.db --addr 127.0.0.1:18080
 ```
 
 `GET /` 列出已登记的报告，`GET /r/<id>` 从数据库重建其中一份并渲染，`GET /r/<id>.json` 返回同一份  
@@ -533,12 +561,27 @@ cell 的 **graders** 标签页里有一个下拉框选择判据：
 | 取值 | 用什么判 |
 | --- | --- |
 | `auto` | 数据集自己声明的那些评分器；它一个都没声明时用 judge |
-| `llm_judge` | judge，用网页回放默认挂的那套 rubric（`input: both`，判结果不判文风） |
-| `patch` | 只判改动的形状：确实改了，而且不是把仓库整体重写 |
+| `llm_judge` | judge —— 这个 serve 启动时用 `--grader-config-file` 声明的那一个（端点、模型、读哪个变量都来自它）；没有声明时用网页回放默认挂的 rubric（`input: both`，判结果不判文风） |
+| `patch` | 只判改动的形状：确实改了，而且不是把仓库整体重写。不调模型，所以不需要凭据 |
 
 在**写任何东西之前**就会拒绝那些跑不了的：`pytest` 与 `command` 需要在工作区里执行，而已结束的 run  
-没有工作区；judge 没有凭证则会把 harness 的错误记成 agent 的失败。拒绝时会点名缺什么 —— 该设哪两个
-环境变量，或者哪些评分器是能离线跑的。
+没有工作区；judge 没有凭证则会把 harness 的错误记成 agent 的失败。拒绝时会点名缺什么 —— 该设哪个
+变量，以及**哪些评分器不调模型、现在就能用**（`patch` 之类）。一条"没有凭据"的拒绝如果不给替代，
+读者手里就只剩一颗按不动的按钮。
+
+判分本身是**异步**的。按一次按钮只做三件事：校验、把请求记进 `grade_jobs`、返回（实测 29 ms，而一次
+judge 调用要 13–24 秒）。真正的执行在这个进程里排队跑，于是页面不会看起来像按钮坏了：
+
+- 那一行的状态立刻变成 `grading…`，页面顶部写 `Grading this cell.`，并每 3 秒自动刷新一次（与会话页
+  跟进回放是同一个机制），直到这行有了结论；
+- 同一个 cell 上重复按不会买第二次判定：数据库上有部分唯一索引，第二次只会把你带回正在跑的那一次；
+- 结束后横幅给结论，并写明这次判分花了多少：`It cost 147 input and 2132 output tokens on
+  deepseek-flash and took 13.5s.`
+
+这些数字落在 `grade_jobs` 里，一行一次请求，**不写进 attempts 的 token 列** —— 那几列是 agent 的花费，
+报告的总量从它们算出来，把 judge 的 token 混进去会让「agent 花了多少」这个唯一被横向比较的数字失真。
+失败也有归属：页面写 `The grade did not finish.` 加原因，而 cell 保持原来的结论。进程被杀掉留下的
+`running` 行会在下次 `aeval serve` 启动时收尾为 failed —— 否则页面会永远显示「判分中」。
 
 没有变的是当初真正要紧的那部分：每次读取仍然是从行重建，所以被判过分的页面回来时会写着  
 `This page is not the recorded document.` —— 这正是发生的事。它上方那条提示写的是**行里现在**的结论，
@@ -593,6 +636,18 @@ harness 是 matrix 词汇里的部分 agent 块，**不许设 model 或 `plugin_
 的参数传给 `--model`。没给预设文件时提供 `clean-room` 与 `host`（用本机自己的配置跑 Claude Code）两个  
 harness、`none` 一个 skill、CLI 默认模型。
 
+回放挂哪个 judge，用同一种文件声明：
+
+```sh
+aeval serve --replay-config examples/replay-presets.yaml --grader-config-file examples/judge.yaml
+```
+
+这份声明同时决定**报告页上的判分按钮**用哪个 judge：端点、模型、读哪个变量，都来自它。不给时是
+`llm_judge` 加内置 rubric，端点和凭据从 `ANTHROPIC_*` 读 —— 那样只有导出过这些变量的那台机器能判分，
+换一台就只能在页面上得到一条拒绝。启动横幅会写明它读的是哪个文件；**这个进程里没有凭据时，横幅会直接
+警告**（否则你只会在按下按钮之后才知道）。判分下拉框里还有 `patch`：它只读已经记录的 diff、不调任何
+模型，是"这台机器没有 key 但我想现在就要一个结论"时的出路。
+
 这些页面能读本机每一份转录、并以跳过权限确认的方式启动 agent，所以防护比报告页更严：
 
 - **只绑 loopback。** `--addr` 不是 loopback 就拒绝启动，除非加 `--no-sessions`（只提供报告）。
@@ -616,12 +671,12 @@ internal/grader/   五个评分器与注册表
 internal/trace/    Claude Code stream-json -> 归一化轨迹
 internal/session/  Claude Code 转录 -> 带 baseline 的任务
 internal/runner/   调度、超时、工作区生命周期、记录
-internal/store/    SQLite schema、runs 与 attempts
+internal/store/    SQLite schema、runs 与 attempts、判分请求
 internal/attrib/   因子轴、sweep 计划、配对比较、符号检验
 internal/report/   视图模型、加载器、HTML 渲染器、报告登记表
 internal/server/   HTTP 服务：已登记报告、本机会话、回放表单
 internal/replay/   回放预设与回放按钮背后的任务队列
-internal/regrade/  用已完成 cell 记下的东西重新得出结论
+internal/regrade/  用已完成 cell 记下的东西重新得出结论，并记录每次请求花了什么
 internal/machine/  collect 盖上、回放核对的机器标识
 internal/llm/      llm_judge 用的最小客户端
 tests/             驱动真实二进制的端到端测试

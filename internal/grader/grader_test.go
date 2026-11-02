@@ -828,3 +828,34 @@ func TestOnlyTheGradersThatExecuteNeedAWorkspace(t *testing.T) {
 		t.Error("an unregistered type reported a sandbox requirement; the caller reports that better")
 	}
 }
+
+// The judge is the one grader whose own verdict can disagree with the cell's:
+// it compares its score to a cutoff in its own config, and the cell compares
+// the same score to the run's line. Collect writes the former onto the task so
+// the two cannot drift, which only works if the judge can be asked what it is.
+func TestTheJudgeCanBeAskedForTheCutoffItAppliesToItself(t *testing.T) {
+	cases := []struct {
+		spec   dataset.GraderSpec
+		want   float64
+		hasOne bool
+	}{
+		// No config at all: the documented default, not zero.
+		{dataset.GraderSpec{Type: "llm_judge"}, 0.67, true},
+		{dataset.GraderSpec{Type: "llm_judge", Config: map[string]any{"threshold": 0.85}}, 0.85, true},
+		// A config that names no cutoff still gets the default, which is what
+		// the grader itself would apply.
+		{dataset.GraderSpec{Type: "llm_judge", Config: map[string]any{"input": "both"}}, 0.67, true},
+		// Graders that compare against ground truth have no line of their own.
+		{dataset.GraderSpec{Type: "exact_match"}, 0, false},
+		{dataset.GraderSpec{Type: "patch"}, 0, false},
+		// An unregistered type is not a reason to invent a cutoff for it.
+		{dataset.GraderSpec{Type: "not-a-grader"}, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := DeclaredThreshold(c.spec)
+		if ok != c.hasOne || (ok && got != c.want) {
+			t.Errorf("DeclaredThreshold(%s %v) = %v/%v, want %v/%v",
+				c.spec.Type, c.spec.Config, got, ok, c.want, c.hasOne)
+		}
+	}
+}

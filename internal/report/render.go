@@ -115,6 +115,24 @@ type GradeAction struct {
 	// Graders are the values the picker offers, in order. They are the contract
 	// with the server: the page labels them, but it does not invent them.
 	Graders []string
+	// Grading names the cell a request is working on right now, if any.
+	//
+	// It is here rather than in the payload because it is a fact about a
+	// request in flight, not about the document: the payload is the bytes the
+	// registered hash covers, and a row that says "grading" for twenty seconds
+	// would make the page stop reproducing its own registration for a reason
+	// that has nothing to do with the data.
+	Grading *Grading
+}
+
+// Grading marks the row a grade request is working on.
+//
+// The client uses it to paint that cell's status as "grading" instead of
+// leaving it saying "not graded", which is the one thing the row is certainly
+// not about to keep saying.
+type Grading struct {
+	TaskID string
+	Sample int
 }
 
 // NavLink is one header navigation entry.
